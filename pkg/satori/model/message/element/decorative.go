@@ -14,30 +14,32 @@ type decorativeElement interface {
 
 func (d *Decorative) isDecorative() {}
 
-func (d *Decorative) AddChild(content ...any) {
+func (d *Decorative) AddChild(content ...Element) {
 	if d == nil {
 		return
 	}
 	for _, c := range content {
-		switch v := c.(type) {
-		case Element:
-			bindOwner(v)
-			if _, ok := v.(*Text); ok {
-				d.children = append(d.children, v)
-				continue
-			}
-			if _, ok := v.(decorativeElement); ok {
-				d.children = append(d.children, v)
-			}
-		case string:
-			text, err := New[*Text](map[string]any{"text": v})
-			if err != nil {
-				continue
-			}
-			d.children = append(d.children, text)
-		default:
+		bindOwner(c)
+		if _, ok := c.(*Text); ok {
+			d.children = append(d.children, c)
 			continue
 		}
+		if _, ok := c.(decorativeElement); ok {
+			d.children = append(d.children, c)
+		}
+	}
+}
+
+func (d *Decorative) AddChildString(content ...string) {
+	if d == nil {
+		return
+	}
+	for _, c := range content {
+		text, err := New[*Text](map[string]any{"text": c})
+		if err != nil {
+			continue
+		}
+		d.children = append(d.children, text)
 	}
 }
 

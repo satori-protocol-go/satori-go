@@ -16,7 +16,11 @@ func (b *Br) Children() []Element {
 	return nil
 }
 
-func (b *Br) AddChild(content ...any) {
+func (b *Br) AddChild(content ...Element) {
+	// Br 元素不接受子元素，直接忽略
+}
+
+func (b *Br) AddChildString(content ...string) {
 	// Br 元素不接受子元素，直接忽略
 }
 

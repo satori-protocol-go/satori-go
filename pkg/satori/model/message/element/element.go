@@ -3,10 +3,20 @@ package element
 import (
 	"fmt"
 	"reflect"
+	"slices"
 	"strings"
 
 	"github.com/satori-protocol-go/satori-go/pkg/satori/internal/xhtml"
 )
+
+type ErrTransformFailed struct {
+	Tag string
+	Err error
+}
+
+func (e *ErrTransformFailed) Error() string {
+	return fmt.Sprintf("failed to transform element with tag %q: %v", e.Tag, e.Err)
+}
 
 type ownerBinder interface {
 	setOwner(owner Element)
@@ -42,7 +52,8 @@ type Element interface {
 	Get(key string) (any, bool)
 	MarshalXHTML(strip bool) string
 	Children() []Element
-	AddChild(content ...any)
+	AddChild(content ...Element)
+	AddChildString(content ...string)
 }
 
 type NoAlias struct{}
@@ -143,24 +154,26 @@ func (e *BaseElement) MarshalXHTML(strip bool) string {
 	return "<" + tag + attrs + ">" + inner + "</" + tag + ">"
 }
 
-func (e *BaseElement) AddChild(content ...any) {
+func (e *BaseElement) AddChild(content ...Element) {
 	if e == nil {
 		return
 	}
 	for _, c := range content {
-		switch v := c.(type) {
-		case Element:
-			bindOwner(v)
-			e.children = append(e.children, v)
-		case string:
-			text, err := New[*Text](map[string]any{"text": v})
-			if err != nil {
-				continue
-			}
-			e.children = append(e.children, text)
-		default:
+		bindOwner(c)
+		e.children = append(e.children, c)
+	}
+}
+
+func (e *BaseElement) AddChildString(content ...string) {
+	if e == nil {
+		return
+	}
+	for _, c := range content {
+		text, err := New[*Text](map[string]any{"text": c})
+		if err != nil {
 			continue
 		}
+		e.children = append(e.children, text)
 	}
 }
 
@@ -244,6 +257,152 @@ func RegisterElement(tag string, factory elementFactory) error {
 	}
 	registerElement(tag, factory)
 	return nil
+}
+
+func Transform(elements []*xhtml.Element) ([]Element, error) {
+	var message []Element = make([]Element, 0, len(elements))
+	for _, elem := range elements {
+		tag := elem.Tag()
+		if factory, ok := elementFactoryMap.get(tag); ok {
+			element, err := factory(elem.Attrs)
+			if err != nil {
+				return nil, &ErrTransformFailed{Tag: tag, Err: err}
+			}
+			if len(elem.Children) > 0 {
+				children, err := Transform(elem.Children)
+				if err != nil {
+					return nil, &ErrTransformFailed{Tag: tag, Err: err}
+				}
+				element.AddChild(children...)
+			}
+		} else if slices.Contains([]string{"a", "link"}, tag) {
+			link, err := New[*A](elem.Attrs)
+			if err != nil {
+				return nil, &ErrTransformFailed{Tag: tag, Err: err}
+			}
+			if len(elem.Children) > 0 {
+				children, err := Transform(elem.Children)
+				if err != nil {
+					return nil, &ErrTransformFailed{Tag: tag, Err: err}
+				}
+				link.AddChild(children...)
+			}
+			message = append(message, link)
+		} else if tag == "button" {
+			button, err := New[*Button](elem.Attrs)
+			if err != nil {
+				return nil, &ErrTransformFailed{Tag: tag, Err: err}
+			}
+			if len(elem.Children) > 0 {
+				children, err := Transform(elem.Children)
+				if err != nil {
+					return nil, &ErrTransformFailed{Tag: tag, Err: err}
+				}
+				button.AddChild(children...)
+			}
+			message = append(message, button)
+		} else if factory, ok := styleFactoryMap.get(tag); ok {
+			style, err := factory(elem.Attrs)
+			if err != nil {
+				return nil, &ErrTransformFailed{Tag: tag, Err: err}
+			}
+			if len(elem.Children) > 0 {
+				children, err := Transform(elem.Children)
+				if err != nil {
+					return nil, &ErrTransformFailed{Tag: tag, Err: err}
+				}
+				style.AddChild(children...)
+			}
+			message = append(message, style)
+		} else if slices.Contains([]string{"br", "newline"}, tag) {
+			br, err := New[*Br](elem.Attrs)
+			if err != nil {
+				return nil, &ErrTransformFailed{Tag: tag, Err: err}
+			}
+			message = append(message, br)
+		} else if tag == "message" {
+			msg, err := New[*Message](elem.Attrs)
+			if err != nil {
+				return nil, &ErrTransformFailed{Tag: tag, Err: err}
+			}
+			if len(elem.Children) > 0 {
+				children, err := Transform(elem.Children)
+				if err != nil {
+					return nil, &ErrTransformFailed{Tag: tag, Err: err}
+				}
+				msg.AddChild(children...)
+			}
+			message = append(message, msg)
+		} else if tag == "quote" {
+			quote, err := New[*Quote](elem.Attrs)
+			if err != nil {
+				return nil, &ErrTransformFailed{Tag: tag, Err: err}
+			}
+			if len(elem.Children) > 0 {
+				children, err := Transform(elem.Children)
+				if err != nil {
+					return nil, &ErrTransformFailed{Tag: tag, Err: err}
+				}
+				quote.AddChild(children...)
+			}
+			message = append(message, quote)
+		} else {
+			custom, err := NewExtension(tag, elem.Attrs)
+			if err != nil {
+				return nil, &ErrTransformFailed{Tag: tag, Err: err}
+			}
+			if len(elem.Children) > 0 {
+				children, err := Transform(elem.Children)
+				if err != nil {
+					return nil, &ErrTransformFailed{Tag: tag, Err: err}
+				}
+				custom.AddChild(children...)
+			}
+			message = append(message, custom)
+		}
+	}
+	return message, nil
+}
+
+type selector func(Element) bool
+
+func Select(elements []Element, selector selector) []Element {
+	var results []Element
+	for _, elem := range elements {
+		if selector(elem) {
+			results = append(results, elem)
+		}
+		if len(elem.Children()) > 0 {
+			childResults := Select(elem.Children(), selector)
+			results = append(results, childResults...)
+		}
+	}
+	return results
+}
+
+func TagSelector(tag string) selector {
+	return func(elem Element) bool {
+		if elem == nil {
+			return false
+		}
+		return elem.Tag() == tag
+	}
+}
+
+func TypeSelector(dst Element) selector {
+	targetType := reflect.TypeOf(dst)
+	if targetType == nil {
+		return func(Element) bool {
+			return false
+		}
+	}
+
+	return func(elem Element) bool {
+		if elem == nil {
+			return false
+		}
+		return reflect.TypeOf(elem) == targetType
+	}
 }
 
 func init() {

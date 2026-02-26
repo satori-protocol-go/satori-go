@@ -20,7 +20,11 @@ func (t *Text) Children() []Element {
 	return nil
 }
 
-func (t *Text) AddChild(content ...any) {
+func (t *Text) AddChild(content ...Element) {
+	// Text 元素不接受子元素，直接忽略
+}
+
+func (t *Text) AddChildString(content ...string) {
 	// Text 元素不接受子元素，直接忽略
 }
 
