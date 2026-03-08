@@ -15,6 +15,16 @@ import (
 type EventType string
 
 const (
+	// Emoji 事件
+
+	EventTypeGuildEmojiAdded   EventType = "guild-emoji-added"   // 当群组表情被添加时触发
+	EventTypeGuildEmojiUpdated EventType = "guild-emoji-updated" // 当群组表情被更新时触发
+	EventTypeGuildEmojiDeleted EventType = "guild-emoji-deleted" // 当群组表情被删除时触发
+
+	// Friend 事件
+
+	EventTypeFriendRequest EventType = "friend-request" // 接收到新的好友申请时触发
+
 	// Guild 事件
 
 	EventTypeGuildAdded   EventType = "guild-added"   // 加入群组时触发
@@ -56,10 +66,6 @@ const (
 
 	EventTypeReactionAdded   EventType = "reaction-added"   // 当表态被添加时触发
 	EventTypeReactionRemoved EventType = "reaction-removed" // 当表态被移除时触发
-
-	// User 事件
-
-	EventTypeFriendRequest EventType = "friend-request" // 接收到新的好友申请时触发
 
 	// Internal 事件
 

@@ -34,9 +34,9 @@ type fallbackTarget struct {
 	Value string `attr:"alias,omitempty"`
 }
 
-func TestBindAttrs(t *testing.T) {
+func TestUnmarshalAttrs(t *testing.T) {
 	dst := &bindTarget{}
-	err := attrbind.BindAttrs(dst, map[string]any{
+	err := attrbind.UnmarshalAttrs(dst, map[string]any{
 		"id":      "12",
 		"title":   123,
 		"enabled": "true",
@@ -53,7 +53,7 @@ func TestBindAttrs(t *testing.T) {
 		"default": "ok",
 	})
 	if err != nil {
-		t.Fatalf("BindAttrs failed: %v", err)
+		t.Fatalf("UnmarshalAttrs failed: %v", err)
 	}
 
 	if dst.ID != 12 {
@@ -85,30 +85,30 @@ func TestBindAttrs(t *testing.T) {
 	}
 }
 
-func TestBindAttrsErrors(t *testing.T) {
+func TestUnmarshalAttrsErrors(t *testing.T) {
 	var nilPtr *bindTarget
-	if err := attrbind.BindAttrs(nilPtr, map[string]any{"id": 1}); err == nil {
+	if err := attrbind.UnmarshalAttrs(nilPtr, map[string]any{"id": 1}); err == nil {
 		t.Fatalf("expected nil pointer error")
 	}
-	if err := attrbind.BindAttrs(bindTarget{}, map[string]any{"id": 1}); err == nil {
+	if err := attrbind.UnmarshalAttrs(bindTarget{}, map[string]any{"id": 1}); err == nil {
 		t.Fatalf("expected non-pointer error")
 	}
-	if err := attrbind.BindAttrs(&bindTarget{}, map[string]any{"id": "bad-int"}); err == nil {
+	if err := attrbind.UnmarshalAttrs(&bindTarget{}, map[string]any{"id": "bad-int"}); err == nil {
 		t.Fatalf("expected conversion error")
 	}
-	if err := attrbind.BindAttrs(&requiredTarget{}, map[string]any{}); err == nil {
+	if err := attrbind.UnmarshalAttrs(&requiredTarget{}, map[string]any{}); err == nil {
 		t.Fatalf("expected missing required error")
 	}
 }
 
-func TestBindAttrsOptionalAndFallback(t *testing.T) {
+func TestUnmarshalAttrsOptionalAndFallback(t *testing.T) {
 	optional := &optionalTarget{}
-	if err := attrbind.BindAttrs(optional, map[string]any{}); err != nil {
+	if err := attrbind.UnmarshalAttrs(optional, map[string]any{}); err != nil {
 		t.Fatalf("optional field should not error: %v", err)
 	}
 
 	fallback := &fallbackTarget{}
-	if err := attrbind.BindAttrs(fallback, map[string]any{"value": "ok"}); err != nil {
+	if err := attrbind.UnmarshalAttrs(fallback, map[string]any{"value": "ok"}); err != nil {
 		t.Fatalf("fallback field key should bind: %v", err)
 	}
 	if fallback.Value != "ok" {
