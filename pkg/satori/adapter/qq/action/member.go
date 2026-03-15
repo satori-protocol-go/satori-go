@@ -54,9 +54,6 @@ func (h *Handler) handleGuildMemberList(request satoriserver.Request[satoriserve
 	if next := optionalString(request.Params.Next); next != "" {
 		pager.After = next
 	}
-	if limit, ok := optionalInt(request.Params.Limit); ok && limit > 0 {
-		pager.Limit = strconv.Itoa(limit)
-	}
 
 	items, err := api.GuildMembers(requestContext(request.Origin), splitGuildCompositeID(guildID), pager)
 	if err != nil {
@@ -114,8 +111,8 @@ func (h *Handler) handleGuildMemberMute(request satoriserver.Request[satoriserve
 	}
 
 	seconds := 0
-	if duration, ok := optionalInt(request.Params.Duration); ok && duration > 0 {
-		seconds = duration / 1000
+	if request.Params.Duration > 0 {
+		seconds = request.Params.Duration / 1000
 	}
 	mute := &botgodto.UpdateGuildMute{MuteSeconds: strconv.Itoa(seconds)}
 	if err := api.MemberMute(requestContext(request.Origin), splitGuildCompositeID(guildID), userID, mute); err != nil {

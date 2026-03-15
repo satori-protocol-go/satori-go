@@ -1,8 +1,6 @@
 package action
 
 import (
-	"strconv"
-
 	botgodto "github.com/WindowsSov8forUs/botgo-plus/dto"
 	qqcodec "github.com/satori-protocol-go/satori-go/pkg/satori/adapter/qq/codec"
 	"github.com/satori-protocol-go/satori-go/pkg/satori/model/define"
@@ -34,9 +32,6 @@ func (h *Handler) handleReactionList(request satoriserver.Request[satoriserver.R
 	pager := &botgodto.MessageReactionPager{Limit: "50"}
 	if next := optionalString(request.Params.Next); next != "" {
 		pager.Cookie = next
-	}
-	if limit, ok := optionalInt(request.Params.Limit); ok && limit > 0 {
-		pager.Limit = strconv.Itoa(limit)
 	}
 
 	items, err := api.GetMessageReactionUsers(

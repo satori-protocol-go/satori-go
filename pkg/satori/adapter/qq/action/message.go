@@ -164,10 +164,6 @@ func (h *Handler) handleMessageList(request satoriserver.Request[satoriserver.Me
 		}
 		pager.ID = next
 	}
-	if prev := optionalString(request.Params.Prev); prev != "" {
-		pager.Type = botgodto.MPTAfter
-		pager.ID = prev
-	}
 
 	items, err := api.Messages(requestContext(request.Origin), channelID, pager)
 	if err != nil {

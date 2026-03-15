@@ -83,7 +83,6 @@ type MessageListParam struct {
 	Next      string      `json:"next,omitempty"`
 	Direction string      `json:"direction,omitempty"`
 	Order     string      `json:"order,omitempty"`
-	Prev      string      `json:"prev,omitempty"`
 	Limit     OptionalInt `json:"limit,omitempty"`
 }
 
@@ -107,8 +106,8 @@ type ChannelUpdateParam struct {
 }
 
 type ChannelMuteParam struct {
-	ChannelID string      `json:"channel_id"`
-	Duration  OptionalInt `json:"duration,omitempty"`
+	ChannelID string `json:"channel_id"`
+	Duration  int    `json:"duration"`
 }
 
 type UserChannelCreateParam struct {
@@ -121,8 +120,7 @@ type GuildGetParam struct {
 }
 
 type GuildListParam struct {
-	Next  string      `json:"next,omitempty"`
-	Limit OptionalInt `json:"limit,omitempty"`
+	Next string `json:"next,omitempty"`
 }
 
 type GuildMemberGetParam struct {
@@ -131,9 +129,8 @@ type GuildMemberGetParam struct {
 }
 
 type GuildListByGuildParam struct {
-	GuildID string      `json:"guild_id"`
-	Next    string      `json:"next,omitempty"`
-	Limit   OptionalInt `json:"limit,omitempty"`
+	GuildID string `json:"guild_id"`
+	Next    string `json:"next,omitempty"`
 }
 
 type GuildMemberKickParam struct {
@@ -143,9 +140,9 @@ type GuildMemberKickParam struct {
 }
 
 type GuildMemberMuteParam struct {
-	GuildID  string      `json:"guild_id"`
-	UserID   string      `json:"user_id"`
-	Duration OptionalInt `json:"duration,omitempty"`
+	GuildID  string `json:"guild_id"`
+	UserID   string `json:"user_id"`
+	Duration int    `json:"duration"`
 }
 
 type GuildMemberRoleParam struct {
@@ -190,16 +187,14 @@ type ReactionClearParam struct {
 }
 
 type ReactionListParam struct {
-	ChannelID string      `json:"channel_id"`
-	MessageID string      `json:"message_id"`
-	Emoji     string      `json:"emoji"`
-	Next      string      `json:"next,omitempty"`
-	Limit     OptionalInt `json:"limit,omitempty"`
+	ChannelID string `json:"channel_id"`
+	MessageID string `json:"message_id"`
+	Emoji     string `json:"emoji"`
+	Next      string `json:"next,omitempty"`
 }
 
 type UserGetParam struct {
-	UserID  string `json:"user_id"`
-	GuildID string `json:"guild_id,omitempty"`
+	UserID string `json:"user_id"`
 }
 
 type FriendListParam struct {

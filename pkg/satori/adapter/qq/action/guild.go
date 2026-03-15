@@ -1,8 +1,6 @@
 package action
 
 import (
-	"strconv"
-
 	botgodto "github.com/WindowsSov8forUs/botgo-plus/dto"
 	qqcodec "github.com/satori-protocol-go/satori-go/pkg/satori/adapter/qq/codec"
 	"github.com/satori-protocol-go/satori-go/pkg/satori/model/define"
@@ -42,9 +40,6 @@ func (h *Handler) handleGuildList(request satoriserver.Request[satoriserver.Guil
 		return nil, satoriserver.NotFound("guild.list capability is unavailable")
 	}
 	pager := &botgodto.GuildPager{Limit: "100"}
-	if limit, ok := optionalInt(request.Params.Limit); ok && limit > 0 {
-		pager.Limit = strconv.Itoa(limit)
-	}
 	if next := optionalString(request.Params.Next); next != "" {
 		pager.After = next
 	}

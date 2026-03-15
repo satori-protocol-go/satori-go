@@ -55,14 +55,14 @@ func (h *Handler) handleUserGet(request satoriserver.Request[satoriserver.UserGe
 		return nil, satoriserver.NotFound("user.get capability is unavailable")
 	}
 
-	guildID := optionalString(request.Params.GuildID)
-	if guildID == "" && strings.Contains(userID, "_") {
+	guildID := ""
+	if strings.Contains(userID, "_") {
 		parts := strings.SplitN(userID, "_", 2)
 		guildID = parts[0]
 		userID = parts[1]
 	}
 	if guildID == "" {
-		return nil, satoriserver.NotFound("qqguild platform requires guild_id for user.get")
+		return nil, satoriserver.NotFound("qqguild platform requires user_id in guildID_userID format")
 	}
 
 	member, err := api.GuildMember(requestContext(request.Origin), splitGuildCompositeID(guildID), userID)
