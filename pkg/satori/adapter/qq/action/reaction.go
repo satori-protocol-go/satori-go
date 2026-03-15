@@ -1,6 +1,8 @@
 package action
 
 import (
+	"strings"
+
 	botgodto "github.com/WindowsSov8forUs/botgo-plus/dto"
 	qqcodec "github.com/satori-protocol-go/satori-go/pkg/satori/adapter/qq/codec"
 	"github.com/satori-protocol-go/satori-go/pkg/satori/model/define"
@@ -30,8 +32,11 @@ func (h *Handler) handleReactionList(request satoriserver.Request[satoriserver.R
 	}
 
 	pager := &botgodto.MessageReactionPager{Limit: "50"}
-	if next := optionalString(request.Params.Next); next != "" {
-		pager.Cookie = next
+	if nextValue, ok := request.Params.Next.Get(); ok {
+		next := strings.TrimSpace(nextValue)
+		if next != "" {
+			pager.Cookie = next
+		}
 	}
 
 	items, err := api.GetMessageReactionUsers(

@@ -325,6 +325,78 @@ func TestServerDefaultUploadAndProxy(t *testing.T) {
 	}
 }
 
+func TestDecodeMessageListParamStrictNumber(t *testing.T) {
+	_, err := satoriserver.DecodeParams[satoriserver.MessageListParam](map[string]any{
+		"channel_id": "c1",
+		"limit":      "10",
+	})
+	if err == nil {
+		t.Fatal("expected error for string limit")
+	}
+
+	_, err = satoriserver.DecodeParams[satoriserver.MessageListParam](map[string]any{
+		"channel_id": "c1",
+		"limit":      1.5,
+	})
+	if err == nil {
+		t.Fatal("expected error for fractional limit")
+	}
+}
+
+func TestDecodeMessageListParamSafeInteger(t *testing.T) {
+	_, err := satoriserver.DecodeParams[satoriserver.MessageListParam](map[string]any{
+		"channel_id": "c1",
+		"limit":      int64(9007199254740992),
+	})
+	if err == nil {
+		t.Fatal("expected error for out-of-range limit")
+	}
+
+	params, err := satoriserver.DecodeParams[satoriserver.MessageListParam](map[string]any{
+		"channel_id": "c1",
+		"limit":      int64(100),
+	})
+	if err != nil {
+		t.Fatalf("decode valid limit failed: %v", err)
+	}
+	limit, ok := params.Limit.Get()
+	if !ok || limit != 100 {
+		t.Fatalf("limit parse mismatch: ok=%v value=%d", ok, limit)
+	}
+}
+
+func TestDecodeMessageListParamOptionMissing(t *testing.T) {
+	params, err := satoriserver.DecodeParams[satoriserver.MessageListParam](map[string]any{
+		"channel_id": "c1",
+	})
+	if err != nil {
+		t.Fatalf("decode failed: %v", err)
+	}
+	if params.Limit.IsSome() {
+		t.Fatal("limit should be none when field is missing")
+	}
+}
+
+func TestDecodeGuildMemberMuteParamStrictNumber(t *testing.T) {
+	_, err := satoriserver.DecodeParams[satoriserver.GuildMemberMuteParam](map[string]any{
+		"guild_id": "g1",
+		"user_id":  "u1",
+		"duration": "1000",
+	})
+	if err == nil {
+		t.Fatal("expected error for string duration")
+	}
+
+	_, err = satoriserver.DecodeParams[satoriserver.GuildMemberMuteParam](map[string]any{
+		"guild_id": "g1",
+		"user_id":  "u1",
+		"duration": int64(9007199254740992),
+	})
+	if err == nil {
+		t.Fatal("expected error for out-of-range duration")
+	}
+}
+
 func toInt(t *testing.T, value any) int {
 	t.Helper()
 	switch typed := value.(type) {

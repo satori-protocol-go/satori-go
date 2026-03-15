@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"net/http"
+	"strconv"
 	"strings"
 
 	botgodto "github.com/WindowsSov8forUs/botgo-plus/dto"
@@ -107,8 +108,11 @@ func optionalString(text string) string {
 	return strings.TrimSpace(text)
 }
 
-func optionalInt(value satoriserver.OptionalInt) (int, bool) {
-	return value.Int()
+func int64ToInt(value int64, key string) (int, error) {
+	if strconv.IntSize == 32 && (value < -2147483648 || value > 2147483647) {
+		return 0, satoriserver.BadRequest(fmt.Sprintf("%s is out of range", key))
+	}
+	return int(value), nil
 }
 
 func splitGuildCompositeID(id string) string {

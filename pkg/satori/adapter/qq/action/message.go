@@ -19,6 +19,10 @@ func (h *Handler) handleMessageCreate(request satoriserver.Request[satoriserver.
 		return nil, err
 	}
 	content := request.Params.Content
+	referrer, err := parseMessageReferrer(request.Params.Referrer)
+	if err != nil {
+		return nil, err
+	}
 
 	if h.sender == nil {
 		return []*message.Message{}, nil
@@ -27,7 +31,7 @@ func (h *Handler) handleMessageCreate(request satoriserver.Request[satoriserver.
 		Platform:  request.Platform,
 		ChannelID: channelID,
 		Content:   content,
-		Referrer:  parseMessageReferrer(request.Params.Referrer),
+		Referrer:  referrer,
 	})
 	if err != nil {
 		if errors.Is(err, qqmessagesend.ErrUnsupportedPlatform) {
@@ -152,17 +156,24 @@ func (h *Handler) handleMessageList(request satoriserver.Request[satoriserver.Me
 	}
 
 	pager := &botgodto.MessagesPager{Limit: "20"}
-	if limit, ok := optionalInt(request.Params.Limit); ok && limit > 0 {
-		pager.Limit = strconv.Itoa(limit)
+	if limit, ok := request.Params.Limit.Get(); ok && limit > 0 {
+		pager.Limit = strconv.FormatInt(limit, 10)
 	}
-	if next := optionalString(request.Params.Next); next != "" {
-		switch strings.ToLower(optionalString(request.Params.Direction)) {
-		case "after":
-			pager.Type = botgodto.MPTAfter
-		default:
-			pager.Type = botgodto.MPTBefore
+	if nextValue, ok := request.Params.Next.Get(); ok {
+		next := strings.TrimSpace(nextValue)
+		if next != "" {
+			direction := ""
+			if directionValue, ok := request.Params.Direction.Get(); ok {
+				direction = strings.ToLower(strings.TrimSpace(directionValue))
+			}
+			switch direction {
+			case "after":
+				pager.Type = botgodto.MPTAfter
+			default:
+				pager.Type = botgodto.MPTBefore
+			}
+			pager.ID = next
 		}
-		pager.ID = next
 	}
 
 	items, err := api.Messages(requestContext(request.Origin), channelID, pager)
@@ -184,16 +195,25 @@ func (h *Handler) handleMessageList(request satoriserver.Request[satoriserver.Me
 	return response, nil
 }
 
-func parseMessageReferrer(raw *satoriserver.MessageReferrerParam) qqmessagesend.Referrer {
+func parseMessageReferrer(raw satoriserver.Option[satoriserver.MessageReferrerParam]) (qqmessagesend.Referrer, error) {
 	result := qqmessagesend.Referrer{}
-	if raw == nil {
-		return result
+	referrer, ok := raw.Get()
+	if !ok {
+		return result, nil
 	}
-	result.MsgID = optionalString(raw.MsgID)
-	result.Direct = raw.Direct
-	if seq, ok := optionalInt(raw.MsgSeq); ok {
-		result.MsgSeq = seq
+	if msgID, ok := referrer.MsgID.Get(); ok {
+		result.MsgID = strings.TrimSpace(msgID)
+	}
+	if direct, ok := referrer.Direct.Get(); ok {
+		result.Direct = direct
+	}
+	if seq, ok := referrer.MsgSeq.Get(); ok {
+		parsed, err := int64ToInt(seq, "msg_seq")
+		if err != nil {
+			return result, err
+		}
+		result.MsgSeq = parsed
 		result.HasMsgSeq = true
 	}
-	return result
+	return result, nil
 }

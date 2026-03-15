@@ -20,7 +20,11 @@ func (h *Handler) handleUserChannelCreate(request satoriserver.Request[satoriser
 	case "qq":
 		return &channel.Channel{Id: "private:" + userID, Type: channel.ChannelTypeDirect}, nil
 	case "qqguild":
-		guildID, err := requiredString(request.Params.GuildID, "guild_id")
+		guildIDRaw, ok := request.Params.GuildID.Get()
+		if !ok {
+			return nil, satoriserver.BadRequest("guild_id is required")
+		}
+		guildID, err := requiredString(guildIDRaw, "guild_id")
 		if err != nil {
 			return nil, err
 		}

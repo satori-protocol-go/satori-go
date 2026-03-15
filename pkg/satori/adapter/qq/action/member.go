@@ -2,6 +2,7 @@ package action
 
 import (
 	"strconv"
+	"strings"
 
 	botgodto "github.com/WindowsSov8forUs/botgo-plus/dto"
 	qqcodec "github.com/satori-protocol-go/satori-go/pkg/satori/adapter/qq/codec"
@@ -51,8 +52,11 @@ func (h *Handler) handleGuildMemberList(request satoriserver.Request[satoriserve
 	}
 
 	pager := &botgodto.GuildMembersPager{After: "0", Limit: "400"}
-	if next := optionalString(request.Params.Next); next != "" {
-		pager.After = next
+	if nextValue, ok := request.Params.Next.Get(); ok {
+		next := strings.TrimSpace(nextValue)
+		if next != "" {
+			pager.After = next
+		}
 	}
 
 	items, err := api.GuildMembers(requestContext(request.Origin), splitGuildCompositeID(guildID), pager)
@@ -110,11 +114,11 @@ func (h *Handler) handleGuildMemberMute(request satoriserver.Request[satoriserve
 		return nil, err
 	}
 
-	seconds := 0
+	seconds := int64(0)
 	if request.Params.Duration > 0 {
 		seconds = request.Params.Duration / 1000
 	}
-	mute := &botgodto.UpdateGuildMute{MuteSeconds: strconv.Itoa(seconds)}
+	mute := &botgodto.UpdateGuildMute{MuteSeconds: strconv.FormatInt(seconds, 10)}
 	if err := api.MemberMute(requestContext(request.Origin), splitGuildCompositeID(guildID), userID, mute); err != nil {
 		return nil, err
 	}
