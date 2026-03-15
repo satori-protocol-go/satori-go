@@ -275,6 +275,7 @@ func Transform(elements []*xhtml.Element) ([]Element, error) {
 				}
 				element.AddChild(children...)
 			}
+			message = append(message, element)
 		} else if slices.Contains([]string{"a", "link"}, tag) {
 			link, err := New[*A](elem.Attrs)
 			if err != nil {
