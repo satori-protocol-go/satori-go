@@ -5,77 +5,250 @@ import (
 	"encoding/json"
 	"fmt"
 	"mime/multipart"
+	"reflect"
 	"strings"
+
+	"github.com/satori-protocol-go/satori-go/pkg/satori/model"
+	"github.com/satori-protocol-go/satori-go/pkg/satori/types"
 )
 
-const maxJSSafeInteger int64 = 9007199254740991
-
 func validateSafeIntegerField(field string, value int64) error {
-	if value < -maxJSSafeInteger || value > maxJSSafeInteger {
+	if value < -types.MaxJSSafeInteger || value > types.MaxJSSafeInteger {
 		return fmt.Errorf("%s exceeds JavaScript safe integer range", field)
 	}
 	return nil
 }
 
-func decodeParamJSON(data []byte, target any) error {
-	decoder := json.NewDecoder(bytes.NewReader(data))
-	decoder.UseNumber()
-	return decoder.Decode(target)
+func validateDecodedParamTags(value any) error {
+	return walkValidateTags(reflect.ValueOf(value), "")
 }
 
-type MessageReferrerParam struct {
-	Direct Option[bool]   `json:"direct"`
-	MsgID  Option[string] `json:"msg_id"`
-	MsgSeq Option[int64]  `json:"msg_seq"`
-}
-
-func (p *MessageReferrerParam) UnmarshalJSON(data []byte) error {
-	type raw struct {
-		Direct *bool   `json:"direct"`
-		MsgID  *string `json:"msg_id"`
-		MsgSeq *int64  `json:"msg_seq"`
+func walkValidateTags(value reflect.Value, fieldPath string) error {
+	if !value.IsValid() {
+		return nil
 	}
-	value := raw{}
-	if err := decodeParamJSON(data, &value); err != nil {
-		return err
-	}
-	p.Direct = optionFromPointer(value.Direct)
-	if value.MsgID == nil {
-		p.MsgID = None[string]()
-	} else {
-		p.MsgID = Some(strings.TrimSpace(*value.MsgID))
-	}
-	if value.MsgSeq == nil {
-		p.MsgSeq = None[int64]()
-	} else {
-		if err := validateSafeIntegerField("msg_seq", *value.MsgSeq); err != nil {
-			return err
+	for value.Kind() == reflect.Interface || value.Kind() == reflect.Pointer {
+		if value.IsNil() {
+			return nil
 		}
-		p.MsgSeq = Some(*value.MsgSeq)
+		value = value.Elem()
+	}
+
+	switch value.Kind() {
+	case reflect.Struct:
+		typ := value.Type()
+		for i := 0; i < value.NumField(); i++ {
+			structField := typ.Field(i)
+			if structField.PkgPath != "" {
+				continue
+			}
+			structValue := value.Field(i)
+			currentPath := structField.Name
+			if fieldPath != "" {
+				currentPath = fieldPath + "." + structField.Name
+			}
+			if tag := strings.TrimSpace(structField.Tag.Get("validate")); tag != "" {
+				if err := applyValidateRules(tag, structValue, currentPath); err != nil {
+					return err
+				}
+			}
+			if err := walkValidateTags(structValue, currentPath); err != nil {
+				return err
+			}
+		}
+	case reflect.Array, reflect.Slice:
+		for i := 0; i < value.Len(); i++ {
+			if err := walkValidateTags(value.Index(i), fieldPath); err != nil {
+				return err
+			}
+		}
+	case reflect.Map:
+		iterator := value.MapRange()
+		for iterator.Next() {
+			if err := walkValidateTags(iterator.Value(), fieldPath); err != nil {
+				return err
+			}
+		}
+	}
+
+	return nil
+}
+
+func applyValidateRules(tag string, value reflect.Value, fieldPath string) error {
+	rules := strings.Split(tag, ",")
+	for _, rawRule := range rules {
+		rule := strings.TrimSpace(rawRule)
+		switch rule {
+		case "", "-":
+			continue
+		case "safe_int":
+			integer, ok := valueToInt64(value)
+			if !ok {
+				return fmt.Errorf("%s must be an integer", fieldPath)
+			}
+			if err := validateSafeIntegerField(fieldPath, integer); err != nil {
+				return err
+			}
+		default:
+			return fmt.Errorf("unknown validate rule %q on %s", rule, fieldPath)
+		}
 	}
 	return nil
 }
+
+func valueToInt64(value reflect.Value) (int64, bool) {
+	if !value.IsValid() {
+		return 0, false
+	}
+	for value.Kind() == reflect.Interface || value.Kind() == reflect.Pointer {
+		if value.IsNil() {
+			return 0, false
+		}
+		value = value.Elem()
+	}
+
+	switch value.Kind() {
+	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
+		return value.Int(), true
+	case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64, reflect.Uintptr:
+		unsigned := value.Uint()
+		if unsigned > uint64(1<<63-1) {
+			return 0, false
+		}
+		return int64(unsigned), true
+	default:
+		return 0, false
+	}
+}
+
+func decodeParams[T any](raw any) (T, error) {
+	var params T
+	if raw == nil {
+		return params, nil
+	}
+	if casted, ok := raw.(T); ok {
+		if err := validateDecodedParamTags(casted); err != nil {
+			return params, BadRequest(err.Error())
+		}
+		return casted, nil
+	}
+
+	data, err := json.Marshal(raw)
+	if err != nil {
+		return params, BadRequest("invalid request params")
+	}
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	decoder.UseNumber()
+	if err := decoder.Decode(&params); err != nil {
+		return params, BadRequest("invalid request params")
+	}
+	if err := validateDecodedParamTags(params); err != nil {
+		return params, BadRequest(err.Error())
+	}
+	return params, nil
+}
+
+type ChannelParam struct {
+	ChannelID string `json:"channel_id"`
+}
+
+type ChannelListParam struct {
+	GuildID string               `json:"guild_id"`
+	Next    types.Option[string] `json:"next"`
+}
+
+type ChannelCreateParam struct {
+	GuildID string        `json:"guild_id"`
+	Data    model.Channel `json:"data"`
+}
+
+type ChannelUpdateParam struct {
+	ChannelID string        `json:"channel_id"`
+	Data      model.Channel `json:"data"`
+}
+
+type ChannelMuteParam struct {
+	ChannelID string `json:"channel_id"`
+	Duration  int64  `json:"duration" validate:"safe_int"`
+}
+
+type UserChannelCreateParam struct {
+	UserID  string               `json:"user_id"`
+	GuildID types.Option[string] `json:"guild_id"`
+}
+
+type FriendListParam struct {
+	Next types.Option[string] `json:"next"`
+}
+
+type FriendDeleteParam struct {
+	UserID string `json:"user_id"`
+}
+
+type ApproveParam struct {
+	MessageID string               `json:"message_id"`
+	Approve   bool                 `json:"approve"`
+	Comment   types.Option[string] `json:"comment"`
+}
+
+type GuildGetParam struct {
+	GuildID string `json:"guild_id"`
+}
+
+type GuildListParam struct {
+	Next types.Option[string] `json:"next"`
+}
+
+type GuildMemberGetParam struct {
+	GuildID string `json:"guild_id"`
+	UserID  string `json:"user_id"`
+}
+
+type GuildListByGuildParam struct {
+	GuildID string               `json:"guild_id"`
+	Next    types.Option[string] `json:"next"`
+}
+
+type GuildMemberKickParam struct {
+	GuildID   string             `json:"guild_id"`
+	UserID    string             `json:"user_id"`
+	Permanent types.Option[bool] `json:"permanent"`
+}
+
+type GuildMemberMuteParam struct {
+	GuildID  string `json:"guild_id"`
+	UserID   string `json:"user_id"`
+	Duration int64  `json:"duration" validate:"safe_int"`
+}
+
+type GuildMemberRoleParam struct {
+	GuildID string `json:"guild_id"`
+	UserID  string `json:"user_id"`
+	RoleID  string `json:"role_id"`
+}
+
+type GuildRoleCreateParam struct {
+	GuildID string          `json:"guild_id"`
+	Role    model.GuildRole `json:"role"`
+}
+
+type GuildRoleUpdateParam struct {
+	GuildID string          `json:"guild_id"`
+	RoleID  string          `json:"role_id"`
+	Role    model.GuildRole `json:"role"`
+}
+
+type GuildRoleDeleteParam struct {
+	GuildID string `json:"guild_id"`
+	RoleID  string `json:"role_id"`
+}
+
+type LoginGetParam struct{}
 
 type MessageCreateParam struct {
 	ChannelID string                       `json:"channel_id"`
 	Content   string                       `json:"content"`
-	Referrer  Option[MessageReferrerParam] `json:"referrer"`
-}
-
-func (p *MessageCreateParam) UnmarshalJSON(data []byte) error {
-	type raw struct {
-		ChannelID string                `json:"channel_id"`
-		Content   string                `json:"content"`
-		Referrer  *MessageReferrerParam `json:"referrer"`
-	}
-	value := raw{}
-	if err := decodeParamJSON(data, &value); err != nil {
-		return err
-	}
-	p.ChannelID = value.ChannelID
-	p.Content = value.Content
-	p.Referrer = optionFromPointer(value.Referrer)
-	return nil
+	Referrer  types.Option[map[string]any] `json:"referrer"`
 }
 
 type MessageOpParam struct {
@@ -90,395 +263,43 @@ type MessageUpdateParam struct {
 }
 
 type MessageListParam struct {
-	ChannelID string         `json:"channel_id"`
-	Next      Option[string] `json:"next"`
-	Direction Option[string] `json:"direction"`
-	Limit     Option[int64]  `json:"limit"`
-	Order     Option[string] `json:"order"`
-}
-
-func (p *MessageListParam) UnmarshalJSON(data []byte) error {
-	type raw struct {
-		ChannelID string  `json:"channel_id"`
-		Next      *string `json:"next"`
-		Direction *string `json:"direction"`
-		Limit     *int64  `json:"limit"`
-		Order     *string `json:"order"`
-	}
-	value := raw{}
-	if err := decodeParamJSON(data, &value); err != nil {
-		return err
-	}
-	p.ChannelID = value.ChannelID
-	if value.Next == nil {
-		p.Next = None[string]()
-	} else {
-		p.Next = Some(strings.TrimSpace(*value.Next))
-	}
-	if value.Direction == nil {
-		p.Direction = None[string]()
-	} else {
-		p.Direction = Some(strings.TrimSpace(*value.Direction))
-	}
-	if value.Limit == nil {
-		p.Limit = None[int64]()
-	} else {
-		if err := validateSafeIntegerField("limit", *value.Limit); err != nil {
-			return err
-		}
-		p.Limit = Some(*value.Limit)
-	}
-	if value.Order == nil {
-		p.Order = None[string]()
-	} else {
-		p.Order = Some(strings.TrimSpace(*value.Order))
-	}
-	return nil
-}
-
-type ChannelParam struct {
-	ChannelID string `json:"channel_id"`
-}
-
-type ChannelListParam struct {
-	GuildID string         `json:"guild_id"`
-	Next    Option[string] `json:"next"`
-}
-
-func (p *ChannelListParam) UnmarshalJSON(data []byte) error {
-	type raw struct {
-		GuildID string  `json:"guild_id"`
-		Next    *string `json:"next"`
-	}
-	value := raw{}
-	if err := decodeParamJSON(data, &value); err != nil {
-		return err
-	}
-	p.GuildID = value.GuildID
-	if value.Next == nil {
-		p.Next = None[string]()
-	} else {
-		p.Next = Some(strings.TrimSpace(*value.Next))
-	}
-	return nil
-}
-
-type ChannelCreateParam struct {
-	GuildID string         `json:"guild_id"`
-	Data    map[string]any `json:"data"`
-}
-
-type ChannelUpdateParam struct {
-	ChannelID string         `json:"channel_id"`
-	Data      map[string]any `json:"data"`
-}
-
-type ChannelMuteParam struct {
-	ChannelID string `json:"channel_id"`
-	Duration  int64  `json:"duration"`
-}
-
-func (p *ChannelMuteParam) UnmarshalJSON(data []byte) error {
-	type raw struct {
-		ChannelID string `json:"channel_id"`
-		Duration  int64  `json:"duration"`
-	}
-	value := raw{}
-	if err := decodeParamJSON(data, &value); err != nil {
-		return err
-	}
-	if err := validateSafeIntegerField("duration", value.Duration); err != nil {
-		return err
-	}
-	p.ChannelID = value.ChannelID
-	p.Duration = value.Duration
-	return nil
-}
-
-type UserChannelCreateParam struct {
-	UserID  string         `json:"user_id"`
-	GuildID Option[string] `json:"guild_id"`
-}
-
-func (p *UserChannelCreateParam) UnmarshalJSON(data []byte) error {
-	type raw struct {
-		UserID  string  `json:"user_id"`
-		GuildID *string `json:"guild_id"`
-	}
-	value := raw{}
-	if err := decodeParamJSON(data, &value); err != nil {
-		return err
-	}
-	p.UserID = value.UserID
-	if value.GuildID == nil {
-		p.GuildID = None[string]()
-	} else {
-		p.GuildID = Some(strings.TrimSpace(*value.GuildID))
-	}
-	return nil
-}
-
-type GuildGetParam struct {
-	GuildID string `json:"guild_id"`
-}
-
-type GuildListParam struct {
-	Next Option[string] `json:"next"`
-}
-
-func (p *GuildListParam) UnmarshalJSON(data []byte) error {
-	type raw struct {
-		Next *string `json:"next"`
-	}
-	value := raw{}
-	if err := decodeParamJSON(data, &value); err != nil {
-		return err
-	}
-	if value.Next == nil {
-		p.Next = None[string]()
-	} else {
-		p.Next = Some(strings.TrimSpace(*value.Next))
-	}
-	return nil
-}
-
-type GuildMemberGetParam struct {
-	GuildID string `json:"guild_id"`
-	UserID  string `json:"user_id"`
-}
-
-type GuildListByGuildParam struct {
-	GuildID string         `json:"guild_id"`
-	Next    Option[string] `json:"next"`
-}
-
-func (p *GuildListByGuildParam) UnmarshalJSON(data []byte) error {
-	type raw struct {
-		GuildID string  `json:"guild_id"`
-		Next    *string `json:"next"`
-	}
-	value := raw{}
-	if err := decodeParamJSON(data, &value); err != nil {
-		return err
-	}
-	p.GuildID = value.GuildID
-	if value.Next == nil {
-		p.Next = None[string]()
-	} else {
-		p.Next = Some(strings.TrimSpace(*value.Next))
-	}
-	return nil
-}
-
-type GuildMemberKickParam struct {
-	GuildID   string       `json:"guild_id"`
-	UserID    string       `json:"user_id"`
-	Permanent Option[bool] `json:"permanent"`
-}
-
-func (p *GuildMemberKickParam) UnmarshalJSON(data []byte) error {
-	type raw struct {
-		GuildID   string `json:"guild_id"`
-		UserID    string `json:"user_id"`
-		Permanent *bool  `json:"permanent"`
-	}
-	value := raw{}
-	if err := decodeParamJSON(data, &value); err != nil {
-		return err
-	}
-	p.GuildID = value.GuildID
-	p.UserID = value.UserID
-	p.Permanent = optionFromPointer(value.Permanent)
-	return nil
-}
-
-type GuildMemberMuteParam struct {
-	GuildID  string `json:"guild_id"`
-	UserID   string `json:"user_id"`
-	Duration int64  `json:"duration"`
-}
-
-func (p *GuildMemberMuteParam) UnmarshalJSON(data []byte) error {
-	type raw struct {
-		GuildID  string `json:"guild_id"`
-		UserID   string `json:"user_id"`
-		Duration int64  `json:"duration"`
-	}
-	value := raw{}
-	if err := decodeParamJSON(data, &value); err != nil {
-		return err
-	}
-	if err := validateSafeIntegerField("duration", value.Duration); err != nil {
-		return err
-	}
-	p.GuildID = value.GuildID
-	p.UserID = value.UserID
-	p.Duration = value.Duration
-	return nil
-}
-
-type GuildMemberRoleParam struct {
-	GuildID string `json:"guild_id"`
-	UserID  string `json:"user_id"`
-	RoleID  string `json:"role_id"`
-}
-
-type GuildRoleCreateParam struct {
-	GuildID string         `json:"guild_id"`
-	Role    map[string]any `json:"role"`
-}
-
-type GuildRoleUpdateParam struct {
-	GuildID string         `json:"guild_id"`
-	RoleID  string         `json:"role_id"`
-	Role    map[string]any `json:"role"`
-}
-
-type GuildRoleDeleteParam struct {
-	GuildID string `json:"guild_id"`
-	RoleID  string `json:"role_id"`
+	ChannelID string                        `json:"channel_id"`
+	Next      types.Option[string]          `json:"next"`
+	Direction types.Option[model.Direction] `json:"direction"`
+	Limit     types.Option[int64]           `json:"limit"`
+	Order     types.Option[model.Order]     `json:"order"`
 }
 
 type ReactionCreateParam struct {
 	ChannelID string `json:"channel_id"`
 	MessageID string `json:"message_id"`
-	Emoji     string `json:"emoji"`
+	EmojiID   string `json:"emoji_id"`
 }
 
 type ReactionDeleteParam struct {
-	ChannelID string         `json:"channel_id"`
-	MessageID string         `json:"message_id"`
-	Emoji     string         `json:"emoji"`
-	UserID    Option[string] `json:"user_id"`
-}
-
-func (p *ReactionDeleteParam) UnmarshalJSON(data []byte) error {
-	type raw struct {
-		ChannelID string  `json:"channel_id"`
-		MessageID string  `json:"message_id"`
-		Emoji     string  `json:"emoji"`
-		UserID    *string `json:"user_id"`
-	}
-	value := raw{}
-	if err := decodeParamJSON(data, &value); err != nil {
-		return err
-	}
-	p.ChannelID = value.ChannelID
-	p.MessageID = value.MessageID
-	p.Emoji = value.Emoji
-	if value.UserID == nil {
-		p.UserID = None[string]()
-	} else {
-		p.UserID = Some(strings.TrimSpace(*value.UserID))
-	}
-	return nil
+	ChannelID string               `json:"channel_id"`
+	MessageID string               `json:"message_id"`
+	EmojiID   string               `json:"emoji_id"`
+	UserID    types.Option[string] `json:"user_id"`
 }
 
 type ReactionClearParam struct {
-	ChannelID string         `json:"channel_id"`
-	MessageID string         `json:"message_id"`
-	Emoji     Option[string] `json:"emoji"`
-}
-
-func (p *ReactionClearParam) UnmarshalJSON(data []byte) error {
-	type raw struct {
-		ChannelID string  `json:"channel_id"`
-		MessageID string  `json:"message_id"`
-		Emoji     *string `json:"emoji"`
-	}
-	value := raw{}
-	if err := decodeParamJSON(data, &value); err != nil {
-		return err
-	}
-	p.ChannelID = value.ChannelID
-	p.MessageID = value.MessageID
-	if value.Emoji == nil {
-		p.Emoji = None[string]()
-	} else {
-		p.Emoji = Some(strings.TrimSpace(*value.Emoji))
-	}
-	return nil
+	ChannelID string               `json:"channel_id"`
+	MessageID string               `json:"message_id"`
+	EmojiID   types.Option[string] `json:"emoji_id"`
 }
 
 type ReactionListParam struct {
-	ChannelID string         `json:"channel_id"`
-	MessageID string         `json:"message_id"`
-	Emoji     string         `json:"emoji"`
-	Next      Option[string] `json:"next"`
-}
-
-func (p *ReactionListParam) UnmarshalJSON(data []byte) error {
-	type raw struct {
-		ChannelID string  `json:"channel_id"`
-		MessageID string  `json:"message_id"`
-		Emoji     string  `json:"emoji"`
-		Next      *string `json:"next"`
-	}
-	value := raw{}
-	if err := decodeParamJSON(data, &value); err != nil {
-		return err
-	}
-	p.ChannelID = value.ChannelID
-	p.MessageID = value.MessageID
-	p.Emoji = value.Emoji
-	if value.Next == nil {
-		p.Next = None[string]()
-	} else {
-		p.Next = Some(strings.TrimSpace(*value.Next))
-	}
-	return nil
+	ChannelID string               `json:"channel_id"`
+	MessageID string               `json:"message_id"`
+	EmojiID   string               `json:"emoji_id"`
+	Next      types.Option[string] `json:"next"`
 }
 
 type UserGetParam struct {
 	UserID string `json:"user_id"`
 }
 
-type FriendListParam struct {
-	Next Option[string] `json:"next"`
-}
-
-func (p *FriendListParam) UnmarshalJSON(data []byte) error {
-	type raw struct {
-		Next *string `json:"next"`
-	}
-	value := raw{}
-	if err := decodeParamJSON(data, &value); err != nil {
-		return err
-	}
-	if value.Next == nil {
-		p.Next = None[string]()
-	} else {
-		p.Next = Some(strings.TrimSpace(*value.Next))
-	}
-	return nil
-}
-
-type ApproveParam struct {
-	MessageID string         `json:"message_id"`
-	Approve   bool           `json:"approve"`
-	Comment   Option[string] `json:"comment"`
-}
-
-func (p *ApproveParam) UnmarshalJSON(data []byte) error {
-	type raw struct {
-		MessageID string  `json:"message_id"`
-		Approve   bool    `json:"approve"`
-		Comment   *string `json:"comment"`
-	}
-	value := raw{}
-	if err := decodeParamJSON(data, &value); err != nil {
-		return err
-	}
-	p.MessageID = value.MessageID
-	p.Approve = value.Approve
-	if value.Comment == nil {
-		p.Comment = None[string]()
-	} else {
-		p.Comment = Some(strings.TrimSpace(*value.Comment))
-	}
-	return nil
-}
-
-type LoginGetParam map[string]any
-
 type UploadCreateParam = *multipart.Form
+
+type InternalParam = map[string]any

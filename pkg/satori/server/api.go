@@ -3,93 +3,102 @@ package server
 type Api string
 
 const (
-	ApiMessageCreate Api = "message.create"
-	ApiMessageUpdate Api = "message.update"
-	ApiMessageGet    Api = "message.get"
-	ApiMessageDelete Api = "message.delete"
-	ApiMessageList   Api = "message.list"
+	ApiChannelGet        Api = "channel.get"         // 获取群组频道
+	ApiChannelList       Api = "channel.list"        // 获取群组频道列表
+	ApiChannelCreate     Api = "channel.create"      // 创建群组频道
+	ApiChannelUpdate     Api = "channel.update"      // 修改群组频道
+	ApiChannelDelete     Api = "channel.delete"      // 删除群组频道
+	ApiChannelMute       Api = "channel.mute"        // 禁言群组频道
+	ApiUserChannelCreate Api = "user.channel.create" // 创建私聊频道
 
-	ApiChannelGet        Api = "channel.get"
-	ApiChannelList       Api = "channel.list"
-	ApiChannelCreate     Api = "channel.create"
-	ApiChannelUpdate     Api = "channel.update"
-	ApiChannelDelete     Api = "channel.delete"
-	ApiChannelMute       Api = "channel.mute"
-	ApiUserChannelCreate Api = "user.channel.create"
+	ApiFriendList    Api = "friend.list"    // 获取好友列表
+	ApiFriendDelete  Api = "friend.delete"  // 删除好友
+	ApiFriendApprove Api = "friend.approve" // 处理好友申请
 
-	ApiGuildGet     Api = "guild.get"
-	ApiGuildList    Api = "guild.list"
-	ApiGuildApprove Api = "guild.approve"
+	ApiGuildGet     Api = "guild.get"     // 获取群组
+	ApiGuildList    Api = "guild.list"    // 获取群组列表
+	ApiGuildApprove Api = "guild.approve" // 处理群组邀请
 
-	ApiGuildMemberList      Api = "guild.member.list"
-	ApiGuildMemberGet       Api = "guild.member.get"
-	ApiGuildMemberKick      Api = "guild.member.kick"
-	ApiGuildMemberMute      Api = "guild.member.mute"
-	ApiGuildMemberApprove   Api = "guild.member.approve"
-	ApiGuildMemberRoleSet   Api = "guild.member.role.set"
-	ApiGuildMemberRoleUnset Api = "guild.member.role.unset"
+	ApiGuildMemberGet     Api = "guild.member.get"     // 获取群组成员
+	ApiGuildMemberList    Api = "guild.member.list"    // 获取群组成员列表
+	ApiGuildMemberKick    Api = "guild.member.kick"    // 踢出群组成员
+	ApiGuildMemberMute    Api = "guild.member.mute"    // 禁言群组成员
+	ApiGuildMemberApprove Api = "guild.member.approve" // 通过群组成员申请
 
-	ApiGuildRoleList   Api = "guild.role.list"
-	ApiGuildRoleCreate Api = "guild.role.create"
-	ApiGuildRoleUpdate Api = "guild.role.update"
-	ApiGuildRoleDelete Api = "guild.role.delete"
+	ApiGuildMemberRoleSet   Api = "guild.member.role.set"   // 设置群组成员角色
+	ApiGuildMemberRoleUnset Api = "guild.member.role.unset" // 取消群组成员角色
+	ApiGuildRoleList        Api = "guild.role.list"         // 获取群组角色列表
+	ApiGuildRoleCreate      Api = "guild.role.create"       // 创建群组角色
+	ApiGuildRoleUpdate      Api = "guild.role.update"       // 修改群组角色
+	ApiGuildRoleDelete      Api = "guild.role.delete"       // 删除群组角色
 
-	ApiReactionCreate Api = "reaction.create"
-	ApiReactionDelete Api = "reaction.delete"
-	ApiReactionClear  Api = "reaction.clear"
-	ApiReactionList   Api = "reaction.list"
+	ApiLoginGet Api = "login.get" // 获取登录信息
 
-	ApiLoginGet Api = "login.get"
+	ApiMessageCreate Api = "message.create" // 发送消息
+	ApiMessageGet    Api = "message.get"    // 获取消息
+	ApiMessageDelete Api = "message.delete" // 撤回消息
+	ApiMessageUpdate Api = "message.update" // 编辑消息
+	ApiMessageList   Api = "message.list"   // 获取消息列表
 
-	ApiUserGet       Api = "user.get"
-	ApiFriendList    Api = "friend.list"
-	ApiFriendApprove Api = "friend.approve"
+	ApiReactionCreate Api = "reaction.create" // 添加表态
+	ApiReactionDelete Api = "reaction.delete" // 删除表态
+	ApiReactionClear  Api = "reaction.clear"  // 清除表态
+	ApiReactionList   Api = "reaction.list"   // 获取表态列表
 
-	ApiUploadCreate Api = "upload.create"
+	ApiUserGet Api = "user.get" // 获取用户信息
+
+	ApiUploadCreate Api = "upload.create" // 文件上传
 )
 
-var apiActionSet = map[string]struct{}{
-	string(ApiMessageCreate): {},
-	string(ApiMessageUpdate): {},
-	string(ApiMessageGet):    {},
-	string(ApiMessageDelete): {},
-	string(ApiMessageList):   {},
+var apiSet = map[Api]struct{}{
+	ApiChannelGet:        {},
+	ApiChannelList:       {},
+	ApiChannelCreate:     {},
+	ApiChannelUpdate:     {},
+	ApiChannelDelete:     {},
+	ApiChannelMute:       {},
+	ApiUserChannelCreate: {},
 
-	string(ApiChannelGet):        {},
-	string(ApiChannelList):       {},
-	string(ApiChannelCreate):     {},
-	string(ApiChannelUpdate):     {},
-	string(ApiChannelDelete):     {},
-	string(ApiChannelMute):       {},
-	string(ApiUserChannelCreate): {},
+	ApiFriendList:    {},
+	ApiFriendDelete:  {},
+	ApiFriendApprove: {},
 
-	string(ApiGuildGet):     {},
-	string(ApiGuildList):    {},
-	string(ApiGuildApprove): {},
+	ApiGuildGet:     {},
+	ApiGuildList:    {},
+	ApiGuildApprove: {},
 
-	string(ApiGuildMemberList):      {},
-	string(ApiGuildMemberGet):       {},
-	string(ApiGuildMemberKick):      {},
-	string(ApiGuildMemberMute):      {},
-	string(ApiGuildMemberApprove):   {},
-	string(ApiGuildMemberRoleSet):   {},
-	string(ApiGuildMemberRoleUnset): {},
+	ApiGuildMemberGet:     {},
+	ApiGuildMemberList:    {},
+	ApiGuildMemberKick:    {},
+	ApiGuildMemberMute:    {},
+	ApiGuildMemberApprove: {},
 
-	string(ApiGuildRoleList):   {},
-	string(ApiGuildRoleCreate): {},
-	string(ApiGuildRoleUpdate): {},
-	string(ApiGuildRoleDelete): {},
+	ApiGuildMemberRoleSet:   {},
+	ApiGuildMemberRoleUnset: {},
+	ApiGuildRoleList:        {},
+	ApiGuildRoleCreate:      {},
+	ApiGuildRoleUpdate:      {},
+	ApiGuildRoleDelete:      {},
 
-	string(ApiReactionCreate): {},
-	string(ApiReactionDelete): {},
-	string(ApiReactionClear):  {},
-	string(ApiReactionList):   {},
+	ApiLoginGet: {},
 
-	string(ApiLoginGet): {},
+	ApiMessageCreate: {},
+	ApiMessageGet:    {},
+	ApiMessageDelete: {},
+	ApiMessageUpdate: {},
+	ApiMessageList:   {},
 
-	string(ApiUserGet):       {},
-	string(ApiFriendList):    {},
-	string(ApiFriendApprove): {},
+	ApiReactionCreate: {},
+	ApiReactionDelete: {},
+	ApiReactionClear:  {},
+	ApiReactionList:   {},
 
-	string(ApiUploadCreate): {},
+	ApiUserGet: {},
+
+	ApiUploadCreate: {},
+}
+
+func isExistApi(api Api) bool {
+	_, ok := apiSet[api]
+	return ok
 }

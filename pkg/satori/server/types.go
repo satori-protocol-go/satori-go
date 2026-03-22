@@ -2,27 +2,22 @@ package server
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
-	"fmt"
+	"io"
+	"net"
 	"net/http"
+	"net/url"
+	"os"
 	"time"
 
+	"github.com/go-chi/chi/v5"
 	"github.com/satori-protocol-go/satori-go/pkg/satori/model/event"
 	"github.com/satori-protocol-go/satori-go/pkg/satori/model/login"
 )
 
-type Request[T any] struct {
-	Origin   *http.Request
-	Action   string
-	Params   T
-	Platform string
-	SelfID   string
-}
-
-type RouteCall func(request Request[any]) (any, error)
-
 type Router interface {
-	Routes() map[string]RouteCall
+	Routes() map[string]RouteCall[any, any]
 }
 
 type Provider interface {
@@ -36,24 +31,27 @@ type Provider interface {
 type Adapter interface {
 	Provider
 	Router
-}
-
-type ServerAware interface {
 	EnsureServer(server *Server)
 }
 
-type RootRoute struct {
-	Path    string
-	Methods []string
-	Handler http.Handler
-}
-
-type RootRouteProvider interface {
-	RootRoutes() []RootRoute
+type RootRouteRegistrar interface {
+	RegisterRootRoutes(router chi.Router)
 }
 
 type EventPublisher interface {
 	Publisher(ctx context.Context) <-chan *event.Event
+}
+
+type Preparable interface {
+	Prepare(ctx context.Context) error
+}
+
+type Blockable interface {
+	Block(ctx context.Context) error
+}
+
+type Cleanable interface {
+	Cleanup(ctx context.Context) error
 }
 
 type WebhookEndpoint struct {
@@ -63,16 +61,28 @@ type WebhookEndpoint struct {
 }
 
 type Response struct {
-	StatusCode int
-	Header     http.Header
-	Body       []byte
+	StatusCode    int
+	Header        http.Header
+	Body          []byte
+	Stream        io.ReadCloser
+	ContentLength int64
 }
 
 func NewResponse(statusCode int, body []byte) *Response {
 	return &Response{
-		StatusCode: statusCode,
-		Header:     http.Header{},
-		Body:       body,
+		StatusCode:    statusCode,
+		Header:        http.Header{},
+		Body:          body,
+		ContentLength: int64(len(body)),
+	}
+}
+
+func NewStreamResponse(statusCode int, stream io.ReadCloser) *Response {
+	return &Response{
+		StatusCode:    statusCode,
+		Header:        http.Header{},
+		Stream:        stream,
+		ContentLength: -1,
 	}
 }
 
@@ -83,13 +93,26 @@ func (r *Response) statusCodeOrDefault() int {
 	return r.StatusCode
 }
 
-type ActionFailed struct {
-	Code    int
+func (r *Response) closeStream() {
+	if r == nil || r.Stream == nil {
+		return
+	}
+	_ = r.Stream.Close()
+	r.Stream = nil
+}
+
+type SatoriError interface {
+	error
+	HTTPStatus() int
+}
+
+type ActionError struct {
+	Status  int
 	Message string
 	Err     error
 }
 
-func (e *ActionFailed) Error() string {
+func (e *ActionError) Error() string {
 	if e == nil {
 		return ""
 	}
@@ -99,48 +122,51 @@ func (e *ActionFailed) Error() string {
 	if e.Err != nil {
 		return e.Err.Error()
 	}
-	if e.Code > 0 {
-		return http.StatusText(e.Code)
+	if e.Status > 0 {
+		return http.StatusText(e.Status)
 	}
 	return "action failed"
 }
 
-func (e *ActionFailed) Unwrap() error {
+func (e *ActionError) Unwrap() error {
 	if e == nil {
 		return nil
 	}
 	return e.Err
 }
 
-func NewActionFailed(code int, message string, err error) *ActionFailed {
-	if code == 0 {
-		code = http.StatusBadRequest
+func (e *ActionError) HTTPStatus() int {
+	if e == nil || e.Status <= 0 {
+		return http.StatusInternalServerError
 	}
-	return &ActionFailed{
-		Code:    code,
+	return e.Status
+}
+
+func NewActionError(status int, message string, err error) *ActionError {
+	if status == 0 {
+		status = http.StatusBadRequest
+	}
+	return &ActionError{
+		Status:  status,
 		Message: message,
 		Err:     err,
 	}
 }
 
-func actionFailedf(code int, format string, args ...any) error {
-	return NewActionFailed(code, fmt.Sprintf(format, args...), nil)
-}
-
 func BadRequest(message string) error {
-	return NewActionFailed(http.StatusBadRequest, message, nil)
+	return NewActionError(http.StatusBadRequest, message, nil)
 }
 
 func Unauthorized(message string) error {
-	return NewActionFailed(http.StatusUnauthorized, message, nil)
+	return NewActionError(http.StatusUnauthorized, message, nil)
 }
 
 func Forbidden(message string) error {
-	return NewActionFailed(http.StatusForbidden, message, nil)
+	return NewActionError(http.StatusForbidden, message, nil)
 }
 
 func NotFound(message string) error {
-	return NewActionFailed(http.StatusNotFound, message, nil)
+	return NewActionError(http.StatusNotFound, message, nil)
 }
 
 func statusFromError(err error) int {
@@ -153,9 +179,31 @@ func statusFromError(err error) int {
 	case errors.Is(err, context.DeadlineExceeded):
 		return http.StatusGatewayTimeout
 	default:
-		var actionErr *ActionFailed
-		if errors.As(err, &actionErr) && actionErr.Code != 0 {
-			return actionErr.Code
+		var sErr SatoriError
+		if errors.As(err, &sErr) {
+			return sErr.HTTPStatus()
+		}
+		if errors.Is(err, os.ErrNotExist) {
+			return http.StatusNotFound
+		}
+		if errors.Is(err, os.ErrPermission) {
+			return http.StatusForbidden
+		}
+		var syntaxErr *json.SyntaxError
+		if errors.As(err, &syntaxErr) {
+			return http.StatusBadRequest
+		}
+		var unmarshalTypeErr *json.UnmarshalTypeError
+		if errors.As(err, &unmarshalTypeErr) {
+			return http.StatusBadRequest
+		}
+		var urlErr *url.Error
+		if errors.As(err, &urlErr) && urlErr.Timeout() {
+			return http.StatusGatewayTimeout
+		}
+		var netErr net.Error
+		if errors.As(err, &netErr) && netErr.Timeout() {
+			return http.StatusGatewayTimeout
 		}
 		return http.StatusInternalServerError
 	}
