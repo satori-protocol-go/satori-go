@@ -221,10 +221,36 @@ func (a *Account) EnsureURL(raw string) string {
 }
 
 func (a *Account) Custom(config APIConfig, protocolFactory ProtocolFactory) *Account {
+	options := []CustomOption{}
+	if config != nil {
+		options = append(options, WithCustomConfig(config))
+	}
+	if protocolFactory != nil {
+		options = append(options, WithCustomProtocolFactory(protocolFactory))
+	}
+	return a.CustomWith(options...)
+}
+
+func (a *Account) CustomWith(options ...CustomOption) *Account {
+	settings := &customOptions{
+		config: a.Config,
+	}
+	for _, option := range options {
+		if option == nil {
+			continue
+		}
+		option(settings)
+	}
+
+	config := settings.config
+	if settings.apiInfo != nil {
+		settings.apiInfo.normalize()
+		config = *settings.apiInfo
+	}
 	if config == nil {
 		config = a.Config
 	}
-	return NewAccount(a.SelfInfo, config, a.ProxyURLs(), protocolFactory)
+	return NewAccount(a.SelfInfo, config, a.ProxyURLs(), settings.protocolFactory)
 }
 
 func (a *Account) String() string {

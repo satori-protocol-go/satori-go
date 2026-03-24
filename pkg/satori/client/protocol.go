@@ -55,6 +55,7 @@ type InternalRequestOptions struct {
 	basicSet    bool
 	bearerToken string
 	tlsConfig   *tls.Config
+	rawRequest  []func(*http.Request)
 }
 
 type RequestOption func(*InternalRequestOptions)
@@ -225,6 +226,15 @@ func WithRequestTLSConfig(config *tls.Config) RequestOption {
 	}
 }
 
+func WithRawRequest(hook func(*http.Request)) RequestOption {
+	return func(options *InternalRequestOptions) {
+		if options == nil || hook == nil {
+			return
+		}
+		options.rawRequest = append(options.rawRequest, hook)
+	}
+}
+
 func NewAPIProtocol(account *Account, httpClient *http.Client) *APIProtocol {
 	if account == nil {
 		account = NewAccount(nil, APIInfo{}, nil, nil)
@@ -330,6 +340,12 @@ func (p *APIProtocol) RequestInternal(
 	}
 	if options.bearerToken != "" {
 		request.Header.Set("Authorization", "Bearer "+options.bearerToken)
+	}
+	for _, hook := range options.rawRequest {
+		if hook == nil {
+			continue
+		}
+		hook(request)
 	}
 
 	client, err := p.resolveInternalRequestClient(options)
