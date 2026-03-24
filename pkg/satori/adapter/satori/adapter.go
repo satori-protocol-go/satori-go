@@ -7,51 +7,54 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"log"
 	"mime/multipart"
 	"net/http"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/satori-protocol-go/satori-go/pkg/satori/client"
 	"github.com/satori-protocol-go/satori-go/pkg/satori/model/event"
 	"github.com/satori-protocol-go/satori-go/pkg/satori/model/login"
-	satoriserver "github.com/satori-protocol-go/satori-go/pkg/satori/server"
+	"github.com/satori-protocol-go/satori-go/pkg/satori/protocol"
+	"github.com/satori-protocol-go/satori-go/pkg/satori/server"
 )
 
 const defaultEventBuffer = 128
 
 type Config struct {
-	Host       string
-	Port       int
-	Path       string
-	Version    string
-	Token      string
-	PostUpload bool
+	Host             string
+	Port             int
+	Path             string
+	Version          string
+	Token            string
+	Secure           bool
+	Timeout          time.Duration
+	HandshakeTimeout time.Duration
+	PostUpload       bool
 
 	EventBuffer int
 	HTTPClient  *http.Client
 }
 
 type Adapter struct {
-	satoriserver.RouterMixin
+	server.RouterMixin
 
 	app        *client.App
 	postUpload bool
 	httpClient *http.Client
-
-	eventCh chan *event.Event
-	runOnce sync.Once
+	eventCh    chan *event.Event
 }
 
 func New(cfg Config) (*Adapter, error) {
 	app, err := client.NewApp(client.WebSocketConfig{
-		Host:    cfg.Host,
-		Port:    cfg.Port,
-		Path:    cfg.Path,
-		Version: cfg.Version,
-		Token:   cfg.Token,
+		Host:             cfg.Host,
+		Port:             cfg.Port,
+		Path:             cfg.Path,
+		Version:          cfg.Version,
+		Token:            cfg.Token,
+		Secure:           cfg.Secure,
+		Timeout:          cfg.Timeout,
+		HandshakeTimeout: cfg.HandshakeTimeout,
 	})
 	if err != nil {
 		return nil, err
@@ -61,33 +64,34 @@ func New(cfg Config) (*Adapter, error) {
 	if buffer <= 0 {
 		buffer = defaultEventBuffer
 	}
+	httpClient := cfg.HTTPClient
+	if httpClient == nil {
+		httpClient = &http.Client{Timeout: protocol.DefaultRequestTimeout}
+	}
+
 	adapter := &Adapter{
 		app:        app,
 		postUpload: cfg.PostUpload,
-		httpClient: cfg.HTTPClient,
+		httpClient: httpClient,
 		eventCh:    make(chan *event.Event, buffer),
 	}
-	if adapter.httpClient == nil {
-		adapter.httpClient = &http.Client{Timeout: 300 * time.Second}
-	}
 
-	adapter.Route("internal/*", adapter.handleRoute)
-	for _, action := range supportedAPIActions {
-		if !cfg.PostUpload && action == string(client.ApiUploadCreate) {
+	adapter.Route(protocol.ParseApi("internal/*"), adapter.handleRoute)
+	for _, api := range protocol.AllApis() {
+		if !cfg.PostUpload && api == protocol.ApiUploadCreate {
 			continue
 		}
-		adapter.Route(action, adapter.handleRoute)
+		adapter.Route(api, adapter.handleRoute)
 	}
 
-	adapter.app.Register(func(account *client.Account, evt *event.Event) error {
-		_ = account
+	adapter.app.Register(func(_ *client.Account, evt *event.Event) error {
 		if evt == nil {
 			return nil
 		}
 		select {
 		case adapter.eventCh <- evt:
 		default:
-			// Drop events when consumer is slower than producer to avoid blocking client network loops.
+			// Keep client network loops responsive when consumers are slow.
 		}
 		return nil
 	})
@@ -95,28 +99,29 @@ func New(cfg Config) (*Adapter, error) {
 	return adapter, nil
 }
 
-func (a *Adapter) EnsureServer(server *satoriserver.Server) {
-	_ = server
-}
+func (a *Adapter) EnsureServer(_ *server.Server) {}
 
-func (a *Adapter) Publisher(ctx context.Context) <-chan *event.Event {
-	a.runOnce.Do(func() {
-		go func() {
-			if err := a.app.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
-				log.Printf("[satori-adapter] client app stopped: %v", err)
-			}
-		}()
-	})
+func (a *Adapter) Publisher(_ context.Context) <-chan *event.Event {
 	return a.eventCh
 }
 
-func (a *Adapter) GetLogins(ctx context.Context) ([]*login.Login, error) {
-	_ = ctx
+func (a *Adapter) Block(ctx context.Context) error {
+	if err := a.app.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
+		return err
+	}
+	return nil
+}
+
+func (a *Adapter) Cleanup(_ context.Context) error {
+	return a.app.Close()
+}
+
+func (a *Adapter) GetLogins(_ context.Context) ([]*login.Login, error) {
 	account := a.Account()
 	if account == nil || account.SelfInfo == nil {
 		return []*login.Login{}, nil
 	}
-	return []*login.Login{account.SelfInfo}, nil
+	return []*login.Login{cloneLogin(account.SelfInfo)}, nil
 }
 
 func (a *Adapter) ProxyUrls() []string {
@@ -135,36 +140,33 @@ func (a *Adapter) Ensure(platform string, selfID string) bool {
 	return account.Platform() == platform && account.SelfID() == selfID
 }
 
-func (a *Adapter) HandleInternal(request satoriserver.Request[map[string]any], path string) (*satoriserver.Response, error) {
+func (a *Adapter) HandleInternal(request server.Request[map[string]any], path string) (*server.Response, error) {
 	path = strings.TrimSpace(path)
 	if strings.HasPrefix(path, "_api") {
 		account := a.Account()
 		if account == nil {
-			return nil, satoriserver.NotFound("no account found")
+			return nil, server.NotFound("no account found")
 		}
 
 		action := strings.TrimPrefix(path, "_api")
 		action = strings.TrimPrefix(action, "/")
-
-		params := request.Params
-		if params == nil {
-			params = map[string]any{}
+		if strings.TrimSpace(action) == "" {
+			return nil, server.BadRequest("internal api action is required")
 		}
 
-		method := http.MethodGet
-		ctx := context.Background()
-		if request.Origin != nil {
-			method = request.Origin.Method
-			ctx = request.Origin.Context()
-		}
-
-		raw, err := account.Protocol.CallAPI(ctx, action, params, false, method)
+		params, err := internalCallParams(request)
 		if err != nil {
 			return nil, err
 		}
-		response := satoriserver.NewResponse(http.StatusOK, raw)
-		response.Header.Set("Content-Type", "application/json")
-		return response, nil
+		method := requestMethod(request.Origin, http.MethodPost)
+		raw, err := account.Protocol.CallAPI(requestContext(request.Origin), action, params, false, method)
+		if err != nil {
+			return nil, err
+		}
+
+		resp := server.NewResponse(http.StatusOK, raw)
+		resp.Header.Set("Content-Type", "application/json")
+		return resp, nil
 	}
 
 	if account := a.Account(); account != nil {
@@ -178,17 +180,16 @@ func (a *Adapter) HandleInternal(request satoriserver.Request[map[string]any], p
 		if err != nil {
 			return nil, err
 		}
-		return satoriserver.NewResponse(http.StatusOK, data), nil
+		return server.NewResponse(http.StatusOK, data), nil
 	}
 
 	if path == "" {
-		return nil, satoriserver.NotFound("path is empty")
+		return nil, server.NotFound("path is empty")
 	}
 	return a.fetchURL(requestContext(request.Origin), path)
 }
 
-func (a *Adapter) HandleProxied(prefix string, rawURL string) (*satoriserver.Response, error) {
-	_ = prefix
+func (a *Adapter) HandleProxied(_ string, rawURL string) (*server.Response, error) {
 	return a.fetchURL(context.Background(), rawURL)
 }
 
@@ -200,62 +201,56 @@ func (a *Adapter) Account() *client.Account {
 	return nil
 }
 
-func (a *Adapter) handleRoute(request satoriserver.Request[any]) (any, error) {
-	account := a.Account()
-	if account == nil {
-		return nil, satoriserver.NotFound("no account found")
+func (a *Adapter) handleRoute(request *server.Request[any]) (any, error) {
+	if request == nil {
+		return nil, server.BadRequest("request cannot be nil")
 	}
 
-	if request.Action == string(client.ApiUploadCreate) {
+	account := a.Account()
+	if account == nil {
+		return nil, server.NotFound("no account found")
+	}
+
+	method := http.MethodPost
+	if request.Action == string(protocol.ApiUploadCreate) {
 		if !a.postUpload {
-			return nil, satoriserver.NotFound("upload.create is not enabled")
+			return nil, server.NotFound("upload.create is not enabled")
 		}
 		form, ok := request.Params.(*multipart.Form)
 		if !ok || form == nil {
-			return nil, satoriserver.BadRequest("invalid multipart form")
+			return nil, server.BadRequest("invalid multipart form")
 		}
-		uploads, err := formToUploads(form)
+		params, err := formToMultipartParams(form)
 		if err != nil {
 			return nil, err
 		}
-		return account.Protocol.UploadCreateNamed(requestContext(request.Origin), uploads)
+		raw, err := account.Protocol.CallAPI(requestContext(request.Origin), request.Action, params, true, method)
+		if err != nil {
+			return nil, err
+		}
+		return decodeRawResult(raw)
 	}
 
 	params, err := paramsToObject(request.Params)
 	if err != nil {
 		return nil, err
 	}
-
-	raw, err := account.Protocol.CallAPI(
-		requestContext(request.Origin),
-		request.Action,
-		params,
-		false,
-		requestMethod(request.Origin),
-	)
+	raw, err := account.Protocol.CallAPI(requestContext(request.Origin), request.Action, params, false, method)
 	if err != nil {
 		return nil, err
 	}
-	if len(bytes.TrimSpace(raw)) == 0 {
-		return map[string]any{}, nil
-	}
-
-	var result any
-	if err := json.Unmarshal(raw, &result); err != nil {
-		return nil, err
-	}
-	return result, nil
+	return decodeRawResult(raw)
 }
 
-func (a *Adapter) fetchURL(ctx context.Context, rawURL string) (*satoriserver.Response, error) {
+func (a *Adapter) fetchURL(ctx context.Context, rawURL string) (*server.Response, error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
+	request, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
 	if err != nil {
 		return nil, err
 	}
-	resp, err := a.httpClient.Do(req)
+	resp, err := a.httpClient.Do(request)
 	if err != nil {
 		return nil, err
 	}
@@ -265,7 +260,7 @@ func (a *Adapter) fetchURL(ctx context.Context, rawURL string) (*satoriserver.Re
 	if err != nil {
 		return nil, err
 	}
-	result := satoriserver.NewResponse(resp.StatusCode, body)
+	result := server.NewResponse(resp.StatusCode, body)
 	for key, values := range resp.Header {
 		for _, value := range values {
 			result.Header.Add(key, value)
@@ -281,9 +276,9 @@ func requestContext(request *http.Request) context.Context {
 	return request.Context()
 }
 
-func requestMethod(request *http.Request) string {
+func requestMethod(request *http.Request, fallback string) string {
 	if request == nil || strings.TrimSpace(request.Method) == "" {
-		return http.MethodPost
+		return fallback
 	}
 	return request.Method
 }
@@ -294,21 +289,38 @@ func paramsToObject(raw any) (map[string]any, error) {
 	}
 	params, ok := raw.(map[string]any)
 	if !ok {
-		return nil, satoriserver.BadRequest("request params must be an object")
+		return nil, server.BadRequest("request params must be an object")
 	}
 	return params, nil
 }
 
-func formToUploads(form *multipart.Form) (map[string]client.Upload, error) {
-	result := map[string]client.Upload{}
+func decodeRawResult(raw []byte) (any, error) {
+	if len(bytes.TrimSpace(raw)) == 0 {
+		return map[string]any{}, nil
+	}
+	var result any
+	if err := json.Unmarshal(raw, &result); err != nil {
+		return nil, err
+	}
+	return result, nil
+}
+
+func formToMultipartParams(form *multipart.Form) (map[string]any, error) {
+	result := map[string]any{}
 	if form == nil {
 		return result, nil
+	}
+	for key, values := range form.Value {
+		if len(values) == 0 {
+			continue
+		}
+		result[key] = values[len(values)-1]
 	}
 	for name, files := range form.File {
 		if len(files) == 0 {
 			continue
 		}
-		fileHeader := files[0]
+		fileHeader := files[len(files)-1]
 		opened, err := fileHeader.Open()
 		if err != nil {
 			return nil, err
@@ -327,44 +339,45 @@ func formToUploads(form *multipart.Form) (map[string]client.Upload, error) {
 	return result, nil
 }
 
-var supportedAPIActions = []string{
-	string(client.ApiMessageCreate),
-	string(client.ApiMessageUpdate),
-	string(client.ApiMessageGet),
-	string(client.ApiMessageDelete),
-	string(client.ApiMessageList),
-	string(client.ApiChannelGet),
-	string(client.ApiChannelList),
-	string(client.ApiChannelCreate),
-	string(client.ApiChannelUpdate),
-	string(client.ApiChannelDelete),
-	string(client.ApiChannelMute),
-	string(client.ApiUserChannelCreate),
-	string(client.ApiGuildGet),
-	string(client.ApiGuildList),
-	string(client.ApiGuildApprove),
-	string(client.ApiGuildMemberList),
-	string(client.ApiGuildMemberGet),
-	string(client.ApiGuildMemberKick),
-	string(client.ApiGuildMemberMute),
-	string(client.ApiGuildMemberApprove),
-	string(client.ApiGuildMemberRoleSet),
-	string(client.ApiGuildMemberRoleUnset),
-	string(client.ApiGuildRoleList),
-	string(client.ApiGuildRoleCreate),
-	string(client.ApiGuildRoleUpdate),
-	string(client.ApiGuildRoleDelete),
-	string(client.ApiReactionCreate),
-	string(client.ApiReactionDelete),
-	string(client.ApiReactionClear),
-	string(client.ApiReactionList),
-	string(client.ApiLoginGet),
-	string(client.ApiUserGet),
-	string(client.ApiFriendList),
-	string(client.ApiFriendApprove),
-	string(client.ApiUploadCreate),
+func internalCallParams(request server.Request[map[string]any]) (map[string]any, error) {
+	params := map[string]any{}
+	if request.Params != nil {
+		params = request.Params
+	}
+	if request.Origin == nil {
+		return params, nil
+	}
+
+	body, err := io.ReadAll(request.Origin.Body)
+	if err != nil {
+		return nil, err
+	}
+	request.Origin.Body = io.NopCloser(bytes.NewReader(body))
+	if len(bytes.TrimSpace(body)) == 0 {
+		return params, nil
+	}
+
+	decoded := map[string]any{}
+	if err := json.Unmarshal(body, &decoded); err != nil {
+		return nil, server.BadRequest("invalid internal api params")
+	}
+	return decoded, nil
 }
 
-var _ satoriserver.Adapter = (*Adapter)(nil)
-var _ satoriserver.EventPublisher = (*Adapter)(nil)
-var _ satoriserver.ServerAware = (*Adapter)(nil)
+func cloneLogin(source *login.Login) *login.Login {
+	if source == nil {
+		return nil
+	}
+	cloned := *source
+	if source.User != nil {
+		userValue := *source.User
+		cloned.User = &userValue
+	}
+	cloned.Features = append([]string(nil), source.Features...)
+	return &cloned
+}
+
+var _ server.Adapter = (*Adapter)(nil)
+var _ server.EventPublisher = (*Adapter)(nil)
+var _ server.Blockable = (*Adapter)(nil)
+var _ server.Cleanable = (*Adapter)(nil)

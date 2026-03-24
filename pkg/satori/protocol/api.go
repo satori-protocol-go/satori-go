@@ -58,52 +58,60 @@ const (
 	ApiAdminLoginList    Api = "admin/login.list"
 )
 
-var apiSet = map[Api]struct{}{
-	ApiMessageCreate: {},
-	ApiMessageUpdate: {},
-	ApiMessageGet:    {},
-	ApiMessageDelete: {},
-	ApiMessageList:   {},
+var apiList = []Api{
+	ApiMessageCreate,
+	ApiMessageUpdate,
+	ApiMessageGet,
+	ApiMessageDelete,
+	ApiMessageList,
 
-	ApiChannelGet:        {},
-	ApiChannelList:       {},
-	ApiChannelCreate:     {},
-	ApiChannelUpdate:     {},
-	ApiChannelDelete:     {},
-	ApiChannelMute:       {},
-	ApiUserChannelCreate: {},
+	ApiChannelGet,
+	ApiChannelList,
+	ApiChannelCreate,
+	ApiChannelUpdate,
+	ApiChannelDelete,
+	ApiChannelMute,
+	ApiUserChannelCreate,
 
-	ApiGuildGet:     {},
-	ApiGuildList:    {},
-	ApiGuildApprove: {},
+	ApiGuildGet,
+	ApiGuildList,
+	ApiGuildApprove,
 
-	ApiGuildMemberList:      {},
-	ApiGuildMemberGet:       {},
-	ApiGuildMemberKick:      {},
-	ApiGuildMemberMute:      {},
-	ApiGuildMemberApprove:   {},
-	ApiGuildMemberRoleSet:   {},
-	ApiGuildMemberRoleUnset: {},
+	ApiGuildMemberList,
+	ApiGuildMemberGet,
+	ApiGuildMemberKick,
+	ApiGuildMemberMute,
+	ApiGuildMemberApprove,
+	ApiGuildMemberRoleSet,
+	ApiGuildMemberRoleUnset,
 
-	ApiGuildRoleList:   {},
-	ApiGuildRoleCreate: {},
-	ApiGuildRoleUpdate: {},
-	ApiGuildRoleDelete: {},
+	ApiGuildRoleList,
+	ApiGuildRoleCreate,
+	ApiGuildRoleUpdate,
+	ApiGuildRoleDelete,
 
-	ApiReactionCreate: {},
-	ApiReactionDelete: {},
-	ApiReactionClear:  {},
-	ApiReactionList:   {},
+	ApiReactionCreate,
+	ApiReactionDelete,
+	ApiReactionClear,
+	ApiReactionList,
 
-	ApiLoginGet: {},
+	ApiLoginGet,
 
-	ApiUserGet:       {},
-	ApiFriendList:    {},
-	ApiFriendDelete:  {},
-	ApiFriendApprove: {},
+	ApiUserGet,
+	ApiFriendList,
+	ApiFriendDelete,
+	ApiFriendApprove,
 
-	ApiUploadCreate: {},
+	ApiUploadCreate,
 }
+
+var apiSet = func() map[Api]struct{} {
+	result := make(map[Api]struct{}, len(apiList))
+	for _, api := range apiList {
+		result[api] = struct{}{}
+	}
+	return result
+}()
 
 func (a Api) String() string {
 	return string(a)
@@ -116,4 +124,8 @@ func ParseApi(raw string) Api {
 func IsApi(api Api) bool {
 	_, ok := apiSet[api]
 	return ok
+}
+
+func AllApis() []Api {
+	return append([]Api(nil), apiList...)
 }
