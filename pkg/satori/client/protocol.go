@@ -3,6 +3,7 @@ package client
 import (
 	"bytes"
 	"context"
+	"crypto/tls"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -10,20 +11,24 @@ import (
 	"mime/multipart"
 	"net/http"
 	"net/textproto"
+	"net/url"
+	"reflect"
 	"sort"
 	"strconv"
 	"strings"
 	"time"
 
+	"github.com/satori-protocol-go/satori-go/pkg/satori/model"
 	"github.com/satori-protocol-go/satori-go/pkg/satori/model/channel"
-	"github.com/satori-protocol-go/satori-go/pkg/satori/model/define"
 	"github.com/satori-protocol-go/satori-go/pkg/satori/model/event"
 	"github.com/satori-protocol-go/satori-go/pkg/satori/model/guild"
 	"github.com/satori-protocol-go/satori-go/pkg/satori/model/guildmember"
 	"github.com/satori-protocol-go/satori-go/pkg/satori/model/guildrole"
 	"github.com/satori-protocol-go/satori-go/pkg/satori/model/login"
 	"github.com/satori-protocol-go/satori-go/pkg/satori/model/message"
+	"github.com/satori-protocol-go/satori-go/pkg/satori/model/message/element"
 	"github.com/satori-protocol-go/satori-go/pkg/satori/model/meta"
+	"github.com/satori-protocol-go/satori-go/pkg/satori/model/paginated"
 	"github.com/satori-protocol-go/satori-go/pkg/satori/model/user"
 )
 
@@ -31,6 +36,192 @@ type APIProtocol struct {
 	account *Account
 	client  *http.Client
 	timeout time.Duration
+}
+
+type InternalRequestOptions struct {
+	params      map[string]any
+	headers     http.Header
+	query       url.Values
+	cookies     []*http.Cookie
+	body        io.Reader
+	contentType string
+	timeout     time.Duration
+	timeoutSet  bool
+	proxy       string
+	proxySet    bool
+	basicUser   string
+	basicPass   string
+	basicSet    bool
+	bearerToken string
+	tlsConfig   *tls.Config
+}
+
+type RequestOption func(*InternalRequestOptions)
+
+func WithRequestHeader(key string, value string) RequestOption {
+	return func(options *InternalRequestOptions) {
+		if options == nil || strings.TrimSpace(key) == "" {
+			return
+		}
+		if options.headers == nil {
+			options.headers = http.Header{}
+		}
+		options.headers.Add(key, value)
+	}
+}
+
+func WithRequestHeaders(headers http.Header) RequestOption {
+	return func(options *InternalRequestOptions) {
+		if options == nil || len(headers) == 0 {
+			return
+		}
+		if options.headers == nil {
+			options.headers = http.Header{}
+		}
+		for key, values := range headers {
+			for _, value := range values {
+				options.headers.Add(key, value)
+			}
+		}
+	}
+}
+
+func WithRequestQuery(key string, value string) RequestOption {
+	return func(options *InternalRequestOptions) {
+		if options == nil || strings.TrimSpace(key) == "" {
+			return
+		}
+		if options.query == nil {
+			options.query = url.Values{}
+		}
+		options.query.Add(key, value)
+	}
+}
+
+func WithRequestQueryValues(values url.Values) RequestOption {
+	return func(options *InternalRequestOptions) {
+		if options == nil || len(values) == 0 {
+			return
+		}
+		if options.query == nil {
+			options.query = url.Values{}
+		}
+		for key, list := range values {
+			for _, value := range list {
+				options.query.Add(key, value)
+			}
+		}
+	}
+}
+
+func WithRequestBody(body io.Reader, contentType string) RequestOption {
+	return func(options *InternalRequestOptions) {
+		if options == nil {
+			return
+		}
+		options.body = body
+		options.contentType = strings.TrimSpace(contentType)
+	}
+}
+
+func WithRequestJSON(params map[string]any) RequestOption {
+	return func(options *InternalRequestOptions) {
+		if options == nil {
+			return
+		}
+		options.params = params
+	}
+}
+
+func WithRequestCookie(cookie *http.Cookie) RequestOption {
+	return func(options *InternalRequestOptions) {
+		if options == nil || cookie == nil {
+			return
+		}
+		options.cookies = append(options.cookies, cookie)
+	}
+}
+
+func WithRequestCookies(cookies []*http.Cookie) RequestOption {
+	return func(options *InternalRequestOptions) {
+		if options == nil || len(cookies) == 0 {
+			return
+		}
+		for _, cookie := range cookies {
+			if cookie == nil {
+				continue
+			}
+			options.cookies = append(options.cookies, cookie)
+		}
+	}
+}
+
+func WithRequestTimeout(timeout time.Duration) RequestOption {
+	return func(options *InternalRequestOptions) {
+		if options == nil {
+			return
+		}
+		options.timeout = timeout
+		options.timeoutSet = true
+	}
+}
+
+func WithRequestProxy(proxy string) RequestOption {
+	return func(options *InternalRequestOptions) {
+		if options == nil {
+			return
+		}
+		options.proxy = strings.TrimSpace(proxy)
+		options.proxySet = true
+	}
+}
+
+func WithRequestProxyURL(proxyURL *url.URL) RequestOption {
+	return func(options *InternalRequestOptions) {
+		if options == nil {
+			return
+		}
+		if proxyURL == nil {
+			options.proxy = ""
+			options.proxySet = true
+			return
+		}
+		options.proxy = strings.TrimSpace(proxyURL.String())
+		options.proxySet = true
+	}
+}
+
+func WithRequestBasicAuth(username string, password string) RequestOption {
+	return func(options *InternalRequestOptions) {
+		if options == nil {
+			return
+		}
+		options.basicUser = username
+		options.basicPass = password
+		options.basicSet = true
+	}
+}
+
+func WithRequestBearerAuth(token string) RequestOption {
+	return func(options *InternalRequestOptions) {
+		if options == nil {
+			return
+		}
+		options.bearerToken = strings.TrimSpace(token)
+	}
+}
+
+func WithRequestTLSConfig(config *tls.Config) RequestOption {
+	return func(options *InternalRequestOptions) {
+		if options == nil {
+			return
+		}
+		if config == nil {
+			options.tlsConfig = nil
+			return
+		}
+		options.tlsConfig = config.Clone()
+	}
 }
 
 func NewAPIProtocol(account *Account, httpClient *http.Client) *APIProtocol {
@@ -63,22 +254,88 @@ func (p *APIProtocol) RequestInternal(
 	rawURL string,
 	method string,
 	params map[string]any,
+	requestOptions ...RequestOption,
 ) (map[string]any, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	endpoint := p.account.EnsureURL(rawURL)
 	method = normalizeMethod(method)
+	options := &InternalRequestOptions{
+		params:  params,
+		headers: http.Header{},
+		query:   url.Values{},
+	}
+	for _, option := range requestOptions {
+		if option == nil {
+			continue
+		}
+		option(options)
+	}
+	if options.timeoutSet && options.timeout > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, options.timeout)
+		defer cancel()
+	}
 
 	var (
 		body    io.Reader
-		headers http.Header
+		headers = options.headers
 		err     error
 	)
-	if method != http.MethodGet || len(params) > 0 {
-		body, headers, err = encodeJSONBody(params)
+
+	if len(options.query) > 0 {
+		endpoint, err = appendQueryValues(endpoint, options.query)
 		if err != nil {
 			return nil, err
 		}
 	}
-	payload, err := p.requestBytes(ctx, method, endpoint, body, headers)
+
+	if options.body != nil {
+		body = options.body
+		if options.contentType != "" && headers.Get("Content-Type") == "" {
+			headers.Set("Content-Type", options.contentType)
+		}
+	} else if method != http.MethodGet || len(options.params) > 0 {
+		var extraHeaders http.Header
+		body, extraHeaders, err = encodeJSONBody(options.params)
+		if err != nil {
+			return nil, err
+		}
+		for key, values := range extraHeaders {
+			for _, value := range values {
+				headers.Add(key, value)
+			}
+		}
+	}
+
+	request, err := http.NewRequestWithContext(ctx, method, endpoint, body)
+	if err != nil {
+		return nil, err
+	}
+	for key, values := range headers {
+		for _, value := range values {
+			request.Header.Add(key, value)
+		}
+	}
+	for _, cookie := range options.cookies {
+		if cookie == nil {
+			continue
+		}
+		request.AddCookie(cookie)
+	}
+	if options.basicSet {
+		request.SetBasicAuth(options.basicUser, options.basicPass)
+	}
+	if options.bearerToken != "" {
+		request.Header.Set("Authorization", "Bearer "+options.bearerToken)
+	}
+
+	client, err := p.resolveInternalRequestClient(options)
+	if err != nil {
+		return nil, err
+	}
+	payload, err := p.doRequestWithClient(request, client)
 	if err != nil {
 		return nil, err
 	}
@@ -101,15 +358,10 @@ func (p *APIProtocol) CallAPI(
 	headers := p.apiHeaders()
 
 	if multipart {
-		uploads := make(map[string]Upload, len(params))
-		for name, raw := range params {
-			upload, ok := raw.(Upload)
-			if !ok {
-				return nil, fmt.Errorf("multipart param %q is not an Upload", name)
-			}
-			uploads[name] = upload
+		if params == nil {
+			return nil, errors.New("multipart requires params")
 		}
-		body, contentType, err := encodeMultipartBody(uploads)
+		body, contentType, err := encodeMultipartBody(params)
 		if err != nil {
 			return nil, err
 		}
@@ -138,36 +390,60 @@ func (p *APIProtocol) CallAPI(
 	return payload, nil
 }
 
-func (p *APIProtocol) Send(ctx context.Context, evt *event.Event, messageText string) ([]*message.Message, error) {
+func (p *APIProtocol) Send(ctx context.Context, evt *event.Event, messageInput any) ([]*message.Message, error) {
 	if evt == nil || evt.Channel == nil {
 		return nil, errors.New("event cannot be replied to")
 	}
-	return p.SendMessage(ctx, evt.Channel.Id, messageText, evt.Referrer)
+	return p.SendMessage(ctx, evt.Channel, messageInput, evt.Referrer)
 }
 
 func (p *APIProtocol) SendMessage(
 	ctx context.Context,
-	channelID string,
-	messageText string,
+	channelTarget any,
+	messageInput any,
 	referrer map[string]any,
 ) ([]*message.Message, error) {
-	return p.MessageCreate(ctx, channelID, messageText, referrer)
+	channelID, err := resolveChannelID(channelTarget)
+	if err != nil {
+		return nil, err
+	}
+	content, err := composeMessageContent(messageInput)
+	if err != nil {
+		return nil, err
+	}
+	return p.MessageCreate(ctx, channelID, content, referrer)
 }
 
 func (p *APIProtocol) SendPrivateMessage(
 	ctx context.Context,
-	userID string,
-	messageText string,
+	userTarget any,
+	messageInput any,
 	referrer map[string]any,
 ) ([]*message.Message, error) {
+	userID, err := resolveUserID(userTarget)
+	if err != nil {
+		return nil, err
+	}
+	content, err := composeMessageContent(messageInput)
+	if err != nil {
+		return nil, err
+	}
 	channelItem, err := p.UserChannelCreate(ctx, userID, "")
 	if err != nil {
 		return nil, err
 	}
-	return p.MessageCreate(ctx, channelItem.Id, messageText, referrer)
+	return p.MessageCreate(ctx, channelItem.Id, content, referrer)
 }
 
-func (p *APIProtocol) UpdateMessage(ctx context.Context, channelID string, messageID string, content string) error {
+func (p *APIProtocol) UpdateMessage(ctx context.Context, channelTarget any, messageID string, messageInput any) error {
+	channelID, err := resolveChannelID(channelTarget)
+	if err != nil {
+		return err
+	}
+	content, err := composeMessageContent(messageInput)
+	if err != nil {
+		return err
+	}
 	return p.MessageUpdate(ctx, channelID, messageID, content)
 }
 
@@ -231,7 +507,7 @@ func (p *APIProtocol) MessageList(
 	direction string,
 	limit int,
 	order string,
-) (*define.BidiPaginated[*message.Message], error) {
+) (*model.BidiPaginated[*message.Message], error) {
 	if direction == "" {
 		direction = "before"
 	}
@@ -255,7 +531,7 @@ func (p *APIProtocol) MessageList(
 	if err != nil {
 		return nil, err
 	}
-	var result define.BidiPaginated[*message.Message]
+	var result model.BidiPaginated[*message.Message]
 	if err := decodeJSON(resp, &result); err != nil {
 		return nil, err
 	}
@@ -278,7 +554,17 @@ func (p *APIProtocol) ChannelList(
 	ctx context.Context,
 	guildID string,
 	nextToken string,
-) (*define.Paginated[*channel.Channel], error) {
+) *model.PaginatedSeq[*channel.Channel] {
+	return paginated.NewPaginatedSeq(ctx, nextToken, func(fetchCtx context.Context, token string) (*model.Paginated[*channel.Channel], error) {
+		return p.channelListPage(fetchCtx, guildID, token)
+	})
+}
+
+func (p *APIProtocol) channelListPage(
+	ctx context.Context,
+	guildID string,
+	nextToken string,
+) (*model.Paginated[*channel.Channel], error) {
 	resp, err := p.CallAPI(ctx, string(ApiChannelList), map[string]any{
 		"guild_id": guildID,
 		"next":     nextToken,
@@ -286,7 +572,7 @@ func (p *APIProtocol) ChannelList(
 	if err != nil {
 		return nil, err
 	}
-	var result define.Paginated[*channel.Channel]
+	var result model.Paginated[*channel.Channel]
 	if err := decodeJSON(resp, &result); err != nil {
 		return nil, err
 	}
@@ -316,9 +602,6 @@ func (p *APIProtocol) ChannelDelete(ctx context.Context, channelID string) error
 }
 
 func (p *APIProtocol) ChannelMute(ctx context.Context, channelID string, duration time.Duration) error {
-	if duration <= 0 {
-		duration = 60 * time.Second
-	}
 	_, err := p.CallAPI(ctx, string(ApiChannelMute), map[string]any{
 		"channel_id": channelID,
 		"duration":   duration.Milliseconds(),
@@ -354,12 +637,18 @@ func (p *APIProtocol) GuildGet(ctx context.Context, guildID string) (*guild.Guil
 	return &result, nil
 }
 
-func (p *APIProtocol) GuildList(ctx context.Context, nextToken string) (*define.Paginated[*guild.Guild], error) {
+func (p *APIProtocol) GuildList(ctx context.Context, nextToken string) *model.PaginatedSeq[*guild.Guild] {
+	return paginated.NewPaginatedSeq(ctx, nextToken, func(fetchCtx context.Context, token string) (*model.Paginated[*guild.Guild], error) {
+		return p.guildListPage(fetchCtx, token)
+	})
+}
+
+func (p *APIProtocol) guildListPage(ctx context.Context, nextToken string) (*model.Paginated[*guild.Guild], error) {
 	resp, err := p.CallAPI(ctx, string(ApiGuildList), map[string]any{"next": nextToken}, false, http.MethodPost)
 	if err != nil {
 		return nil, err
 	}
-	var result define.Paginated[*guild.Guild]
+	var result model.Paginated[*guild.Guild]
 	if err := decodeJSON(resp, &result); err != nil {
 		return nil, err
 	}
@@ -379,7 +668,17 @@ func (p *APIProtocol) GuildMemberList(
 	ctx context.Context,
 	guildID string,
 	nextToken string,
-) (*define.Paginated[*guildmember.GuildMember], error) {
+) *model.PaginatedSeq[*guildmember.GuildMember] {
+	return paginated.NewPaginatedSeq(ctx, nextToken, func(fetchCtx context.Context, token string) (*model.Paginated[*guildmember.GuildMember], error) {
+		return p.guildMemberListPage(fetchCtx, guildID, token)
+	})
+}
+
+func (p *APIProtocol) guildMemberListPage(
+	ctx context.Context,
+	guildID string,
+	nextToken string,
+) (*model.Paginated[*guildmember.GuildMember], error) {
 	resp, err := p.CallAPI(ctx, string(ApiGuildMemberList), map[string]any{
 		"guild_id": guildID,
 		"next":     nextToken,
@@ -387,7 +686,7 @@ func (p *APIProtocol) GuildMemberList(
 	if err != nil {
 		return nil, err
 	}
-	var result define.Paginated[*guildmember.GuildMember]
+	var result model.Paginated[*guildmember.GuildMember]
 	if err := decodeJSON(resp, &result); err != nil {
 		return nil, err
 	}
@@ -424,9 +723,6 @@ func (p *APIProtocol) GuildMemberMute(
 	userID string,
 	duration time.Duration,
 ) error {
-	if duration <= 0 {
-		duration = 60 * time.Second
-	}
 	_, err := p.CallAPI(ctx, string(ApiGuildMemberMute), map[string]any{
 		"guild_id": guildID,
 		"user_id":  userID,
@@ -466,7 +762,17 @@ func (p *APIProtocol) GuildRoleList(
 	ctx context.Context,
 	guildID string,
 	nextToken string,
-) (*define.Paginated[*guildrole.GuildRole], error) {
+) *model.PaginatedSeq[*guildrole.GuildRole] {
+	return paginated.NewPaginatedSeq(ctx, nextToken, func(fetchCtx context.Context, token string) (*model.Paginated[*guildrole.GuildRole], error) {
+		return p.guildRoleListPage(fetchCtx, guildID, token)
+	})
+}
+
+func (p *APIProtocol) guildRoleListPage(
+	ctx context.Context,
+	guildID string,
+	nextToken string,
+) (*model.Paginated[*guildrole.GuildRole], error) {
 	resp, err := p.CallAPI(ctx, string(ApiGuildRoleList), map[string]any{
 		"guild_id": guildID,
 		"next":     nextToken,
@@ -474,7 +780,7 @@ func (p *APIProtocol) GuildRoleList(
 	if err != nil {
 		return nil, err
 	}
-	var result define.Paginated[*guildrole.GuildRole]
+	var result model.Paginated[*guildrole.GuildRole]
 	if err := decodeJSON(resp, &result); err != nil {
 		return nil, err
 	}
@@ -556,7 +862,19 @@ func (p *APIProtocol) ReactionList(
 	messageID string,
 	emoji string,
 	nextToken string,
-) (*define.Paginated[*user.User], error) {
+) *model.PaginatedSeq[*user.User] {
+	return paginated.NewPaginatedSeq(ctx, nextToken, func(fetchCtx context.Context, token string) (*model.Paginated[*user.User], error) {
+		return p.reactionListPage(fetchCtx, channelID, messageID, emoji, token)
+	})
+}
+
+func (p *APIProtocol) reactionListPage(
+	ctx context.Context,
+	channelID string,
+	messageID string,
+	emoji string,
+	nextToken string,
+) (*model.Paginated[*user.User], error) {
 	resp, err := p.CallAPI(ctx, string(ApiReactionList), map[string]any{
 		"channel_id": channelID,
 		"message_id": messageID,
@@ -566,7 +884,7 @@ func (p *APIProtocol) ReactionList(
 	if err != nil {
 		return nil, err
 	}
-	var result define.Paginated[*user.User]
+	var result model.Paginated[*user.User]
 	if err := decodeJSON(resp, &result); err != nil {
 		return nil, err
 	}
@@ -597,12 +915,18 @@ func (p *APIProtocol) UserGet(ctx context.Context, userID string) (*user.User, e
 	return &result, nil
 }
 
-func (p *APIProtocol) FriendList(ctx context.Context, nextToken string) (*define.Paginated[*user.User], error) {
+func (p *APIProtocol) FriendList(ctx context.Context, nextToken string) *model.PaginatedSeq[*user.User] {
+	return paginated.NewPaginatedSeq(ctx, nextToken, func(fetchCtx context.Context, token string) (*model.Paginated[*user.User], error) {
+		return p.friendListPage(fetchCtx, token)
+	})
+}
+
+func (p *APIProtocol) friendListPage(ctx context.Context, nextToken string) (*model.Paginated[*user.User], error) {
 	resp, err := p.CallAPI(ctx, string(ApiFriendList), map[string]any{"next": nextToken}, false, http.MethodPost)
 	if err != nil {
 		return nil, err
 	}
-	var result define.Paginated[*user.User]
+	var result model.Paginated[*user.User]
 	if err := decodeJSON(resp, &result); err != nil {
 		return nil, err
 	}
@@ -642,12 +966,12 @@ func (p *APIProtocol) MetaGet(ctx context.Context) (*meta.Meta, error) {
 	return &result, nil
 }
 
-func (p *APIProtocol) AdminLoginList(ctx context.Context) ([]*login.Login, error) {
+func (p *APIProtocol) AdminLoginList(ctx context.Context) ([]*login.LoginPartial, error) {
 	resp, err := p.CallAPI(ctx, "admin/login.list", map[string]any{}, false, http.MethodPost)
 	if err != nil {
 		return nil, err
 	}
-	var result []*login.Login
+	var result []*login.LoginPartial
 	if err := decodeJSON(resp, &result); err != nil {
 		return nil, err
 	}
@@ -731,7 +1055,22 @@ func (p *APIProtocol) requestBytes(
 			request.Header.Add(key, value)
 		}
 	}
-	response, err := p.client.Do(request)
+	return p.doRequest(request)
+}
+
+func (p *APIProtocol) doRequest(request *http.Request) ([]byte, error) {
+	return p.doRequestWithClient(request, p.client)
+}
+
+func (p *APIProtocol) doRequestWithClient(request *http.Request, client *http.Client) ([]byte, error) {
+	if request == nil {
+		return nil, errors.New("request cannot be nil")
+	}
+	if client == nil {
+		client = &http.Client{Timeout: p.timeout}
+	}
+
+	response, err := client.Do(request)
 	if err != nil {
 		return nil, err
 	}
@@ -744,7 +1083,60 @@ func (p *APIProtocol) requestBytes(
 	if response.StatusCode >= 200 && response.StatusCode < 300 {
 		return payload, nil
 	}
-	return nil, &RequestError{StatusCode: response.StatusCode, Body: string(payload)}
+	return nil, errorFromStatusCode(response.StatusCode, payload)
+}
+
+func (p *APIProtocol) resolveInternalRequestClient(options *InternalRequestOptions) (*http.Client, error) {
+	if options == nil {
+		return p.client, nil
+	}
+	requiresTransportClone := options.proxySet || options.tlsConfig != nil
+	if !requiresTransportClone {
+		return p.client, nil
+	}
+
+	baseClient := p.client
+	if baseClient == nil {
+		baseClient = &http.Client{Timeout: p.timeout}
+	}
+	clonedClient := *baseClient
+
+	clonedTransport, err := cloneHTTPTransport(baseClient.Transport)
+	if err != nil {
+		return nil, err
+	}
+	if options.proxySet {
+		if options.proxy == "" {
+			clonedTransport.Proxy = nil
+		} else {
+			proxyURL, parseErr := url.Parse(options.proxy)
+			if parseErr != nil {
+				return nil, fmt.Errorf("invalid request proxy url %q: %w", options.proxy, parseErr)
+			}
+			clonedTransport.Proxy = http.ProxyURL(proxyURL)
+		}
+	}
+	if options.tlsConfig != nil {
+		clonedTransport.TLSClientConfig = options.tlsConfig.Clone()
+	}
+
+	clonedClient.Transport = clonedTransport
+	return &clonedClient, nil
+}
+
+func cloneHTTPTransport(roundTripper http.RoundTripper) (*http.Transport, error) {
+	if roundTripper == nil {
+		defaultTransport, ok := http.DefaultTransport.(*http.Transport)
+		if !ok {
+			return &http.Transport{}, nil
+		}
+		return defaultTransport.Clone(), nil
+	}
+	transport, ok := roundTripper.(*http.Transport)
+	if !ok {
+		return nil, fmt.Errorf("unsupported http transport type %T", roundTripper)
+	}
+	return transport.Clone(), nil
 }
 
 func (p *APIProtocol) apiHeaders() http.Header {
@@ -771,22 +1163,172 @@ func encodeJSONBody(params map[string]any) (io.Reader, http.Header, error) {
 	return bytes.NewReader(body), headers, nil
 }
 
-func encodeMultipartBody(uploads map[string]Upload) (io.Reader, string, error) {
+type multipartPart struct {
+	name        string
+	value       []byte
+	filename    string
+	contentType string
+	asFile      bool
+}
+
+func resolveChannelID(target any) (string, error) {
+	switch typed := target.(type) {
+	case string:
+		channelID := strings.TrimSpace(typed)
+		if channelID == "" {
+			return "", errors.New("channel id cannot be empty")
+		}
+		return channelID, nil
+	case *channel.Channel:
+		if typed == nil {
+			return "", errors.New("channel cannot be nil")
+		}
+		channelID := strings.TrimSpace(typed.Id)
+		if channelID == "" {
+			return "", errors.New("channel id cannot be empty")
+		}
+		return channelID, nil
+	case channel.Channel:
+		channelID := strings.TrimSpace(typed.Id)
+		if channelID == "" {
+			return "", errors.New("channel id cannot be empty")
+		}
+		return channelID, nil
+	default:
+		return "", fmt.Errorf("unsupported channel target type %T", target)
+	}
+}
+
+func resolveUserID(target any) (string, error) {
+	switch typed := target.(type) {
+	case string:
+		userID := strings.TrimSpace(typed)
+		if userID == "" {
+			return "", errors.New("user id cannot be empty")
+		}
+		return userID, nil
+	case *user.User:
+		if typed == nil {
+			return "", errors.New("user cannot be nil")
+		}
+		userID := strings.TrimSpace(typed.Id)
+		if userID == "" {
+			return "", errors.New("user id cannot be empty")
+		}
+		return userID, nil
+	case user.User:
+		userID := strings.TrimSpace(typed.Id)
+		if userID == "" {
+			return "", errors.New("user id cannot be empty")
+		}
+		return userID, nil
+	default:
+		return "", fmt.Errorf("unsupported user target type %T", target)
+	}
+}
+
+func composeMessageContent(input any) (string, error) {
+	var builder strings.Builder
+	if err := appendMessageContent(&builder, input); err != nil {
+		return "", err
+	}
+	return builder.String(), nil
+}
+
+func appendMessageContent(builder *strings.Builder, value any) error {
+	switch typed := value.(type) {
+	case nil:
+		return nil
+	case string:
+		builder.WriteString(typed)
+		return nil
+	case []string:
+		for _, item := range typed {
+			builder.WriteString(item)
+		}
+		return nil
+	case []byte:
+		builder.Write(typed)
+		return nil
+	case []rune:
+		builder.WriteString(string(typed))
+		return nil
+	case element.Element:
+		builder.WriteString(typed.MarshalXHTML(false))
+		return nil
+	case []element.Element:
+		for _, item := range typed {
+			if item == nil {
+				continue
+			}
+			builder.WriteString(item.MarshalXHTML(false))
+		}
+		return nil
+	case fmt.Stringer:
+		builder.WriteString(typed.String())
+		return nil
+	case []fmt.Stringer:
+		for _, item := range typed {
+			if item == nil {
+				continue
+			}
+			builder.WriteString(item.String())
+		}
+		return nil
+	case []any:
+		for _, item := range typed {
+			if err := appendMessageContent(builder, item); err != nil {
+				return err
+			}
+		}
+		return nil
+	case bool, int, int8, int16, int32, int64, uint, uint8, uint16, uint32, uint64, uintptr, float32, float64:
+		builder.WriteString(fmt.Sprint(typed))
+		return nil
+	default:
+		refValue := reflect.ValueOf(value)
+		if refValue.IsValid() && (refValue.Kind() == reflect.Slice || refValue.Kind() == reflect.Array) {
+			for index := 0; index < refValue.Len(); index++ {
+				if err := appendMessageContent(builder, refValue.Index(index).Interface()); err != nil {
+					return err
+				}
+			}
+			return nil
+		}
+		return fmt.Errorf("unsupported message type %T", value)
+	}
+}
+
+func encodeMultipartBody(params map[string]any) (io.Reader, string, error) {
+	if params == nil {
+		return nil, "", errors.New("multipart requires params")
+	}
 	buffer := &bytes.Buffer{}
 	writer := multipart.NewWriter(buffer)
 
-	for name, rawUpload := range uploads {
-		upload := rawUpload.normalized(name)
-		header := textproto.MIMEHeader{}
-		header.Set("Content-Disposition", fmt.Sprintf(`form-data; name=%q; filename=%q`, name, upload.Filename))
-		header.Set("Content-Type", upload.ContentType)
-
-		partWriter, err := writer.CreatePart(header)
+	for name, raw := range params {
+		part, err := normalizeMultipartPart(name, raw)
 		if err != nil {
 			_ = writer.Close()
 			return nil, "", err
 		}
-		if _, err := partWriter.Write(upload.Value); err != nil {
+		if part.asFile {
+			header := textproto.MIMEHeader{}
+			header.Set("Content-Disposition", fmt.Sprintf(`form-data; name=%q; filename=%q`, part.name, part.filename))
+			header.Set("Content-Type", part.contentType)
+
+			partWriter, createErr := writer.CreatePart(header)
+			if createErr != nil {
+				_ = writer.Close()
+				return nil, "", createErr
+			}
+			if _, writeErr := partWriter.Write(part.value); writeErr != nil {
+				_ = writer.Close()
+				return nil, "", writeErr
+			}
+			continue
+		}
+		if err := writer.WriteField(part.name, string(part.value)); err != nil {
 			_ = writer.Close()
 			return nil, "", err
 		}
@@ -796,6 +1338,239 @@ func encodeMultipartBody(uploads map[string]Upload) (io.Reader, string, error) {
 		return nil, "", err
 	}
 	return buffer, writer.FormDataContentType(), nil
+}
+
+func normalizeMultipartPart(name string, raw any) (multipartPart, error) {
+	switch typed := raw.(type) {
+	case nil:
+		return multipartPart{name: name, value: []byte{}}, nil
+	case Upload:
+		upload := typed.normalized(name)
+		return multipartPart{
+			name:        name,
+			value:       append([]byte(nil), upload.Value...),
+			filename:    upload.Filename,
+			contentType: upload.ContentType,
+			asFile:      true,
+		}, nil
+	case *Upload:
+		if typed == nil {
+			return multipartPart{name: name, value: []byte{}}, nil
+		}
+		upload := typed.normalized(name)
+		return multipartPart{
+			name:        name,
+			value:       append([]byte(nil), upload.Value...),
+			filename:    upload.Filename,
+			contentType: upload.ContentType,
+			asFile:      true,
+		}, nil
+	case map[string]any:
+		return normalizeMultipartMap(name, typed)
+	case map[string]string:
+		converted := make(map[string]any, len(typed))
+		for key, value := range typed {
+			converted[key] = value
+		}
+		return normalizeMultipartMap(name, converted)
+	case []byte:
+		return multipartPart{
+			name:        name,
+			value:       append([]byte(nil), typed...),
+			filename:    name,
+			contentType: "application/octet-stream",
+			asFile:      true,
+		}, nil
+	case io.Reader:
+		data, err := io.ReadAll(typed)
+		if err != nil {
+			return multipartPart{}, fmt.Errorf("multipart param %q read failed: %w", name, err)
+		}
+		return multipartPart{
+			name:        name,
+			value:       data,
+			filename:    name,
+			contentType: "application/octet-stream",
+			asFile:      true,
+		}, nil
+	case string:
+		return multipartPart{name: name, value: []byte(typed)}, nil
+	case fmt.Stringer:
+		return multipartPart{name: name, value: []byte(typed.String())}, nil
+	case bool, int, int8, int16, int32, int64, uint, uint8, uint16, uint32, uint64, uintptr, float32, float64:
+		return multipartPart{name: name, value: []byte(fmt.Sprint(typed))}, nil
+	default:
+		return multipartPart{}, fmt.Errorf("multipart param %q has unsupported type %T", name, raw)
+	}
+}
+
+func normalizeMultipartMap(name string, fields map[string]any) (multipartPart, error) {
+	value, ok := fields["value"]
+	if !ok {
+		return multipartPart{}, fmt.Errorf("multipart param %q is missing \"value\"", name)
+	}
+
+	filename := stringValue(fields["filename"])
+	contentType := stringValue(fields["content_type"])
+	if contentType == "" {
+		contentType = stringValue(fields["contentType"])
+	}
+
+	switch typed := value.(type) {
+	case nil:
+		if filename == "" && contentType == "" {
+			return multipartPart{name: name, value: []byte{}}, nil
+		}
+		if filename == "" {
+			filename = name
+		}
+		if contentType == "" {
+			contentType = "application/octet-stream"
+		}
+		return multipartPart{
+			name:        name,
+			value:       []byte{},
+			filename:    filename,
+			contentType: contentType,
+			asFile:      true,
+		}, nil
+	case Upload:
+		upload := typed
+		if filename != "" {
+			upload.Filename = filename
+		}
+		if contentType != "" {
+			upload.ContentType = contentType
+		}
+		normalized := upload.normalized(name)
+		return multipartPart{
+			name:        name,
+			value:       append([]byte(nil), normalized.Value...),
+			filename:    normalized.Filename,
+			contentType: normalized.ContentType,
+			asFile:      true,
+		}, nil
+	case *Upload:
+		if typed == nil {
+			return multipartPart{name: name, value: []byte{}}, nil
+		}
+		upload := *typed
+		if filename != "" {
+			upload.Filename = filename
+		}
+		if contentType != "" {
+			upload.ContentType = contentType
+		}
+		normalized := upload.normalized(name)
+		return multipartPart{
+			name:        name,
+			value:       append([]byte(nil), normalized.Value...),
+			filename:    normalized.Filename,
+			contentType: normalized.ContentType,
+			asFile:      true,
+		}, nil
+	case []byte:
+		if filename == "" {
+			filename = name
+		}
+		if contentType == "" {
+			contentType = "application/octet-stream"
+		}
+		return multipartPart{
+			name:        name,
+			value:       append([]byte(nil), typed...),
+			filename:    filename,
+			contentType: contentType,
+			asFile:      true,
+		}, nil
+	case io.Reader:
+		data, err := io.ReadAll(typed)
+		if err != nil {
+			return multipartPart{}, fmt.Errorf("multipart param %q read failed: %w", name, err)
+		}
+		if filename == "" {
+			filename = name
+		}
+		if contentType == "" {
+			contentType = "application/octet-stream"
+		}
+		return multipartPart{
+			name:        name,
+			value:       data,
+			filename:    filename,
+			contentType: contentType,
+			asFile:      true,
+		}, nil
+	case string:
+		if filename == "" && contentType == "" {
+			return multipartPart{name: name, value: []byte(typed)}, nil
+		}
+		if filename == "" {
+			filename = name
+		}
+		if contentType == "" {
+			contentType = "text/plain; charset=utf-8"
+		}
+		return multipartPart{
+			name:        name,
+			value:       []byte(typed),
+			filename:    filename,
+			contentType: contentType,
+			asFile:      true,
+		}, nil
+	case bool, int, int8, int16, int32, int64, uint, uint8, uint16, uint32, uint64, uintptr, float32, float64:
+		text := fmt.Sprint(typed)
+		if filename == "" && contentType == "" {
+			return multipartPart{name: name, value: []byte(text)}, nil
+		}
+		if filename == "" {
+			filename = name
+		}
+		if contentType == "" {
+			contentType = "text/plain; charset=utf-8"
+		}
+		return multipartPart{
+			name:        name,
+			value:       []byte(text),
+			filename:    filename,
+			contentType: contentType,
+			asFile:      true,
+		}, nil
+	default:
+		if str, ok := value.(fmt.Stringer); ok {
+			text := str.String()
+			if filename == "" && contentType == "" {
+				return multipartPart{name: name, value: []byte(text)}, nil
+			}
+			if filename == "" {
+				filename = name
+			}
+			if contentType == "" {
+				contentType = "text/plain; charset=utf-8"
+			}
+			return multipartPart{
+				name:        name,
+				value:       []byte(text),
+				filename:    filename,
+				contentType: contentType,
+				asFile:      true,
+			}, nil
+		}
+		return multipartPart{}, fmt.Errorf("multipart param %q has unsupported \"value\" type %T", name, value)
+	}
+}
+
+func stringValue(value any) string {
+	switch typed := value.(type) {
+	case nil:
+		return ""
+	case string:
+		return strings.TrimSpace(typed)
+	case fmt.Stringer:
+		return strings.TrimSpace(typed.String())
+	default:
+		return strings.TrimSpace(fmt.Sprint(typed))
+	}
 }
 
 func decodeObject(payload []byte) (map[string]any, error) {
@@ -824,4 +1599,19 @@ func normalizeMethod(method string) string {
 		return http.MethodPost
 	}
 	return method
+}
+
+func appendQueryValues(rawURL string, values url.Values) (string, error) {
+	parsed, err := url.Parse(rawURL)
+	if err != nil {
+		return "", err
+	}
+	query := parsed.Query()
+	for key, list := range values {
+		for _, value := range list {
+			query.Add(key, value)
+		}
+	}
+	parsed.RawQuery = query.Encode()
+	return parsed.String(), nil
 }

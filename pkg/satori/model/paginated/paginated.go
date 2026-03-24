@@ -1,4 +1,4 @@
-package define
+package paginated
 
 import (
 	"encoding/json"

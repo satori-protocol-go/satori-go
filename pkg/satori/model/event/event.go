@@ -1,6 +1,9 @@
 package event
 
 import (
+	"encoding/json"
+	"strings"
+
 	"github.com/satori-protocol-go/satori-go/pkg/satori/model/channel"
 	"github.com/satori-protocol-go/satori-go/pkg/satori/model/guild"
 	"github.com/satori-protocol-go/satori-go/pkg/satori/model/guildmember"
@@ -11,83 +14,142 @@ import (
 	"github.com/satori-protocol-go/satori-go/pkg/satori/model/user"
 )
 
-// EventType 事件类型
 type EventType string
 
 const (
-	// Emoji 事件
+	EventTypeGuildEmojiAdded   EventType = "guild-emoji-added"
+	EventTypeGuildEmojiUpdated EventType = "guild-emoji-updated"
+	EventTypeGuildEmojiDeleted EventType = "guild-emoji-deleted"
 
-	EventTypeGuildEmojiAdded   EventType = "guild-emoji-added"   // 当群组表情被添加时触发
-	EventTypeGuildEmojiUpdated EventType = "guild-emoji-updated" // 当群组表情被更新时触发
-	EventTypeGuildEmojiDeleted EventType = "guild-emoji-deleted" // 当群组表情被删除时触发
+	EventTypeFriendRequest EventType = "friend-request"
 
-	// Friend 事件
+	EventTypeGuildAdded   EventType = "guild-added"
+	EventTypeGuildUpdated EventType = "guild-updated"
+	EventTypeGuildRemoved EventType = "guild-removed"
+	EventTypeGuildRequest EventType = "guild-request"
 
-	EventTypeFriendRequest EventType = "friend-request" // 接收到新的好友申请时触发
+	EventTypeGuildMemberAdded   EventType = "guild-member-added"
+	EventTypeGuildMemberUpdated EventType = "guild-member-updated"
+	EventTypeGuildMemberRemoved EventType = "guild-member-removed"
+	EventTypeGuildMemberRequest EventType = "guild-member-request"
 
-	// Guild 事件
+	EventTypeGuildRoleCreated EventType = "guild-role-created"
+	EventTypeGuildRoleUpdated EventType = "guild-role-updated"
+	EventTypeGuildRoleDeleted EventType = "guild-role-deleted"
 
-	EventTypeGuildAdded   EventType = "guild-added"   // 加入群组时触发
-	EventTypeGuildUpdated EventType = "guild-updated" // 群组被修改时触发
-	EventTypeGuildRemoved EventType = "guild-removed" // 退出群组时触发
-	EventTypeGuildRequest EventType = "guild-request" // 接收到新的入群邀请时触发
+	EventTypeInteractionButton  EventType = "interaction/button"
+	EventTypeInteractionCommand EventType = "interaction/command"
 
-	// GuildMember 事件
+	EventTypeLoginAdded   EventType = "login-added"
+	EventTypeLoginRemoved EventType = "login-removed"
+	EventTypeLoginUpdated EventType = "login-updated"
 
-	EventTypeGuildMemberAdded   EventType = "guild-member-added"   // 群组成员增加时触发
-	EventTypeGuildMemberUpdated EventType = "guild-member-updated" // 群组成员信息更新时触发
-	EventTypeGuildMemberRemoved EventType = "guild-member-removed" // 群组成员移除时触发
-	EventTypeGuildMemberRequest EventType = "guild-member-request" // 接收到新的加群请求时触发
+	EventTypeMessageCreated EventType = "message-created"
+	EventTypeMessageUpdated EventType = "message-updated"
+	EventTypeMessageDeleted EventType = "message-deleted"
 
-	// GuildRole 事件
+	EventTypeReactionAdded   EventType = "reaction-added"
+	EventTypeReactionRemoved EventType = "reaction-removed"
 
-	EventTypeGuildRoleCreated EventType = "guild-role-created" // 群组角色被创建时触发
-	EventTypeGuildRoleUpdated EventType = "guild-role-updated" // 群组角色被修改时触发
-	EventTypeGuildRoleDeleted EventType = "guild-role-deleted" // 群组角色被删除时触发
-
-	// Interaction 事件
-
-	EventTypeInteractionButton  EventType = "interaction/button"  // 类型为 action 的按钮被点击时触发
-	EventTypeInteractionCommand EventType = "interaction/command" // 调用斜线指令时触发
-
-	// Login 事件
-
-	EventTypeLoginAdded   EventType = "login-added"   // 登录被创建时触发
-	EventTypeLoginRemoved EventType = "login-removed" // 登录被删除时触发
-	EventTypeLoginUpdated EventType = "login-updated" // 登录信息更新时触发
-
-	// Message 事件
-
-	EventTypeMessageCreated EventType = "message-created" // 当消息被创建时触发
-	EventTypeMessageUpdated EventType = "message-updated" // 当消息被编辑时触发
-	EventTypeMessageDeleted EventType = "message-deleted" // 当消息被删除时触发
-
-	// Reaction 事件
-
-	EventTypeReactionAdded   EventType = "reaction-added"   // 当表态被添加时触发
-	EventTypeReactionRemoved EventType = "reaction-removed" // 当表态被移除时触发
-
-	// Internal 事件
-
-	EventTypeInternal EventType = "internal" // 内部事件
+	EventTypeInternal EventType = "internal"
 )
 
-// 事件类型定义
+// Event is the canonical Satori event payload.
 type Event struct {
-	Sn        int64                    `json:"sn"`                 // 序列号
-	Type      EventType                `json:"type"`               // 事件类型
-	Timestamp int64                    `json:"timestamp"`          // 事件的时间戳
-	Login     *login.Login             `json:"login"`              // 登录信息
-	Argv      *interaction.Argv        `json:"argv,omitempty"`     // 交互指令
-	Button    *interaction.Button      `json:"button,omitempty"`   // 交互按钮
-	Channel   *channel.Channel         `json:"channel,omitempty"`  // 事件所属的频道
-	Guild     *guild.Guild             `json:"guild,omitempty"`    // 事件所属的群组
-	Member    *guildmember.GuildMember `json:"member,omitempty"`   // 事件的目标成员
-	Message   *message.Message         `json:"message,omitempty"`  // 事件的消息
-	Operator  *user.User               `json:"operator,omitempty"` // 事件的操作者
-	Role      *guildrole.GuildRole     `json:"role,omitempty"`     // 事件的目标角色
-	User      *user.User               `json:"user,omitempty"`     // 事件的目标用户
-	Referrer  map[string]any           `json:"referrer,omitempty"` // 用于 被动请求 的来源信息
-	Type_     string                   `json:"_type,omitempty"`    // 原生事件类型
-	Data_     any                      `json:"_data,omitempty"`    // 原生事件数据
+	Sn        int64                    `json:"sn"`
+	Type      EventType                `json:"type"`
+	Timestamp int64                    `json:"timestamp"`
+	Login     *login.Login             `json:"login"`
+	Argv      *interaction.Argv        `json:"argv,omitempty"`
+	Button    *interaction.Button      `json:"button,omitempty"`
+	Channel   *channel.Channel         `json:"channel,omitempty"`
+	Guild     *guild.Guild             `json:"guild,omitempty"`
+	Member    *guildmember.GuildMember `json:"member,omitempty"`
+	Message   *message.Message         `json:"message,omitempty"`
+	Operator  *user.User               `json:"operator,omitempty"`
+	Role      *guildrole.GuildRole     `json:"role,omitempty"`
+	User      *user.User               `json:"user,omitempty"`
+	Referrer  map[string]any           `json:"referrer,omitempty"`
+	Type_     string                   `json:"_type,omitempty"`
+	Data_     any                      `json:"_data,omitempty"`
+}
+
+func (e *Event) UnmarshalJSON(data []byte) error {
+	type eventWire struct {
+		Sn        *int64                   `json:"sn"`
+		ID        *int64                   `json:"id"`
+		Type      EventType                `json:"type"`
+		Timestamp int64                    `json:"timestamp"`
+		Login     *login.Login             `json:"login"`
+		Platform  string                   `json:"platform"`
+		SelfID    string                   `json:"self_id"`
+		Argv      *interaction.Argv        `json:"argv"`
+		Button    *interaction.Button      `json:"button"`
+		Channel   *channel.Channel         `json:"channel"`
+		Guild     *guild.Guild             `json:"guild"`
+		Member    *guildmember.GuildMember `json:"member"`
+		Message   *message.Message         `json:"message"`
+		Operator  *user.User               `json:"operator"`
+		Role      *guildrole.GuildRole     `json:"role"`
+		User      *user.User               `json:"user"`
+		Referrer  map[string]any           `json:"referrer"`
+		Type_     string                   `json:"_type"`
+		Data_     any                      `json:"_data"`
+	}
+
+	var wire eventWire
+	if err := json.Unmarshal(data, &wire); err != nil {
+		return err
+	}
+
+	e.Sn = 0
+	if wire.Sn != nil {
+		e.Sn = *wire.Sn
+	} else if wire.ID != nil {
+		e.Sn = *wire.ID
+	}
+
+	e.Type = wire.Type
+	e.Timestamp = wire.Timestamp
+	e.Login = wire.Login
+	e.Argv = wire.Argv
+	e.Button = wire.Button
+	e.Channel = wire.Channel
+	e.Guild = wire.Guild
+	e.Member = wire.Member
+	e.Message = wire.Message
+	e.Operator = wire.Operator
+	e.Role = wire.Role
+	e.User = wire.User
+	e.Referrer = wire.Referrer
+	e.Type_ = wire.Type_
+	e.Data_ = wire.Data_
+
+	selfID := strings.TrimSpace(wire.SelfID)
+	platform := strings.TrimSpace(wire.Platform)
+	if selfID == "" {
+		return nil
+	}
+
+	if e.Login == nil {
+		if platform == "" {
+			platform = "unknown"
+		}
+		e.Login = &login.Login{
+			Sn:       0,
+			Platform: platform,
+			User:     &user.User{Id: selfID},
+			Status:   login.LoginStatusOnline,
+			Adapter:  "satori",
+		}
+		return nil
+	}
+
+	if e.Login.User == nil {
+		e.Login.User = &user.User{Id: selfID}
+	}
+	if e.Login.Platform == "" && platform != "" {
+		e.Login.Platform = platform
+	}
+	return nil
 }

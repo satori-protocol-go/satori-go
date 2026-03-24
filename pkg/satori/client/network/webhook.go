@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"strconv"
 	"strings"
@@ -19,7 +20,7 @@ import (
 )
 
 type Webhook struct {
-	base *base
+	base *baseNetwork
 
 	host    string
 	port    int
@@ -33,10 +34,11 @@ type Webhook struct {
 }
 
 func NewWebhook(app AppBridge, options WebhookOptions) *Webhook {
-	identity := options.Identity
+	identity := strings.TrimSpace(options.Identity)
 	if identity == "" {
-		identity = fmt.Sprintf("webhook@%p", &options)
+		identity = "default"
 	}
+
 	path := strings.TrimSpace(options.Path)
 	if path == "" {
 		path = "/v1/events"
@@ -44,15 +46,17 @@ func NewWebhook(app AppBridge, options WebhookOptions) *Webhook {
 	if !strings.HasPrefix(path, "/") {
 		path = "/" + path
 	}
-	return &Webhook{
-		base:    newBase(app, options.APIConfig, "satori/net/wh/"+identity),
+
+	network := &Webhook{
 		host:    options.Host,
 		port:    options.Port,
 		path:    path,
 		token:   options.Token,
-		timeout: options.Timeout,
+		timeout: normalizedTimeout(options.Timeout),
 		client:  &http.Client{Timeout: normalizedTimeout(options.Timeout)},
 	}
+	network.base = newBaseNetwork(app, options.APIConfig, fmt.Sprintf("satori/net/wh/%s#%p", identity, network))
+	return network
 }
 
 func (n *Webhook) ID() string {
@@ -60,61 +64,86 @@ func (n *Webhook) ID() string {
 }
 
 func (n *Webhook) Run(ctx context.Context) error {
-	if err := n.fetchMeta(ctx); err != nil {
-		return err
+	if ctx == nil {
+		ctx = context.Background()
 	}
 
 	mux := http.NewServeMux()
 	mux.HandleFunc(n.path, n.handleRequest)
-	server := &http.Server{
-		Addr:    webhookAddress(n.host, n.port),
-		Handler: mux,
+
+	addr := webhookAddress(n.host, n.port)
+	listener, err := net.Listen("tcp", addr)
+	if err != nil {
+		return err
 	}
 
+	server := &http.Server{
+		Addr:    addr,
+		Handler: mux,
+	}
 	n.mu.Lock()
 	n.server = server
 	n.mu.Unlock()
+	n.base.MarkAvailable()
 
 	errCh := make(chan error, 1)
 	go func() {
-		if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			errCh <- err
+		serveErr := server.Serve(listener)
+		if serveErr != nil && serveErr != http.ErrServerClosed && serveErr != net.ErrClosed {
+			errCh <- serveErr
+			return
 		}
-		close(errCh)
+		errCh <- nil
 	}()
+
+	if err := n.fetchMeta(ctx); err != nil {
+		_ = n.Close()
+		return err
+	}
 
 	select {
 	case <-ctx.Done():
-		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-		_ = server.Shutdown(shutdownCtx)
-		n.base.app.MarkNetworkStatus(n.ID(), login.LoginStatusOffline, true)
+		_ = n.Close()
 		return nil
-	case err := <-errCh:
+	case serveErr := <-errCh:
 		n.base.app.MarkNetworkStatus(n.ID(), login.LoginStatusOffline, true)
-		return err
+		return serveErr
 	}
 }
 
 func (n *Webhook) Close() error {
 	n.base.MarkClosed()
+
 	n.mu.Lock()
 	server := n.server
 	n.server = nil
 	n.mu.Unlock()
+
 	if server != nil {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
 		_ = server.Shutdown(ctx)
 	}
+
 	n.base.app.MarkNetworkStatus(n.ID(), login.LoginStatusOffline, true)
 	return nil
 }
 
+func (n *Webhook) Alive() bool {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	return n.server != nil
+}
+
+func (n *Webhook) WaitForAvailable(ctx context.Context) error {
+	return n.base.WaitAvailable(ctx)
+}
+
 func (n *Webhook) fetchMeta(ctx context.Context) error {
-	endpoint := stringsJoinPath(n.base.Config().APIBase(), "meta")
-	requestBody := bytes.NewReader([]byte("{}"))
-	request, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, requestBody)
+	endpoint := joinURLPath(n.base.Config().APIBase(), "meta")
+	body := bytes.NewReader([]byte("{}"))
+
+	request, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, body)
 	if err != nil {
 		return err
 	}
@@ -124,13 +153,12 @@ func (n *Webhook) fetchMeta(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	defer response.Body.Close()
-	payload, err := io.ReadAll(response.Body)
+	payload, err := readResponseBody(response)
 	if err != nil {
 		return err
 	}
-	if response.StatusCode < 200 || response.StatusCode >= 300 {
-		return fmt.Errorf("meta request failed with status %d: %s", response.StatusCode, string(payload))
+	if err := validateHTTPStatus(response.StatusCode, payload); err != nil {
+		return err
 	}
 
 	var data meta.Meta
@@ -144,26 +172,30 @@ func (n *Webhook) fetchMeta(ctx context.Context) error {
 }
 
 func (n *Webhook) handleRequest(w http.ResponseWriter, request *http.Request) {
+	if request.Method != http.MethodPost {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+
 	authorization := request.Header.Get("Authorization")
 	if !strings.HasPrefix(authorization, "Bearer") {
 		w.WriteHeader(http.StatusUnauthorized)
 		return
 	}
-
 	token := strings.TrimSpace(strings.TrimPrefix(authorization, "Bearer"))
 	if n.token != "" && token != n.token {
 		w.WriteHeader(http.StatusUnauthorized)
 		return
 	}
 
-	opcodeRaw := request.Header.Get("Satori-OpCode")
-	opcode, _ := strconv.Atoi(opcodeRaw)
-
 	payload, err := io.ReadAll(request.Body)
 	if err != nil {
 		w.WriteHeader(http.StatusInternalServerError)
 		return
 	}
+
+	opcodeRaw := strings.TrimSpace(request.Header.Get("Satori-OpCode"))
+	opcode, _ := strconv.Atoi(opcodeRaw)
 
 	switch operation.Opcode(opcode) {
 	case operation.OpcodeMeta:
@@ -175,6 +207,8 @@ func (n *Webhook) handleRequest(w http.ResponseWriter, request *http.Request) {
 		n.base.SetProxyURLs(metaPayload.ProxyUrls)
 		n.base.app.SyncLogins(n.ID(), n.base.Config(), metaPayload.ProxyUrls, nil)
 		w.WriteHeader(http.StatusOK)
+		return
+
 	case operation.OpcodeEvent:
 		var evt event.Event
 		if err := decodeJSON(payload, &evt); err != nil {
@@ -183,9 +217,16 @@ func (n *Webhook) handleRequest(w http.ResponseWriter, request *http.Request) {
 			return
 		}
 		n.base.SetSequence(evt.Sn)
+		// Keep webhook request path fast; callbacks run asynchronously.
 		go n.base.app.PostEvent(n.ID(), &evt)
 		w.WriteHeader(http.StatusOK)
+		return
+
 	default:
 		w.WriteHeader(http.StatusAccepted)
+		return
 	}
 }
+
+var _ Runner = (*Webhook)(nil)
+var _ Availability = (*Webhook)(nil)

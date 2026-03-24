@@ -30,13 +30,17 @@ type Config interface {
 }
 
 type WebSocketConfig struct {
-	Host    string
-	Port    int
-	Path    string
-	Version string
-	Token   string
-	Timeout time.Duration
+	Host             string
+	Port             int
+	Path             string
+	Version          string
+	Token            string
+	Timeout          time.Duration
+	HandshakeTimeout time.Duration
 }
+
+// WebsocketsInfo keeps naming parity with satori-python.
+type WebsocketsInfo = WebSocketConfig
 
 func (c *WebSocketConfig) normalize() {
 	if strings.TrimSpace(c.Host) == "" {
@@ -118,6 +122,9 @@ type WebhookConfig struct {
 	Version    string
 	Timeout    time.Duration
 }
+
+// WebhookInfo keeps naming parity with satori-python.
+type WebhookInfo = WebhookConfig
 
 func (c *WebhookConfig) normalize() {
 	if strings.TrimSpace(c.Host) == "" {

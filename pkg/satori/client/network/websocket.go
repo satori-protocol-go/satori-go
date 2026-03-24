@@ -17,7 +17,7 @@ import (
 )
 
 type WS struct {
-	base   *base
+	base   *baseNetwork
 	token  string
 	wsBase string
 	dialer *websocket.Dialer
@@ -29,20 +29,38 @@ type WS struct {
 }
 
 func NewWS(app AppBridge, options WebSocketOptions) *WS {
-	dialer := options.Dialer
-	if dialer == nil {
-		dialer = websocket.DefaultDialer
+	dialer := copyDialer(options.Dialer)
+	if options.HandshakeTimeout > 0 {
+		dialer.HandshakeTimeout = options.HandshakeTimeout
+	} else if dialer.HandshakeTimeout <= 0 {
+		dialer.HandshakeTimeout = 300 * time.Second
 	}
-	identity := options.Identity
+
+	identity := strings.TrimSpace(options.Identity)
 	if identity == "" {
-		identity = fmt.Sprintf("ws@%p", &options)
+		identity = "default"
 	}
-	return &WS{
-		base:   newBase(app, options.APIConfig, "satori/net/ws/"+identity),
+
+	network := &WS{
 		token:  options.Token,
 		wsBase: options.WSBase,
 		dialer: dialer,
 	}
+	network.base = newBaseNetwork(app, options.APIConfig, fmt.Sprintf("satori/net/ws/%s#%p", identity, network))
+	return network
+}
+
+func copyDialer(source *websocket.Dialer) *websocket.Dialer {
+	if source == nil {
+		defaultDialer := websocket.DefaultDialer
+		if defaultDialer == nil {
+			return &websocket.Dialer{}
+		}
+		copied := *defaultDialer
+		return &copied
+	}
+	copied := *source
+	return &copied
 }
 
 func (n *WS) ID() string {
@@ -50,6 +68,10 @@ func (n *WS) ID() string {
 }
 
 func (n *WS) Run(ctx context.Context) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+
 	for {
 		if ctx.Err() != nil {
 			n.base.app.MarkNetworkStatus(n.ID(), login.LoginStatusOffline, true)
@@ -60,7 +82,7 @@ func (n *WS) Run(ctx context.Context) error {
 		if err == nil {
 			continue
 		}
-		if ctx.Err() != nil || errors.Is(err, context.Canceled) {
+		if errors.Is(err, context.Canceled) || ctx.Err() != nil {
 			n.base.app.MarkNetworkStatus(n.ID(), login.LoginStatusOffline, true)
 			return nil
 		}
@@ -77,8 +99,23 @@ func (n *WS) Run(ctx context.Context) error {
 	}
 }
 
+func (n *WS) Close() error {
+	n.base.MarkClosed()
+	n.closeConnection()
+	n.base.app.MarkNetworkStatus(n.ID(), login.LoginStatusOffline, true)
+	return nil
+}
+
+func (n *WS) Alive() bool {
+	return n.connection() != nil
+}
+
+func (n *WS) WaitForAvailable(ctx context.Context) error {
+	return n.base.WaitAvailable(ctx)
+}
+
 func (n *WS) connectAndServe(ctx context.Context) error {
-	wsEndpoint := stringsJoinPath(n.wsBase, "events")
+	wsEndpoint := joinURLPath(n.wsBase, "events")
 	connection, response, err := n.dialer.DialContext(ctx, wsEndpoint, nil)
 	if err != nil {
 		if response != nil {
@@ -88,6 +125,7 @@ func (n *WS) connectAndServe(ctx context.Context) error {
 	}
 	n.setConnection(connection)
 	defer n.closeConnection()
+	n.base.MarkAvailable()
 
 	if err := n.authenticate(connection); err != nil {
 		return err
@@ -111,11 +149,14 @@ func (n *WS) connectAndServe(ctx context.Context) error {
 }
 
 func (n *WS) authenticate(connection *websocket.Conn) error {
-	body := map[string]any{"token": n.token}
+	identify := operation.IdentifyBody{Token: n.token}
 	if sequence := n.base.Sequence(); sequence > -1 {
-		body["sn"] = sequence
+		identify.Sn = sequence
 	}
-	if err := n.sendJSON(map[string]any{"op": operation.OpcodeIdentify, "body": body}); err != nil {
+	if err := n.sendJSON(map[string]any{
+		"op":   operation.OpcodeIdentify,
+		"body": identify,
+	}); err != nil {
 		return err
 	}
 
@@ -130,22 +171,22 @@ func (n *WS) authenticate(connection *websocket.Conn) error {
 		Op   operation.Opcode `json:"op"`
 		Body json.RawMessage  `json:"body"`
 	}
-	if err := json.Unmarshal(payload, &frame); err != nil {
+	if err := decodeJSON(payload, &frame); err != nil {
 		return err
 	}
 	if frame.Op != operation.OpcodeReady {
-		return errors.New("unexpected websocket ready payload")
+		return errors.New("unexpected websocket frame before ready")
 	}
 
 	var ready operation.ReadyBody
-	if err := json.Unmarshal(frame.Body, &ready); err != nil {
+	if err := decodeJSON(frame.Body, &ready); err != nil {
 		return err
 	}
 
 	n.base.SetProxyURLs(ready.ProxyUrls)
 	n.base.app.SyncLogins(n.ID(), n.base.Config(), ready.ProxyUrls, ready.Logins)
 	if len(ready.Logins) == 0 {
-		log.Printf("[satori-client] no account available for websocket %s", n.ID())
+		log.Printf("[satori-client] no login available for websocket %s", n.ID())
 	}
 	return nil
 }
@@ -161,26 +202,32 @@ func (n *WS) receiveLoop(connection *websocket.Conn) error {
 			Op   operation.Opcode `json:"op"`
 			Body json.RawMessage  `json:"body"`
 		}
-		if err := json.Unmarshal(payload, &frame); err != nil {
+		if err := decodeJSON(payload, &frame); err != nil {
 			continue
 		}
 
 		switch frame.Op {
 		case operation.OpcodeEvent:
 			var evt event.Event
-			if err := json.Unmarshal(frame.Body, &evt); err != nil {
+			if err := decodeJSON(frame.Body, &evt); err != nil {
 				log.Printf("[satori-client] failed to parse event payload: %v", err)
 				continue
 			}
 			n.base.SetSequence(evt.Sn)
-			n.base.app.PostEvent(n.ID(), &evt)
+			// Keep receive loop responsive even with slow callbacks.
+			go n.base.app.PostEvent(n.ID(), &evt)
+
 		case operation.OpcodeMeta:
-			var payload operation.MetaBody
-			if err := json.Unmarshal(frame.Body, &payload); err != nil {
+			var metaPayload operation.MetaBody
+			if err := decodeJSON(frame.Body, &metaPayload); err != nil {
 				continue
 			}
-			n.base.SetProxyURLs(payload.ProxyUrls)
-			n.base.app.SyncLogins(n.ID(), n.base.Config(), payload.ProxyUrls, nil)
+			n.base.SetProxyURLs(metaPayload.ProxyUrls)
+			n.base.app.SyncLogins(n.ID(), n.base.Config(), metaPayload.ProxyUrls, nil)
+
+		case operation.OpcodePong:
+			continue
+
 		default:
 			if frame.Op > operation.OpcodeMeta {
 				log.Printf("[satori-client] received unknown opcode: %d", frame.Op)
@@ -211,7 +258,7 @@ func (n *WS) sendJSON(payload any) error {
 
 	connection := n.connection()
 	if connection == nil {
-		return errors.New("connection is not established")
+		return errors.New("websocket connection is not established")
 	}
 	return connection.WriteJSON(payload)
 }
@@ -238,23 +285,17 @@ func (n *WS) closeConnection() {
 	}
 }
 
-func (n *WS) Close() error {
-	n.base.MarkClosed()
-	n.closeConnection()
-	n.base.app.MarkNetworkStatus(n.ID(), login.LoginStatusOffline, true)
-	return nil
-}
-
-func stringsJoinPath(base string, path string) string {
+func joinURLPath(base string, suffix string) string {
 	base = strings.TrimSuffix(strings.TrimSpace(base), "/")
-	path = strings.TrimPrefix(strings.TrimSpace(path), "/")
+	suffix = strings.TrimPrefix(strings.TrimSpace(suffix), "/")
 	if base == "" {
-		return "/" + path
+		return "/" + suffix
 	}
-	if path == "" {
+	if suffix == "" {
 		return base
 	}
-	return base + "/" + path
+	return base + "/" + suffix
 }
 
 var _ Runner = (*WS)(nil)
+var _ Availability = (*WS)(nil)

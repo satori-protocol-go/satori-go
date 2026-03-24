@@ -20,6 +20,9 @@ type APIInfo struct {
 	Timeout time.Duration
 }
 
+// ApiInfo keeps naming parity with satori-python.
+type ApiInfo = APIInfo
+
 func (c *APIInfo) normalize() {
 	if strings.TrimSpace(c.Host) == "" {
 		c.Host = defaultHost
@@ -60,6 +63,8 @@ func (c APIInfo) TimeoutValue() time.Duration {
 type ProtocolFactory func(*Account) *APIProtocol
 
 type Account struct {
+	*APIProtocol
+
 	Adapter  string
 	SelfInfo *login.Login
 	Config   APIConfig
@@ -68,6 +73,7 @@ type Account struct {
 	mu        sync.RWMutex
 	proxyURLs []string
 	connected bool
+	ready     chan struct{}
 }
 
 func NewAccount(selfInfo *login.Login, cfg APIConfig, proxyURLs []string, protocolFactory ProtocolFactory) *Account {
@@ -78,6 +84,7 @@ func NewAccount(selfInfo *login.Login, cfg APIConfig, proxyURLs []string, protoc
 		Adapter:  selfInfo.Adapter,
 		SelfInfo: selfInfo,
 		Config:   cfg,
+		ready:    make(chan struct{}),
 	}
 	account.SetProxyURLs(proxyURLs)
 	if protocolFactory == nil {
@@ -85,7 +92,12 @@ func NewAccount(selfInfo *login.Login, cfg APIConfig, proxyURLs []string, protoc
 			return NewAPIProtocol(acc, nil)
 		}
 	}
-	account.Protocol = protocolFactory(account)
+	protocol := protocolFactory(account)
+	if protocol == nil {
+		protocol = NewAPIProtocol(account, nil)
+	}
+	account.APIProtocol = protocol
+	account.Protocol = protocol
 	return account
 }
 
@@ -115,25 +127,58 @@ func (a *Account) Connected() bool {
 
 func (a *Account) SetConnected(connected bool) {
 	a.mu.Lock()
-	a.connected = connected
-	a.mu.Unlock()
+	defer a.mu.Unlock()
+
+	if connected {
+		if a.connected {
+			return
+		}
+		if a.ready == nil {
+			a.ready = make(chan struct{})
+		}
+		close(a.ready)
+		a.connected = true
+		return
+	}
+
+	if !a.connected {
+		if a.ready == nil {
+			a.ready = make(chan struct{})
+		}
+		return
+	}
+	a.connected = false
+	a.ready = make(chan struct{})
 }
 
 func (a *Account) WaitConnected(ctx context.Context, interval time.Duration) error {
-	if interval <= 0 {
-		interval = 100 * time.Millisecond
+	_ = interval
+	if ctx == nil {
+		ctx = context.Background()
 	}
-	ticker := time.NewTicker(interval)
-	defer ticker.Stop()
-	for {
-		if a.Connected() {
-			return nil
+
+	a.mu.RLock()
+	if a.connected {
+		a.mu.RUnlock()
+		return nil
+	}
+	ready := a.ready
+	a.mu.RUnlock()
+
+	if ready == nil {
+		a.mu.Lock()
+		if a.ready == nil {
+			a.ready = make(chan struct{})
 		}
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-ticker.C:
-		}
+		ready = a.ready
+		a.mu.Unlock()
+	}
+
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-ready:
+		return nil
 	}
 }
 

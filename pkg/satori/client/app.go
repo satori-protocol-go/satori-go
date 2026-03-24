@@ -43,6 +43,10 @@ type App struct {
 var defaultApp atomic.Pointer[App]
 
 func NewApp(configs ...Config) (*App, error) {
+	if defaultApp.Load() != nil {
+		log.Printf("[satori-client] default app already exists and will be replaced")
+	}
+
 	app := &App{
 		accounts:         map[string]*Account{},
 		networkStates:    map[string]*networkState{},
@@ -110,6 +114,11 @@ func (a *App) RegisterNetworkFactory(kind string, factory NetworkFactory) error 
 	return nil
 }
 
+// RegisterConfig keeps naming parity with satori-python register_config.
+func (a *App) RegisterConfig(kind string, factory NetworkFactory) error {
+	return a.RegisterNetworkFactory(kind, factory)
+}
+
 func (a *App) registerNetworkFactoryLocked(kind string, factory NetworkFactory) {
 	if a.networkFactories == nil {
 		a.networkFactories = map[string]NetworkFactory{}
@@ -169,6 +178,20 @@ func (a *App) RegisterOn(eventType event.EventType, callback EventCallback) {
 	a.RegisterOnType(string(eventType), callback)
 }
 
+// On keeps decorator-style registration parity with satori-python register_on.
+func (a *App) On(eventType event.EventType) func(EventCallback) EventCallback {
+	return a.OnType(string(eventType))
+}
+
+// OnType keeps decorator-style registration parity with satori-python register_on.
+func (a *App) OnType(eventType string) func(EventCallback) EventCallback {
+	eventType = strings.TrimSpace(eventType)
+	return func(callback EventCallback) EventCallback {
+		a.RegisterOnType(eventType, callback)
+		return callback
+	}
+}
+
 func (a *App) RegisterOnType(eventType string, callback EventCallback) {
 	if callback == nil {
 		return
@@ -213,6 +236,66 @@ func (a *App) AccountsBySelfID(selfID string) []*Account {
 			result = append(result, account)
 		}
 	}
+	return result
+}
+
+func (a *App) Connections() []clientnetwork.Runner {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	return append([]clientnetwork.Runner(nil), a.networks...)
+}
+
+func (a *App) WaitForAvailable(ctx context.Context, networkIDs ...string) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+
+	required := map[string]struct{}{}
+	for _, id := range networkIDs {
+		id = strings.TrimSpace(id)
+		if id == "" {
+			continue
+		}
+		required[id] = struct{}{}
+	}
+
+	networks := a.Connections()
+	found := map[string]struct{}{}
+	for _, runner := range networks {
+		id := runner.ID()
+		if len(required) > 0 {
+			if _, ok := required[id]; !ok {
+				continue
+			}
+			found[id] = struct{}{}
+		}
+
+		available, ok := runner.(clientnetwork.Availability)
+		if !ok {
+			continue
+		}
+		if err := available.WaitForAvailable(ctx); err != nil {
+			return err
+		}
+	}
+
+	if len(required) == 0 {
+		return nil
+	}
+	for id := range required {
+		if _, ok := found[id]; !ok {
+			return fmt.Errorf("network %q not found", id)
+		}
+	}
+	return nil
+}
+
+func (a *App) RunAsync(ctx context.Context) <-chan error {
+	result := make(chan error, 1)
+	go func() {
+		defer close(result)
+		result <- a.Run(ctx)
+	}()
 	return result
 }
 
@@ -491,13 +574,31 @@ func (a *App) dispatchEvent(account *Account, evt *event.Event) {
 	a.mu.RLock()
 	callbacks := append([]EventCallback(nil), a.eventCallbacks...)
 	a.mu.RUnlock()
+
+	errCh := make(chan error, len(callbacks))
+	var wg sync.WaitGroup
 	for _, callback := range callbacks {
 		if callback == nil {
 			continue
 		}
-		if err := callback(account, evt); err != nil {
-			log.Printf("[satori-client] event callback error: %v", err)
-		}
+		wg.Add(1)
+		go func(fn EventCallback) {
+			defer wg.Done()
+			defer func() {
+				if recovered := recover(); recovered != nil {
+					errCh <- fmt.Errorf("event callback panic: %v", recovered)
+				}
+			}()
+			if err := fn(account, evt); err != nil {
+				errCh <- err
+			}
+		}(callback)
+	}
+	wg.Wait()
+	close(errCh)
+
+	for err := range errCh {
+		log.Printf("[satori-client] event callback error: %v", err)
 	}
 }
 
@@ -505,13 +606,31 @@ func (a *App) accountUpdate(account *Account, status login.LoginStatus) {
 	a.mu.RLock()
 	callbacks := append([]LifecycleCallback(nil), a.lifecycleCallbacks...)
 	a.mu.RUnlock()
+
+	errCh := make(chan error, len(callbacks))
+	var wg sync.WaitGroup
 	for _, callback := range callbacks {
 		if callback == nil {
 			continue
 		}
-		if err := callback(account, status); err != nil {
-			log.Printf("[satori-client] lifecycle callback error: %v", err)
-		}
+		wg.Add(1)
+		go func(fn LifecycleCallback) {
+			defer wg.Done()
+			defer func() {
+				if recovered := recover(); recovered != nil {
+					errCh <- fmt.Errorf("lifecycle callback panic: %v", recovered)
+				}
+			}()
+			if err := fn(account, status); err != nil {
+				errCh <- err
+			}
+		}(callback)
+	}
+	wg.Wait()
+	close(errCh)
+
+	for err := range errCh {
+		log.Printf("[satori-client] lifecycle callback error: %v", err)
 	}
 }
 
@@ -538,11 +657,16 @@ func wsNetworkFactory(app *App, cfg Config) (clientnetwork.Runner, APIConfig, er
 	case WebSocketConfig:
 		normalized := typed
 		normalized.normalize()
+		handshakeTimeout := normalized.HandshakeTimeout
+		if handshakeTimeout <= 0 {
+			handshakeTimeout = normalized.Timeout
+		}
 		return clientnetwork.NewWS(app, clientnetwork.WebSocketOptions{
-			Identity:  normalized.Identity(),
-			WSBase:    normalized.WSBase(),
-			Token:     normalized.Token,
-			APIConfig: normalized,
+			Identity:         normalized.Identity(),
+			WSBase:           normalized.WSBase(),
+			Token:            normalized.Token,
+			APIConfig:        normalized,
+			HandshakeTimeout: handshakeTimeout,
 		}), normalized, nil
 	case *WebSocketConfig:
 		if typed == nil {
@@ -550,11 +674,16 @@ func wsNetworkFactory(app *App, cfg Config) (clientnetwork.Runner, APIConfig, er
 		}
 		normalized := *typed
 		normalized.normalize()
+		handshakeTimeout := normalized.HandshakeTimeout
+		if handshakeTimeout <= 0 {
+			handshakeTimeout = normalized.Timeout
+		}
 		return clientnetwork.NewWS(app, clientnetwork.WebSocketOptions{
-			Identity:  normalized.Identity(),
-			WSBase:    normalized.WSBase(),
-			Token:     normalized.Token,
-			APIConfig: normalized,
+			Identity:         normalized.Identity(),
+			WSBase:           normalized.WSBase(),
+			Token:            normalized.Token,
+			APIConfig:        normalized,
+			HandshakeTimeout: handshakeTimeout,
 		}), normalized, nil
 	default:
 		return nil, nil, fmt.Errorf("ws factory does not support config type %T", cfg)
