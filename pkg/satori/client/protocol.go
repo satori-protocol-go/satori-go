@@ -30,6 +30,7 @@ import (
 	"github.com/satori-protocol-go/satori-go/pkg/satori/model/meta"
 	"github.com/satori-protocol-go/satori-go/pkg/satori/model/paginated"
 	"github.com/satori-protocol-go/satori-go/pkg/satori/model/user"
+	"github.com/satori-protocol-go/satori-go/pkg/satori/protocol"
 )
 
 type APIProtocol struct {
@@ -230,7 +231,7 @@ func NewAPIProtocol(account *Account, httpClient *http.Client) *APIProtocol {
 	}
 	timeout := account.Config.TimeoutValue()
 	if timeout <= 0 {
-		timeout = 300 * time.Second
+		timeout = protocol.DefaultRequestTimeout
 	}
 	if httpClient == nil {
 		httpClient = &http.Client{Timeout: timeout}
@@ -260,7 +261,7 @@ func (p *APIProtocol) RequestInternal(
 		ctx = context.Background()
 	}
 	endpoint := p.account.EnsureURL(rawURL)
-	method = normalizeMethod(method)
+	method = normalizeRequestMethod(method)
 	options := &InternalRequestOptions{
 		params:  params,
 		headers: http.Header{},
@@ -383,7 +384,7 @@ func (p *APIProtocol) CallAPI(
 		}
 	}
 
-	payload, err := p.requestBytes(ctx, normalizeMethod(method), endpoint, body, headers)
+	payload, err := p.requestBytes(ctx, normalizeAPIMethod(method), endpoint, body, headers)
 	if err != nil {
 		return nil, err
 	}
@@ -453,7 +454,7 @@ func (p *APIProtocol) MessageCreate(
 	content string,
 	referrer map[string]any,
 ) ([]*message.Message, error) {
-	resp, err := p.CallAPI(ctx, string(ApiMessageCreate), map[string]any{
+	resp, err := p.CallAPI(ctx, string(protocol.ApiMessageCreate), map[string]any{
 		"channel_id": channelID,
 		"content":    content,
 		"referrer":   referrer,
@@ -469,7 +470,7 @@ func (p *APIProtocol) MessageCreate(
 }
 
 func (p *APIProtocol) MessageGet(ctx context.Context, channelID string, messageID string) (*message.Message, error) {
-	resp, err := p.CallAPI(ctx, string(ApiMessageGet), map[string]any{
+	resp, err := p.CallAPI(ctx, string(protocol.ApiMessageGet), map[string]any{
 		"channel_id": channelID,
 		"message_id": messageID,
 	}, false, http.MethodPost)
@@ -484,7 +485,7 @@ func (p *APIProtocol) MessageGet(ctx context.Context, channelID string, messageI
 }
 
 func (p *APIProtocol) MessageDelete(ctx context.Context, channelID string, messageID string) error {
-	_, err := p.CallAPI(ctx, string(ApiMessageDelete), map[string]any{
+	_, err := p.CallAPI(ctx, string(protocol.ApiMessageDelete), map[string]any{
 		"channel_id": channelID,
 		"message_id": messageID,
 	}, false, http.MethodPost)
@@ -492,7 +493,7 @@ func (p *APIProtocol) MessageDelete(ctx context.Context, channelID string, messa
 }
 
 func (p *APIProtocol) MessageUpdate(ctx context.Context, channelID string, messageID string, content string) error {
-	_, err := p.CallAPI(ctx, string(ApiMessageUpdate), map[string]any{
+	_, err := p.CallAPI(ctx, string(protocol.ApiMessageUpdate), map[string]any{
 		"channel_id": channelID,
 		"message_id": messageID,
 		"content":    content,
@@ -521,7 +522,7 @@ func (p *APIProtocol) MessageList(
 		return nil, errors.New("invalid direction when next token is empty")
 	}
 
-	resp, err := p.CallAPI(ctx, string(ApiMessageList), map[string]any{
+	resp, err := p.CallAPI(ctx, string(protocol.ApiMessageList), map[string]any{
 		"channel_id": channelID,
 		"next":       nextToken,
 		"direction":  direction,
@@ -539,7 +540,7 @@ func (p *APIProtocol) MessageList(
 }
 
 func (p *APIProtocol) ChannelGet(ctx context.Context, channelID string) (*channel.Channel, error) {
-	resp, err := p.CallAPI(ctx, string(ApiChannelGet), map[string]any{"channel_id": channelID}, false, http.MethodPost)
+	resp, err := p.CallAPI(ctx, string(protocol.ApiChannelGet), map[string]any{"channel_id": channelID}, false, http.MethodPost)
 	if err != nil {
 		return nil, err
 	}
@@ -565,7 +566,7 @@ func (p *APIProtocol) channelListPage(
 	guildID string,
 	nextToken string,
 ) (*model.Paginated[*channel.Channel], error) {
-	resp, err := p.CallAPI(ctx, string(ApiChannelList), map[string]any{
+	resp, err := p.CallAPI(ctx, string(protocol.ApiChannelList), map[string]any{
 		"guild_id": guildID,
 		"next":     nextToken,
 	}, false, http.MethodPost)
@@ -580,7 +581,7 @@ func (p *APIProtocol) channelListPage(
 }
 
 func (p *APIProtocol) ChannelCreate(ctx context.Context, guildID string, data *channel.Channel) (*channel.Channel, error) {
-	resp, err := p.CallAPI(ctx, string(ApiChannelCreate), map[string]any{"guild_id": guildID, "data": data}, false, http.MethodPost)
+	resp, err := p.CallAPI(ctx, string(protocol.ApiChannelCreate), map[string]any{"guild_id": guildID, "data": data}, false, http.MethodPost)
 	if err != nil {
 		return nil, err
 	}
@@ -592,17 +593,17 @@ func (p *APIProtocol) ChannelCreate(ctx context.Context, guildID string, data *c
 }
 
 func (p *APIProtocol) ChannelUpdate(ctx context.Context, channelID string, data *channel.Channel) error {
-	_, err := p.CallAPI(ctx, string(ApiChannelUpdate), map[string]any{"channel_id": channelID, "data": data}, false, http.MethodPost)
+	_, err := p.CallAPI(ctx, string(protocol.ApiChannelUpdate), map[string]any{"channel_id": channelID, "data": data}, false, http.MethodPost)
 	return err
 }
 
 func (p *APIProtocol) ChannelDelete(ctx context.Context, channelID string) error {
-	_, err := p.CallAPI(ctx, string(ApiChannelDelete), map[string]any{"channel_id": channelID}, false, http.MethodPost)
+	_, err := p.CallAPI(ctx, string(protocol.ApiChannelDelete), map[string]any{"channel_id": channelID}, false, http.MethodPost)
 	return err
 }
 
 func (p *APIProtocol) ChannelMute(ctx context.Context, channelID string, duration time.Duration) error {
-	_, err := p.CallAPI(ctx, string(ApiChannelMute), map[string]any{
+	_, err := p.CallAPI(ctx, string(protocol.ApiChannelMute), map[string]any{
 		"channel_id": channelID,
 		"duration":   duration.Milliseconds(),
 	}, false, http.MethodPost)
@@ -614,7 +615,7 @@ func (p *APIProtocol) UserChannelCreate(ctx context.Context, userID string, guil
 	if guildID != "" {
 		params["guild_id"] = guildID
 	}
-	resp, err := p.CallAPI(ctx, string(ApiUserChannelCreate), params, false, http.MethodPost)
+	resp, err := p.CallAPI(ctx, string(protocol.ApiUserChannelCreate), params, false, http.MethodPost)
 	if err != nil {
 		return nil, err
 	}
@@ -626,7 +627,7 @@ func (p *APIProtocol) UserChannelCreate(ctx context.Context, userID string, guil
 }
 
 func (p *APIProtocol) GuildGet(ctx context.Context, guildID string) (*guild.Guild, error) {
-	resp, err := p.CallAPI(ctx, string(ApiGuildGet), map[string]any{"guild_id": guildID}, false, http.MethodPost)
+	resp, err := p.CallAPI(ctx, string(protocol.ApiGuildGet), map[string]any{"guild_id": guildID}, false, http.MethodPost)
 	if err != nil {
 		return nil, err
 	}
@@ -644,7 +645,7 @@ func (p *APIProtocol) GuildList(ctx context.Context, nextToken string) *model.Pa
 }
 
 func (p *APIProtocol) guildListPage(ctx context.Context, nextToken string) (*model.Paginated[*guild.Guild], error) {
-	resp, err := p.CallAPI(ctx, string(ApiGuildList), map[string]any{"next": nextToken}, false, http.MethodPost)
+	resp, err := p.CallAPI(ctx, string(protocol.ApiGuildList), map[string]any{"next": nextToken}, false, http.MethodPost)
 	if err != nil {
 		return nil, err
 	}
@@ -656,7 +657,7 @@ func (p *APIProtocol) guildListPage(ctx context.Context, nextToken string) (*mod
 }
 
 func (p *APIProtocol) GuildApprove(ctx context.Context, requestID string, approve bool, comment string) error {
-	_, err := p.CallAPI(ctx, string(ApiGuildApprove), map[string]any{
+	_, err := p.CallAPI(ctx, string(protocol.ApiGuildApprove), map[string]any{
 		"message_id": requestID,
 		"approve":    approve,
 		"comment":    comment,
@@ -679,7 +680,7 @@ func (p *APIProtocol) guildMemberListPage(
 	guildID string,
 	nextToken string,
 ) (*model.Paginated[*guildmember.GuildMember], error) {
-	resp, err := p.CallAPI(ctx, string(ApiGuildMemberList), map[string]any{
+	resp, err := p.CallAPI(ctx, string(protocol.ApiGuildMemberList), map[string]any{
 		"guild_id": guildID,
 		"next":     nextToken,
 	}, false, http.MethodPost)
@@ -694,7 +695,7 @@ func (p *APIProtocol) guildMemberListPage(
 }
 
 func (p *APIProtocol) GuildMemberGet(ctx context.Context, guildID string, userID string) (*guildmember.GuildMember, error) {
-	resp, err := p.CallAPI(ctx, string(ApiGuildMemberGet), map[string]any{
+	resp, err := p.CallAPI(ctx, string(protocol.ApiGuildMemberGet), map[string]any{
 		"guild_id": guildID,
 		"user_id":  userID,
 	}, false, http.MethodPost)
@@ -709,7 +710,7 @@ func (p *APIProtocol) GuildMemberGet(ctx context.Context, guildID string, userID
 }
 
 func (p *APIProtocol) GuildMemberKick(ctx context.Context, guildID string, userID string, permanent bool) error {
-	_, err := p.CallAPI(ctx, string(ApiGuildMemberKick), map[string]any{
+	_, err := p.CallAPI(ctx, string(protocol.ApiGuildMemberKick), map[string]any{
 		"guild_id":  guildID,
 		"user_id":   userID,
 		"permanent": permanent,
@@ -723,7 +724,7 @@ func (p *APIProtocol) GuildMemberMute(
 	userID string,
 	duration time.Duration,
 ) error {
-	_, err := p.CallAPI(ctx, string(ApiGuildMemberMute), map[string]any{
+	_, err := p.CallAPI(ctx, string(protocol.ApiGuildMemberMute), map[string]any{
 		"guild_id": guildID,
 		"user_id":  userID,
 		"duration": duration.Milliseconds(),
@@ -732,7 +733,7 @@ func (p *APIProtocol) GuildMemberMute(
 }
 
 func (p *APIProtocol) GuildMemberApprove(ctx context.Context, requestID string, approve bool, comment string) error {
-	_, err := p.CallAPI(ctx, string(ApiGuildMemberApprove), map[string]any{
+	_, err := p.CallAPI(ctx, string(protocol.ApiGuildMemberApprove), map[string]any{
 		"message_id": requestID,
 		"approve":    approve,
 		"comment":    comment,
@@ -741,7 +742,7 @@ func (p *APIProtocol) GuildMemberApprove(ctx context.Context, requestID string, 
 }
 
 func (p *APIProtocol) GuildMemberRoleSet(ctx context.Context, guildID string, userID string, roleID string) error {
-	_, err := p.CallAPI(ctx, string(ApiGuildMemberRoleSet), map[string]any{
+	_, err := p.CallAPI(ctx, string(protocol.ApiGuildMemberRoleSet), map[string]any{
 		"guild_id": guildID,
 		"user_id":  userID,
 		"role_id":  roleID,
@@ -750,7 +751,7 @@ func (p *APIProtocol) GuildMemberRoleSet(ctx context.Context, guildID string, us
 }
 
 func (p *APIProtocol) GuildMemberRoleUnset(ctx context.Context, guildID string, userID string, roleID string) error {
-	_, err := p.CallAPI(ctx, string(ApiGuildMemberRoleUnset), map[string]any{
+	_, err := p.CallAPI(ctx, string(protocol.ApiGuildMemberRoleUnset), map[string]any{
 		"guild_id": guildID,
 		"user_id":  userID,
 		"role_id":  roleID,
@@ -773,7 +774,7 @@ func (p *APIProtocol) guildRoleListPage(
 	guildID string,
 	nextToken string,
 ) (*model.Paginated[*guildrole.GuildRole], error) {
-	resp, err := p.CallAPI(ctx, string(ApiGuildRoleList), map[string]any{
+	resp, err := p.CallAPI(ctx, string(protocol.ApiGuildRoleList), map[string]any{
 		"guild_id": guildID,
 		"next":     nextToken,
 	}, false, http.MethodPost)
@@ -788,7 +789,7 @@ func (p *APIProtocol) guildRoleListPage(
 }
 
 func (p *APIProtocol) GuildRoleCreate(ctx context.Context, guildID string, role *guildrole.GuildRole) (*guildrole.GuildRole, error) {
-	resp, err := p.CallAPI(ctx, string(ApiGuildRoleCreate), map[string]any{"guild_id": guildID, "role": role}, false, http.MethodPost)
+	resp, err := p.CallAPI(ctx, string(protocol.ApiGuildRoleCreate), map[string]any{"guild_id": guildID, "role": role}, false, http.MethodPost)
 	if err != nil {
 		return nil, err
 	}
@@ -800,7 +801,7 @@ func (p *APIProtocol) GuildRoleCreate(ctx context.Context, guildID string, role 
 }
 
 func (p *APIProtocol) GuildRoleUpdate(ctx context.Context, guildID string, roleID string, role *guildrole.GuildRole) error {
-	_, err := p.CallAPI(ctx, string(ApiGuildRoleUpdate), map[string]any{
+	_, err := p.CallAPI(ctx, string(protocol.ApiGuildRoleUpdate), map[string]any{
 		"guild_id": guildID,
 		"role_id":  roleID,
 		"role":     role,
@@ -809,7 +810,7 @@ func (p *APIProtocol) GuildRoleUpdate(ctx context.Context, guildID string, roleI
 }
 
 func (p *APIProtocol) GuildRoleDelete(ctx context.Context, guildID string, roleID string) error {
-	_, err := p.CallAPI(ctx, string(ApiGuildRoleDelete), map[string]any{
+	_, err := p.CallAPI(ctx, string(protocol.ApiGuildRoleDelete), map[string]any{
 		"guild_id": guildID,
 		"role_id":  roleID,
 	}, false, http.MethodPost)
@@ -817,7 +818,7 @@ func (p *APIProtocol) GuildRoleDelete(ctx context.Context, guildID string, roleI
 }
 
 func (p *APIProtocol) ReactionCreate(ctx context.Context, channelID string, messageID string, emoji string) error {
-	_, err := p.CallAPI(ctx, string(ApiReactionCreate), map[string]any{
+	_, err := p.CallAPI(ctx, string(protocol.ApiReactionCreate), map[string]any{
 		"channel_id": channelID,
 		"message_id": messageID,
 		"emoji":      emoji,
@@ -840,7 +841,7 @@ func (p *APIProtocol) ReactionDelete(
 	if userID != "" {
 		params["user_id"] = userID
 	}
-	_, err := p.CallAPI(ctx, string(ApiReactionDelete), params, false, http.MethodPost)
+	_, err := p.CallAPI(ctx, string(protocol.ApiReactionDelete), params, false, http.MethodPost)
 	return err
 }
 
@@ -852,7 +853,7 @@ func (p *APIProtocol) ReactionClear(ctx context.Context, channelID string, messa
 	if emoji != "" {
 		params["emoji"] = emoji
 	}
-	_, err := p.CallAPI(ctx, string(ApiReactionClear), params, false, http.MethodPost)
+	_, err := p.CallAPI(ctx, string(protocol.ApiReactionClear), params, false, http.MethodPost)
 	return err
 }
 
@@ -875,7 +876,7 @@ func (p *APIProtocol) reactionListPage(
 	emoji string,
 	nextToken string,
 ) (*model.Paginated[*user.User], error) {
-	resp, err := p.CallAPI(ctx, string(ApiReactionList), map[string]any{
+	resp, err := p.CallAPI(ctx, string(protocol.ApiReactionList), map[string]any{
 		"channel_id": channelID,
 		"message_id": messageID,
 		"emoji":      emoji,
@@ -892,7 +893,7 @@ func (p *APIProtocol) reactionListPage(
 }
 
 func (p *APIProtocol) LoginGet(ctx context.Context) (*login.Login, error) {
-	resp, err := p.CallAPI(ctx, string(ApiLoginGet), map[string]any{}, false, http.MethodPost)
+	resp, err := p.CallAPI(ctx, string(protocol.ApiLoginGet), map[string]any{}, false, http.MethodPost)
 	if err != nil {
 		return nil, err
 	}
@@ -904,7 +905,7 @@ func (p *APIProtocol) LoginGet(ctx context.Context) (*login.Login, error) {
 }
 
 func (p *APIProtocol) UserGet(ctx context.Context, userID string) (*user.User, error) {
-	resp, err := p.CallAPI(ctx, string(ApiUserGet), map[string]any{"user_id": userID}, false, http.MethodPost)
+	resp, err := p.CallAPI(ctx, string(protocol.ApiUserGet), map[string]any{"user_id": userID}, false, http.MethodPost)
 	if err != nil {
 		return nil, err
 	}
@@ -915,26 +916,31 @@ func (p *APIProtocol) UserGet(ctx context.Context, userID string) (*user.User, e
 	return &result, nil
 }
 
-func (p *APIProtocol) FriendList(ctx context.Context, nextToken string) *model.PaginatedSeq[*user.User] {
-	return paginated.NewPaginatedSeq(ctx, nextToken, func(fetchCtx context.Context, token string) (*model.Paginated[*user.User], error) {
+func (p *APIProtocol) FriendList(ctx context.Context, nextToken string) *model.PaginatedSeq[*model.Friend] {
+	return paginated.NewPaginatedSeq(ctx, nextToken, func(fetchCtx context.Context, token string) (*model.Paginated[*model.Friend], error) {
 		return p.friendListPage(fetchCtx, token)
 	})
 }
 
-func (p *APIProtocol) friendListPage(ctx context.Context, nextToken string) (*model.Paginated[*user.User], error) {
-	resp, err := p.CallAPI(ctx, string(ApiFriendList), map[string]any{"next": nextToken}, false, http.MethodPost)
+func (p *APIProtocol) friendListPage(ctx context.Context, nextToken string) (*model.Paginated[*model.Friend], error) {
+	resp, err := p.CallAPI(ctx, string(protocol.ApiFriendList), map[string]any{"next": nextToken}, false, http.MethodPost)
 	if err != nil {
 		return nil, err
 	}
-	var result model.Paginated[*user.User]
+	var result model.Paginated[*model.Friend]
 	if err := decodeJSON(resp, &result); err != nil {
 		return nil, err
 	}
 	return &result, nil
 }
 
+func (p *APIProtocol) FriendDelete(ctx context.Context, userID string) error {
+	_, err := p.CallAPI(ctx, string(protocol.ApiFriendDelete), map[string]any{"user_id": userID}, false, http.MethodPost)
+	return err
+}
+
 func (p *APIProtocol) FriendApprove(ctx context.Context, requestID string, approve bool, comment string) error {
-	_, err := p.CallAPI(ctx, string(ApiFriendApprove), map[string]any{
+	_, err := p.CallAPI(ctx, string(protocol.ApiFriendApprove), map[string]any{
 		"message_id": requestID,
 		"approve":    approve,
 		"comment":    comment,
@@ -943,7 +949,11 @@ func (p *APIProtocol) FriendApprove(ctx context.Context, requestID string, appro
 }
 
 func (p *APIProtocol) Internal(ctx context.Context, action string, method string, params map[string]any) (any, error) {
-	resp, err := p.CallAPI(ctx, "internal/"+strings.TrimPrefix(action, "/"), params, false, method)
+	internalAction := protocol.NormalizeInternalApi(action)
+	if internalAction == "" {
+		return nil, errors.New("internal action cannot be empty")
+	}
+	resp, err := p.CallAPI(ctx, internalAction, params, false, method)
 	if err != nil {
 		return nil, err
 	}
@@ -955,7 +965,7 @@ func (p *APIProtocol) Internal(ctx context.Context, action string, method string
 }
 
 func (p *APIProtocol) MetaGet(ctx context.Context) (*meta.Meta, error) {
-	resp, err := p.CallAPI(ctx, "meta", map[string]any{}, false, http.MethodPost)
+	resp, err := p.CallAPI(ctx, string(protocol.ApiMetaGet), map[string]any{}, false, http.MethodPost)
 	if err != nil {
 		return nil, err
 	}
@@ -967,7 +977,7 @@ func (p *APIProtocol) MetaGet(ctx context.Context) (*meta.Meta, error) {
 }
 
 func (p *APIProtocol) AdminLoginList(ctx context.Context) ([]*login.LoginPartial, error) {
-	resp, err := p.CallAPI(ctx, "admin/login.list", map[string]any{}, false, http.MethodPost)
+	resp, err := p.CallAPI(ctx, string(protocol.ApiAdminLoginList), map[string]any{}, false, http.MethodPost)
 	if err != nil {
 		return nil, err
 	}
@@ -979,12 +989,12 @@ func (p *APIProtocol) AdminLoginList(ctx context.Context) ([]*login.LoginPartial
 }
 
 func (p *APIProtocol) WebhookCreate(ctx context.Context, endpoint string, token string) error {
-	_, err := p.CallAPI(ctx, "meta/webhook.create", map[string]any{"url": endpoint, "token": token}, false, http.MethodPost)
+	_, err := p.CallAPI(ctx, string(protocol.ApiMetaWebhookCreate), map[string]any{"url": endpoint, "token": token}, false, http.MethodPost)
 	return err
 }
 
 func (p *APIProtocol) WebhookDelete(ctx context.Context, endpoint string) error {
-	_, err := p.CallAPI(ctx, "meta/webhook.delete", map[string]any{"url": endpoint}, false, http.MethodPost)
+	_, err := p.CallAPI(ctx, string(protocol.ApiMetaWebhookDelete), map[string]any{"url": endpoint}, false, http.MethodPost)
 	return err
 }
 
@@ -993,7 +1003,7 @@ func (p *APIProtocol) UploadCreateNamed(ctx context.Context, uploads map[string]
 	for name, upload := range uploads {
 		params[name] = upload
 	}
-	resp, err := p.CallAPI(ctx, string(ApiUploadCreate), params, true, http.MethodPost)
+	resp, err := p.CallAPI(ctx, string(protocol.ApiUploadCreate), params, true, http.MethodPost)
 	if err != nil {
 		return nil, err
 	}
@@ -1142,11 +1152,8 @@ func cloneHTTPTransport(roundTripper http.RoundTripper) (*http.Transport, error)
 func (p *APIProtocol) apiHeaders() http.Header {
 	headers := http.Header{}
 	headers.Set("Content-Type", "application/json")
-	headers.Set("Authorization", "Bearer "+p.account.Config.TokenValue())
-	headers.Set("X-Platform", p.account.Platform())
-	headers.Set("X-Self-ID", p.account.SelfID())
-	headers.Set("Satori-Platform", p.account.Platform())
-	headers.Set("Satori-User-ID", p.account.SelfID())
+	protocol.SetBearer(headers, p.account.Config.TokenValue())
+	protocol.SetIdentityHeaders(headers, p.account.Platform(), p.account.SelfID())
 	return headers
 }
 
@@ -1585,18 +1592,22 @@ func decodeObject(payload []byte) (map[string]any, error) {
 }
 
 func decodeJSON(payload []byte, target any) error {
-	if len(bytes.TrimSpace(payload)) == 0 {
-		return nil
-	}
-	decoder := json.NewDecoder(bytes.NewReader(payload))
-	decoder.UseNumber()
-	return decoder.Decode(target)
+	_, err := protocol.DecodeJSONBytes(payload, target)
+	return err
 }
 
-func normalizeMethod(method string) string {
+func normalizeRequestMethod(method string) string {
+	return normalizeMethodWithDefault(method, http.MethodGet)
+}
+
+func normalizeAPIMethod(method string) string {
+	return normalizeMethodWithDefault(method, http.MethodPost)
+}
+
+func normalizeMethodWithDefault(method string, defaultMethod string) string {
 	method = strings.TrimSpace(strings.ToUpper(method))
 	if method == "" {
-		return http.MethodPost
+		return defaultMethod
 	}
 	return method
 }

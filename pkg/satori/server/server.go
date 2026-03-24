@@ -28,13 +28,14 @@ import (
 	"github.com/satori-protocol-go/satori-go/pkg/satori/model/login"
 	"github.com/satori-protocol-go/satori-go/pkg/satori/model/meta"
 	"github.com/satori-protocol-go/satori-go/pkg/satori/model/operation"
+	"github.com/satori-protocol-go/satori-go/pkg/satori/protocol"
 	"golang.org/x/sync/errgroup"
 )
 
 const (
 	defaultHost            = "127.0.0.1"
-	defaultPort            = 5140
-	defaultVersion         = "v1"
+	defaultPort            = protocol.DefaultAPIPort
+	defaultVersion         = protocol.DefaultVersion
 	defaultEventCacheSize  = 100
 	defaultStreamThreshold = 16 * 1024 * 1024
 	defaultStreamChunkSize = 64 * 1024
@@ -42,7 +43,7 @@ const (
 	defaultIdentifyTimeout = 30 * time.Second
 	defaultReadFormMemory  = 32 << 20 // 32 MB
 	defaultCleanupTimeout  = 10 * time.Second
-	defaultWebhookTimeout  = 300 * time.Second
+	defaultWebhookTimeout  = protocol.DefaultRequestTimeout
 )
 
 var (
@@ -1096,8 +1097,8 @@ func (s *Server) sendWebhook(webhook WebhookEndpoint, opcode operation.Opcode, b
 		return err
 	}
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Authorization", "Bearer "+webhook.Token)
-	req.Header.Set("Satori-OpCode", strconv.Itoa(int(opcode)))
+	protocol.SetBearer(req.Header, webhook.Token)
+	protocol.SetOpcode(req.Header, int(opcode))
 
 	resp, err := s.httpClient.Do(req)
 	if err != nil {
@@ -1494,10 +1495,10 @@ func (s *Server) ensureDefaultUploadRoute() {
 	if s.routes == nil {
 		s.routes = map[string]RouteCall[any, any]{}
 	}
-	if _, exists := s.routes[string(ApiUploadCreate)]; exists {
+	if _, exists := s.routes[string(protocol.ApiUploadCreate)]; exists {
 		return
 	}
-	s.routes[string(ApiUploadCreate)] = Wrapper(s.defaultUploadCreateHandler)
+	s.routes[string(protocol.ApiUploadCreate)] = Wrapper(s.defaultUploadCreateHandler)
 }
 
 func (s *Server) mountResources(router chi.Router) error {
@@ -1595,7 +1596,7 @@ func readIdentify(connection *websocketConnection) (string, int64, error) {
 }
 
 func parseParams(action string, request *http.Request) (any, error) {
-	if action == string(ApiUploadCreate) {
+	if action == string(protocol.ApiUploadCreate) {
 		if err := request.ParseMultipartForm(defaultReadFormMemory); err != nil {
 			return nil, BadRequest(err.Error())
 		}
@@ -1617,14 +1618,13 @@ func parseParams(action string, request *http.Request) (any, error) {
 	if err != nil {
 		return nil, err
 	}
-	if len(bytes.TrimSpace(body)) == 0 {
-		return map[string]any{}, nil
-	}
 	var params any
-	decoder := json.NewDecoder(bytes.NewReader(body))
-	decoder.UseNumber()
-	if err := decoder.Decode(&params); err != nil {
+	decoded, err := protocol.DecodeJSONBytes(body, &params)
+	if err != nil {
 		return nil, BadRequest(err.Error())
+	}
+	if !decoded {
+		return map[string]any{}, nil
 	}
 	return params, nil
 }
@@ -1640,16 +1640,13 @@ func normalizeProxyURL(rawURL string) (string, error) {
 }
 
 func decodeJSONBody(reader io.Reader, dst any) error {
-	data, err := io.ReadAll(reader)
-	if err != nil {
+	if err := protocol.DecodeJSONReaderRequired(reader, dst); err != nil {
+		if errors.Is(err, protocol.ErrEmptyJSONBody) {
+			return errors.New("empty request body")
+		}
 		return err
 	}
-	if len(bytes.TrimSpace(data)) == 0 {
-		return errors.New("empty request body")
-	}
-	decoder := json.NewDecoder(bytes.NewReader(data))
-	decoder.UseNumber()
-	return decoder.Decode(dst)
+	return nil
 }
 
 func copyRouteMap(source map[string]RouteCall[any, any]) map[string]RouteCall[any, any] {
@@ -1727,20 +1724,9 @@ func writeServerResponse(w http.ResponseWriter, response *Response, chunkSize in
 }
 
 func extractPlatformAndSelfID(header http.Header) (string, string, error) {
-	platform := header.Get("X-Platform")
-	if platform == "" {
-		platform = header.Get("Satori-Platform")
-	}
-	if platform == "" {
-		return "", "", Unauthorized("Missing header X-Platform or Satori-Platform")
-	}
-
-	selfID := header.Get("X-Self-ID")
-	if selfID == "" {
-		selfID = header.Get("Satori-User-ID")
-	}
-	if selfID == "" {
-		return "", "", Unauthorized("Missing header X-Self-ID or Satori-User-ID")
+	platform, selfID, err := protocol.ExtractIdentityHeaders(header)
+	if err != nil {
+		return "", "", Unauthorized(err.Error())
 	}
 	return platform, selfID, nil
 }

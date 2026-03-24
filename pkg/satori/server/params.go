@@ -1,7 +1,6 @@
 package server
 
 import (
-	"bytes"
 	"encoding/json"
 	"fmt"
 	"mime/multipart"
@@ -9,6 +8,7 @@ import (
 	"strings"
 
 	"github.com/satori-protocol-go/satori-go/pkg/satori/model"
+	"github.com/satori-protocol-go/satori-go/pkg/satori/protocol"
 	"github.com/satori-protocol-go/satori-go/pkg/satori/types"
 )
 
@@ -137,9 +137,11 @@ func decodeParams[T any](raw any) (T, error) {
 	if err != nil {
 		return params, BadRequest("invalid request params")
 	}
-	decoder := json.NewDecoder(bytes.NewReader(data))
-	decoder.UseNumber()
-	if err := decoder.Decode(&params); err != nil {
+	decoded, err := protocol.DecodeJSONBytes(data, &params)
+	if err != nil {
+		return params, BadRequest("invalid request params")
+	}
+	if !decoded {
 		return params, BadRequest("invalid request params")
 	}
 	if err := validateDecodedParamTags(params); err != nil {

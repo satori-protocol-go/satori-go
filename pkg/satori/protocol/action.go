@@ -1,4 +1,6 @@
-package client
+package protocol
+
+import "strings"
 
 type Api string
 
@@ -43,7 +45,75 @@ const (
 
 	ApiUserGet       Api = "user.get"
 	ApiFriendList    Api = "friend.list"
+	ApiFriendDelete  Api = "friend.delete"
 	ApiFriendApprove Api = "friend.approve"
 
 	ApiUploadCreate Api = "upload.create"
 )
+
+const (
+	ApiMetaGet           Api = "meta"
+	ApiMetaWebhookCreate Api = "meta/webhook.create"
+	ApiMetaWebhookDelete Api = "meta/webhook.delete"
+	ApiAdminLoginList    Api = "admin/login.list"
+)
+
+var apiSet = map[Api]struct{}{
+	ApiMessageCreate: {},
+	ApiMessageUpdate: {},
+	ApiMessageGet:    {},
+	ApiMessageDelete: {},
+	ApiMessageList:   {},
+
+	ApiChannelGet:        {},
+	ApiChannelList:       {},
+	ApiChannelCreate:     {},
+	ApiChannelUpdate:     {},
+	ApiChannelDelete:     {},
+	ApiChannelMute:       {},
+	ApiUserChannelCreate: {},
+
+	ApiGuildGet:     {},
+	ApiGuildList:    {},
+	ApiGuildApprove: {},
+
+	ApiGuildMemberList:      {},
+	ApiGuildMemberGet:       {},
+	ApiGuildMemberKick:      {},
+	ApiGuildMemberMute:      {},
+	ApiGuildMemberApprove:   {},
+	ApiGuildMemberRoleSet:   {},
+	ApiGuildMemberRoleUnset: {},
+
+	ApiGuildRoleList:   {},
+	ApiGuildRoleCreate: {},
+	ApiGuildRoleUpdate: {},
+	ApiGuildRoleDelete: {},
+
+	ApiReactionCreate: {},
+	ApiReactionDelete: {},
+	ApiReactionClear:  {},
+	ApiReactionList:   {},
+
+	ApiLoginGet: {},
+
+	ApiUserGet:       {},
+	ApiFriendList:    {},
+	ApiFriendDelete:  {},
+	ApiFriendApprove: {},
+
+	ApiUploadCreate: {},
+}
+
+func (a Api) String() string {
+	return string(a)
+}
+
+func ParseApi(raw string) Api {
+	return Api(strings.TrimSpace(raw))
+}
+
+func IsApi(api Api) bool {
+	_, ok := apiSet[api]
+	return ok
+}

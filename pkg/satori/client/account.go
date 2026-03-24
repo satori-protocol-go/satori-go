@@ -17,6 +17,7 @@ type APIInfo struct {
 	Path    string
 	Version string
 	Token   string
+	Secure  bool
 	Timeout time.Duration
 }
 
@@ -49,7 +50,7 @@ func (c APIInfo) APIBase() string {
 	if version == "" {
 		version = defaultVersion
 	}
-	return fmt.Sprintf("http://%s:%d%s/%s", host, port, normalizeLeadingPath(c.Path), version)
+	return fmt.Sprintf("%s://%s:%d%s/%s", httpScheme(c.Secure), host, port, normalizeLeadingPath(c.Path), version)
 }
 
 func (c APIInfo) TokenValue() string {

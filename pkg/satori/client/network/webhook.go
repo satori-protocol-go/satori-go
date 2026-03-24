@@ -8,7 +8,6 @@ import (
 	"log"
 	"net"
 	"net/http"
-	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -17,6 +16,7 @@ import (
 	"github.com/satori-protocol-go/satori-go/pkg/satori/model/login"
 	"github.com/satori-protocol-go/satori-go/pkg/satori/model/meta"
 	"github.com/satori-protocol-go/satori-go/pkg/satori/model/operation"
+	"github.com/satori-protocol-go/satori-go/pkg/satori/protocol"
 )
 
 type Webhook struct {
@@ -177,12 +177,11 @@ func (n *Webhook) handleRequest(w http.ResponseWriter, request *http.Request) {
 		return
 	}
 
-	authorization := request.Header.Get("Authorization")
-	if !strings.HasPrefix(authorization, "Bearer") {
+	token, ok := protocol.ParseBearer(request.Header.Get(protocol.HeaderAuthorization))
+	if !ok {
 		w.WriteHeader(http.StatusUnauthorized)
 		return
 	}
-	token := strings.TrimSpace(strings.TrimPrefix(authorization, "Bearer"))
 	if n.token != "" && token != n.token {
 		w.WriteHeader(http.StatusUnauthorized)
 		return
@@ -194,8 +193,7 @@ func (n *Webhook) handleRequest(w http.ResponseWriter, request *http.Request) {
 		return
 	}
 
-	opcodeRaw := strings.TrimSpace(request.Header.Get("Satori-OpCode"))
-	opcode, _ := strconv.Atoi(opcodeRaw)
+	opcode, _ := protocol.ParseOpcode(request.Header.Get(protocol.HeaderOpcode))
 
 	switch operation.Opcode(opcode) {
 	case operation.OpcodeMeta:

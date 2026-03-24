@@ -5,12 +5,14 @@ import (
 	"path"
 	"strings"
 	"time"
+
+	"github.com/satori-protocol-go/satori-go/pkg/satori/protocol"
 )
 
 const (
 	defaultHost    = "localhost"
-	defaultPort    = 5140
-	defaultVersion = "v1"
+	defaultPort    = protocol.DefaultAPIPort
+	defaultVersion = protocol.DefaultVersion
 
 	defaultWebhookHost = "127.0.0.1"
 	defaultWebhookPort = 8080
@@ -35,6 +37,7 @@ type WebSocketConfig struct {
 	Path             string
 	Version          string
 	Token            string
+	Secure           bool
 	Timeout          time.Duration
 	HandshakeTimeout time.Duration
 }
@@ -84,7 +87,7 @@ func (c WebSocketConfig) APIBase() string {
 	if version == "" {
 		version = defaultVersion
 	}
-	return fmt.Sprintf("http://%s:%d%s/%s", host, port, normalizeLeadingPath(c.Path), version)
+	return fmt.Sprintf("%s://%s:%d%s/%s", httpScheme(c.Secure), host, port, normalizeLeadingPath(c.Path), version)
 }
 
 func (c WebSocketConfig) WSBase() string {
@@ -100,7 +103,7 @@ func (c WebSocketConfig) WSBase() string {
 	if version == "" {
 		version = defaultVersion
 	}
-	return fmt.Sprintf("ws://%s:%d%s/%s", host, port, normalizeLeadingPath(c.Path), version)
+	return fmt.Sprintf("%s://%s:%d%s/%s", wsScheme(c.Secure), host, port, normalizeLeadingPath(c.Path), version)
 }
 
 func (c WebSocketConfig) TokenValue() string {
@@ -116,6 +119,7 @@ type WebhookConfig struct {
 	Port       int
 	Path       string
 	Token      string
+	Secure     bool
 	ServerHost string
 	ServerPort int
 	ServerPath string
@@ -185,7 +189,7 @@ func (c WebhookConfig) APIBase() string {
 	if version == "" {
 		version = defaultVersion
 	}
-	return fmt.Sprintf("http://%s:%d%s/%s", host, port, normalizeLeadingPath(c.ServerPath), version)
+	return fmt.Sprintf("%s://%s:%d%s/%s", httpScheme(c.Secure), host, port, normalizeLeadingPath(c.ServerPath), version)
 }
 
 func (c WebhookConfig) CallbackURL() string {
@@ -202,7 +206,7 @@ func (c WebhookConfig) CallbackURL() string {
 		p = defaultWebhookPath
 	}
 	p = normalizeLeadingPath(p)
-	return fmt.Sprintf("http://%s:%d%s", host, port, p)
+	return fmt.Sprintf("%s://%s:%d%s", httpScheme(c.Secure), host, port, p)
 }
 
 func (c WebhookConfig) TokenValue() string {
@@ -237,4 +241,18 @@ func joinURLPath(base string, segments ...string) string {
 		return strings.TrimSuffix(base, "/")
 	}
 	return strings.TrimSuffix(base, "/") + "/" + strings.TrimPrefix(path.Join(cleaned...), "/")
+}
+
+func httpScheme(secure bool) string {
+	if secure {
+		return "https"
+	}
+	return "http"
+}
+
+func wsScheme(secure bool) string {
+	if secure {
+		return "wss"
+	}
+	return "ws"
 }

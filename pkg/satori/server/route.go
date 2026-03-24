@@ -5,6 +5,7 @@ import (
 	"strings"
 
 	"github.com/satori-protocol-go/satori-go/pkg/satori/model"
+	"github.com/satori-protocol-go/satori-go/pkg/satori/protocol"
 	"github.com/satori-protocol-go/satori-go/pkg/satori/types"
 )
 
@@ -70,175 +71,170 @@ type RouterMixin struct {
 	routes map[string]RouteCall[any, any]
 }
 
-func (r *RouterMixin) Route(path Api, handler RouteCall[any, any]) {
+func (r *RouterMixin) Route(path protocol.Api, handler RouteCall[any, any]) {
 	if r.routes == nil {
 		r.routes = map[string]RouteCall[any, any]{}
 	}
 	if handler == nil {
 		return // ignore nil handler
 	}
-	if isExistApi(path) {
+	if protocol.IsApi(path) {
 		r.routes[string(path)] = handler
 		return
 	}
-	value := strings.TrimSpace(string(path))
-	value = strings.TrimPrefix(value, "/")
-	if value == "" {
+	internalAction := protocol.NormalizeInternalApi(string(path))
+	if internalAction == "" {
 		return
 	}
-	if strings.HasPrefix(value, "internal/") {
-		r.routes[value] = handler
-		return
-	}
-	r.routes["internal/"+value] = handler
+	r.routes[internalAction] = handler
 }
 
 func (r *RouterMixin) RouteChannelGet(handler handlerChannelGet) {
-	r.Route(ApiChannelGet, Wrapper(handler))
+	r.Route(protocol.ApiChannelGet, Wrapper(handler))
 }
 
 func (r *RouterMixin) RouteChannelList(handler handlerChannelList) {
-	r.Route(ApiChannelList, Wrapper(handler))
+	r.Route(protocol.ApiChannelList, Wrapper(handler))
 }
 
 func (r *RouterMixin) RouteChannelCreate(handler handlerChannelCreate) {
-	r.Route(ApiChannelCreate, Wrapper(handler))
+	r.Route(protocol.ApiChannelCreate, Wrapper(handler))
 }
 
 func (r *RouterMixin) RouteChannelUpdate(handler handlerChannelUpdate) {
-	r.Route(ApiChannelUpdate, Wrapper(handler))
+	r.Route(protocol.ApiChannelUpdate, Wrapper(handler))
 }
 
 func (r *RouterMixin) RouteChannelDelete(handler handlerChannelDelete) {
-	r.Route(ApiChannelDelete, Wrapper(handler))
+	r.Route(protocol.ApiChannelDelete, Wrapper(handler))
 }
 
 func (r *RouterMixin) RouteChannelMute(handler handlerChannelMute) {
-	r.Route(ApiChannelMute, Wrapper(handler))
+	r.Route(protocol.ApiChannelMute, Wrapper(handler))
 }
 
 func (r *RouterMixin) RouteUserChannelCreate(handler handlerUserChannelCreate) {
-	r.Route(ApiUserChannelCreate, Wrapper(handler))
+	r.Route(protocol.ApiUserChannelCreate, Wrapper(handler))
 }
 
 func (r *RouterMixin) RouteFriendList(handler handlerFriendList) {
-	r.Route(ApiFriendList, Wrapper(handler))
+	r.Route(protocol.ApiFriendList, Wrapper(handler))
 }
 
 func (r *RouterMixin) RouteFriendDelete(handler handlerFriendDelete) {
-	r.Route(ApiFriendDelete, Wrapper(handler))
+	r.Route(protocol.ApiFriendDelete, Wrapper(handler))
 }
 
 func (r *RouterMixin) RouteFriendApprove(handler handlerFriendApprove) {
-	r.Route(ApiFriendApprove, Wrapper(handler))
+	r.Route(protocol.ApiFriendApprove, Wrapper(handler))
 }
 
 func (r *RouterMixin) RouteGuildGet(handler handlerGuildGet) {
-	r.Route(ApiGuildGet, Wrapper(handler))
+	r.Route(protocol.ApiGuildGet, Wrapper(handler))
 }
 
 func (r *RouterMixin) RouteGuildList(handler handlerGuildList) {
-	r.Route(ApiGuildList, Wrapper(handler))
+	r.Route(protocol.ApiGuildList, Wrapper(handler))
 }
 
 func (r *RouterMixin) RouteGuildApprove(handler handlerGuildApprove) {
-	r.Route(ApiGuildApprove, Wrapper(handler))
+	r.Route(protocol.ApiGuildApprove, Wrapper(handler))
 }
 
 func (r *RouterMixin) RouteGuildMemberGet(handler handlerGuildMemberGet) {
-	r.Route(ApiGuildMemberGet, Wrapper(handler))
+	r.Route(protocol.ApiGuildMemberGet, Wrapper(handler))
 }
 
 func (r *RouterMixin) RouteGuildMemberList(handler handlerGuildMemberList) {
-	r.Route(ApiGuildMemberList, Wrapper(handler))
+	r.Route(protocol.ApiGuildMemberList, Wrapper(handler))
 }
 
 func (r *RouterMixin) RouteGuildMemberKick(handler handlerGuildMemberKick) {
-	r.Route(ApiGuildMemberKick, Wrapper(handler))
+	r.Route(protocol.ApiGuildMemberKick, Wrapper(handler))
 }
 
 func (r *RouterMixin) RouteGuildMemberMute(handler handlerGuildMemberMute) {
-	r.Route(ApiGuildMemberMute, Wrapper(handler))
+	r.Route(protocol.ApiGuildMemberMute, Wrapper(handler))
 }
 
 func (r *RouterMixin) RouteGuildMemberApprove(handler handlerGuildMemberApprove) {
-	r.Route(ApiGuildMemberApprove, Wrapper(handler))
+	r.Route(protocol.ApiGuildMemberApprove, Wrapper(handler))
 }
 
 func (r *RouterMixin) RouteGuildMemberRoleSet(handler handlerGuildMemberRoleSet) {
-	r.Route(ApiGuildMemberRoleSet, Wrapper(handler))
+	r.Route(protocol.ApiGuildMemberRoleSet, Wrapper(handler))
 }
 
 func (r *RouterMixin) RouteGuildMemberRoleUnset(handler handlerGuildMemberRoleUnset) {
-	r.Route(ApiGuildMemberRoleUnset, Wrapper(handler))
+	r.Route(protocol.ApiGuildMemberRoleUnset, Wrapper(handler))
 }
 
 func (r *RouterMixin) RouteGuildRoleList(handler handlerGuildRoleList) {
-	r.Route(ApiGuildRoleList, Wrapper(handler))
+	r.Route(protocol.ApiGuildRoleList, Wrapper(handler))
 }
 
 func (r *RouterMixin) RouteGuildRoleCreate(handler handlerGuildRoleCreate) {
-	r.Route(ApiGuildRoleCreate, Wrapper(handler))
+	r.Route(protocol.ApiGuildRoleCreate, Wrapper(handler))
 }
 
 func (r *RouterMixin) RouteGuildRoleUpdate(handler handlerGuildRoleUpdate) {
-	r.Route(ApiGuildRoleUpdate, Wrapper(handler))
+	r.Route(protocol.ApiGuildRoleUpdate, Wrapper(handler))
 }
 
 func (r *RouterMixin) RouteGuildRoleDelete(handler handlerGuildRoleDelete) {
-	r.Route(ApiGuildRoleDelete, Wrapper(handler))
+	r.Route(protocol.ApiGuildRoleDelete, Wrapper(handler))
 }
 
 func (r *RouterMixin) RouteLoginGet(handler handlerLoginGet) {
-	r.Route(ApiLoginGet, Wrapper(handler))
+	r.Route(protocol.ApiLoginGet, Wrapper(handler))
 }
 
 func (r *RouterMixin) RouteMessageCreate(handler handlerMessageCreate) {
-	r.Route(ApiMessageCreate, Wrapper(handler))
+	r.Route(protocol.ApiMessageCreate, Wrapper(handler))
 }
 
 func (r *RouterMixin) RouteMessageGet(handler handlerMessageGet) {
-	r.Route(ApiMessageGet, Wrapper(handler))
+	r.Route(protocol.ApiMessageGet, Wrapper(handler))
 }
 
 func (r *RouterMixin) RouteMessageDelete(handler handlerMessageDelete) {
-	r.Route(ApiMessageDelete, Wrapper(handler))
+	r.Route(protocol.ApiMessageDelete, Wrapper(handler))
 }
 
 func (r *RouterMixin) RouteMessageUpdate(handler handlerMessageUpdate) {
-	r.Route(ApiMessageUpdate, Wrapper(handler))
+	r.Route(protocol.ApiMessageUpdate, Wrapper(handler))
 }
 
 func (r *RouterMixin) RouteMessageList(handler handlerMessageList) {
-	r.Route(ApiMessageList, Wrapper(handler))
+	r.Route(protocol.ApiMessageList, Wrapper(handler))
 }
 
 func (r *RouterMixin) RouteReactionCreate(handler handlerReactionCreate) {
-	r.Route(ApiReactionCreate, Wrapper(handler))
+	r.Route(protocol.ApiReactionCreate, Wrapper(handler))
 }
 
 func (r *RouterMixin) RouteReactionDelete(handler handlerReactionDelete) {
-	r.Route(ApiReactionDelete, Wrapper(handler))
+	r.Route(protocol.ApiReactionDelete, Wrapper(handler))
 }
 
 func (r *RouterMixin) RouteReactionClear(handler handlerReactionClear) {
-	r.Route(ApiReactionClear, Wrapper(handler))
+	r.Route(protocol.ApiReactionClear, Wrapper(handler))
 }
 
 func (r *RouterMixin) RouteReactionList(handler handlerReactionList) {
-	r.Route(ApiReactionList, Wrapper(handler))
+	r.Route(protocol.ApiReactionList, Wrapper(handler))
 }
 
 func (r *RouterMixin) RouteUserGet(handler handlerUserGet) {
-	r.Route(ApiUserGet, Wrapper(handler))
+	r.Route(protocol.ApiUserGet, Wrapper(handler))
 }
 
 func (r *RouterMixin) RouteUploadCreate(handler handlerUploadCreate) {
-	r.Route(ApiUploadCreate, Wrapper(handler))
+	r.Route(protocol.ApiUploadCreate, Wrapper(handler))
 }
 
 func (r *RouterMixin) RouteInternal(path string, handler handlerInternal) {
-	r.Route(Api(path), Wrapper(handler))
+	r.Route(protocol.ParseApi(path), Wrapper(handler))
 }
 
 func (r *RouterMixin) Routes() map[string]RouteCall[any, any] {

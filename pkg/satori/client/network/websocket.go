@@ -14,6 +14,7 @@ import (
 	"github.com/satori-protocol-go/satori-go/pkg/satori/model/event"
 	"github.com/satori-protocol-go/satori-go/pkg/satori/model/login"
 	"github.com/satori-protocol-go/satori-go/pkg/satori/model/operation"
+	"github.com/satori-protocol-go/satori-go/pkg/satori/protocol"
 )
 
 type WS struct {
@@ -33,7 +34,7 @@ func NewWS(app AppBridge, options WebSocketOptions) *WS {
 	if options.HandshakeTimeout > 0 {
 		dialer.HandshakeTimeout = options.HandshakeTimeout
 	} else if dialer.HandshakeTimeout <= 0 {
-		dialer.HandshakeTimeout = 300 * time.Second
+		dialer.HandshakeTimeout = protocol.DefaultRequestTimeout
 	}
 
 	identity := strings.TrimSpace(options.Identity)

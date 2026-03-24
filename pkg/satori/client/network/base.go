@@ -10,6 +10,7 @@ import (
 	"github.com/gorilla/websocket"
 	"github.com/satori-protocol-go/satori-go/pkg/satori/model/event"
 	"github.com/satori-protocol-go/satori-go/pkg/satori/model/login"
+	"github.com/satori-protocol-go/satori-go/pkg/satori/protocol"
 )
 
 type APIConfig interface {
@@ -60,7 +61,7 @@ func webhookAddress(host string, port int) string {
 
 func normalizedTimeout(timeout time.Duration) time.Duration {
 	if timeout <= 0 {
-		return 300 * time.Second
+		return protocol.DefaultRequestTimeout
 	}
 	return timeout
 }
