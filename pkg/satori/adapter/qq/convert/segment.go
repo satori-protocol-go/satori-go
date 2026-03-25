@@ -1,4 +1,4 @@
-package messagecodec
+package convert
 
 import (
 	"fmt"
@@ -8,43 +8,54 @@ import (
 	"github.com/satori-protocol-go/satori-go/pkg/satori/model/message/element"
 )
 
-type ResourceKind string
+type MessageResourceKind string
 
 const (
-	ResourceImage ResourceKind = "image"
-	ResourceAudio ResourceKind = "audio"
-	ResourceVideo ResourceKind = "video"
-	ResourceFile  ResourceKind = "file"
+	MessageResourceImage MessageResourceKind = "image"
+	MessageResourceAudio MessageResourceKind = "audio"
+	MessageResourceVideo MessageResourceKind = "video"
+	MessageResourceFile  MessageResourceKind = "file"
 )
 
-type Resource struct {
-	Kind ResourceKind
+type MessageResource struct {
+	Kind MessageResourceKind
 	Src  string
 }
 
-type Segment struct {
+type MessageSegment struct {
 	Text     string
 	QuoteID  string
-	Resource *Resource
+	Resource *MessageResource
 }
 
-type parser struct {
+func ParseMessageSegments(content string, platform string) []MessageSegment {
+	segments, err := parseQQMessageSegments(content, platform)
+	if err != nil {
+		return []MessageSegment{{Text: content}}
+	}
+	if len(segments) == 0 && strings.TrimSpace(content) != "" {
+		return []MessageSegment{{Text: content}}
+	}
+	return segments
+}
+
+type qqMessageParser struct {
 	platform     string
 	pendingQuote string
 	currentText  strings.Builder
-	segments     []Segment
+	segments     []MessageSegment
 }
 
-func Parse(content string, platform string) ([]Segment, error) {
+func parseQQMessageSegments(content string, platform string) ([]MessageSegment, error) {
 	rawElements := xhtml.Parse(content, nil)
 	elements, err := element.Transform(rawElements)
 	if err != nil {
-		return []Segment{{Text: content}}, err
+		return []MessageSegment{{Text: content}}, err
 	}
 
-	state := &parser{
+	state := &qqMessageParser{
 		platform: platform,
-		segments: make([]Segment, 0, len(elements)),
+		segments: make([]MessageSegment, 0, len(elements)),
 	}
 	state.walk(elements)
 	state.flushText()
@@ -52,7 +63,7 @@ func Parse(content string, platform string) ([]Segment, error) {
 	return state.segments, nil
 }
 
-func (p *parser) walk(elements []element.Element) {
+func (p *qqMessageParser) walk(elements []element.Element) {
 	for _, item := range elements {
 		if item == nil {
 			continue
@@ -76,26 +87,26 @@ func (p *parser) walk(elements []element.Element) {
 			p.flushText()
 		case *element.Quote:
 			p.flushText()
-			if strings.TrimSpace(typed.Id) != "" {
-				p.pendingQuote = strings.TrimSpace(typed.Id)
+			if typed.Id != "" {
+				p.pendingQuote = typed.Id
 			}
 		case *element.At:
 			p.writeText(p.renderAt(typed))
 		case *element.Sharp:
 			p.writeText(p.renderSharp(typed))
 		case *element.A:
-			if strings.TrimSpace(typed.Href) != "" {
+			if typed.Href != "" {
 				p.writeText(typed.Href)
 			}
 			p.walk(typed.Children())
 		case *element.Img:
-			p.appendResource(ResourceImage, typed.Src)
+			p.appendResource(MessageResourceImage, typed.Src)
 		case *element.Audio:
-			p.appendResource(ResourceAudio, typed.Src)
+			p.appendResource(MessageResourceAudio, typed.Src)
 		case *element.Video:
-			p.appendResource(ResourceVideo, typed.Src)
+			p.appendResource(MessageResourceVideo, typed.Src)
 		case *element.File:
-			p.appendResource(ResourceFile, typed.Src)
+			p.appendResource(MessageResourceFile, typed.Src)
 		case *element.Extension:
 			p.writeText(p.renderExtension(typed))
 			p.walk(typed.Children())
@@ -105,44 +116,37 @@ func (p *parser) walk(elements []element.Element) {
 	}
 }
 
-func (p *parser) writeText(text string) {
+func (p *qqMessageParser) writeText(text string) {
 	if text == "" {
 		return
 	}
 	p.currentText.WriteString(text)
 }
 
-func (p *parser) flushText() {
+func (p *qqMessageParser) flushText() {
 	text := p.currentText.String()
 	if text == "" {
 		return
 	}
-	p.segments = append(p.segments, Segment{
-		Text:    text,
-		QuoteID: p.consumeQuote(),
-	})
+	p.segments = append(p.segments, MessageSegment{Text: text, QuoteID: p.consumeQuote()})
 	p.currentText.Reset()
 }
 
-func (p *parser) appendResource(kind ResourceKind, src string) {
-	src = strings.TrimSpace(src)
+func (p *qqMessageParser) appendResource(kind MessageResourceKind, src string) {
 	if src == "" {
 		return
 	}
 	p.flushText()
-	p.segments = append(p.segments, Segment{
-		QuoteID:  p.consumeQuote(),
-		Resource: &Resource{Kind: kind, Src: src},
-	})
+	p.segments = append(p.segments, MessageSegment{QuoteID: p.consumeQuote(), Resource: &MessageResource{Kind: kind, Src: src}})
 }
 
-func (p *parser) consumeQuote() string {
+func (p *qqMessageParser) consumeQuote() string {
 	value := p.pendingQuote
 	p.pendingQuote = ""
 	return value
 }
 
-func (p *parser) renderAt(input *element.At) string {
+func (p *qqMessageParser) renderAt(input *element.At) string {
 	if input == nil {
 		return ""
 	}
@@ -152,7 +156,7 @@ func (p *parser) renderAt(input *element.At) string {
 		}
 		return "@everyone"
 	}
-	if strings.TrimSpace(input.Id) == "" {
+	if input.Id == "" {
 		return ""
 	}
 	if p.platform == "qqguild" {
@@ -161,8 +165,8 @@ func (p *parser) renderAt(input *element.At) string {
 	return fmt.Sprintf("<@%s>", input.Id)
 }
 
-func (p *parser) renderSharp(input *element.Sharp) string {
-	if input == nil || strings.TrimSpace(input.Id) == "" {
+func (p *qqMessageParser) renderSharp(input *element.Sharp) string {
+	if input == nil || input.Id == "" {
 		return ""
 	}
 	if p.platform == "qqguild" {
@@ -171,12 +175,11 @@ func (p *parser) renderSharp(input *element.Sharp) string {
 	return "#" + input.Id
 }
 
-func (p *parser) renderExtension(input *element.Extension) string {
+func (p *qqMessageParser) renderExtension(input *element.Extension) string {
 	if input == nil {
 		return ""
 	}
-	tag := input.Tag()
-	switch tag {
+	switch input.Tag() {
 	case "chronocat:emoji", "qq:emoji":
 		if raw, ok := input.Get("id"); ok {
 			return fmt.Sprintf("<emoji:%v>", raw)

@@ -1,4 +1,4 @@
-package eventconv
+package event
 
 import (
 	"bytes"
@@ -8,7 +8,7 @@ import (
 	"strings"
 	"time"
 
-	botgodto "github.com/WindowsSov8forUs/botgo-plus/dto"
+	"github.com/WindowsSov8forUs/botgo-plus/dto"
 	"github.com/satori-protocol-go/satori-go/pkg/satori/model/user"
 )
 
@@ -25,16 +25,16 @@ func decodeWebhookData(raw json.RawMessage) (map[string]any, error) {
 	return data, nil
 }
 
-func decodeDTOMessage(raw map[string]any) *botgodto.Message {
-	result := &botgodto.Message{}
+func decodeDTOMessage(raw map[string]any) *dto.Message {
+	result := &dto.Message{}
 	if !decodeInto(raw, result) {
-		return &botgodto.Message{}
+		return &dto.Message{}
 	}
 	return result
 }
 
 func decodeDTOUser(c *Converter, raw map[string]any) *user.User {
-	dtoUser := &botgodto.User{}
+	dtoUser := &dto.User{}
 	if !decodeInto(raw, dtoUser) {
 		return nil
 	}

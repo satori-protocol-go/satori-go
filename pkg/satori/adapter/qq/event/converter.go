@@ -1,9 +1,9 @@
-package eventconv
+package event
 
 import (
 	"context"
 
-	botgodto "github.com/WindowsSov8forUs/botgo-plus/dto"
+	"github.com/WindowsSov8forUs/botgo-plus/dto"
 	"github.com/satori-protocol-go/satori-go/pkg/satori/model/channel"
 	"github.com/satori-protocol-go/satori-go/pkg/satori/model/guild"
 	"github.com/satori-protocol-go/satori-go/pkg/satori/model/guildmember"
@@ -21,11 +21,11 @@ const (
 )
 
 type Dependencies struct {
-	MessageFromDTO   func(input *botgodto.Message, platform string) *message.Message
-	UserFromDTO      func(input *botgodto.User) *user.User
-	MemberFromDTO    func(input *botgodto.Member) *guildmember.GuildMember
-	GuildFromDTO     func(input *botgodto.Guild) *guild.Guild
-	ChannelFromDTO   func(input *botgodto.Channel) *channel.Channel
+	MessageFromDTO   func(input *dto.Message, platform string) *message.Message
+	UserFromDTO      func(input *dto.User) *user.User
+	MemberFromDTO    func(input *dto.Member) *guildmember.GuildMember
+	GuildFromDTO     func(input *dto.Guild) *guild.Guild
+	ChannelFromDTO   func(input *dto.Channel) *channel.Channel
 	LoginForEvent    func(ctx context.Context, eventType string) *login.Login
 	LoginForPlatform func(ctx context.Context, platform string) *login.Login
 }
@@ -38,7 +38,7 @@ func New(deps Dependencies) *Converter {
 	return &Converter{deps: deps}
 }
 
-func (c *Converter) messageFromDTO(input *botgodto.Message, platform string) *message.Message {
+func (c *Converter) messageFromDTO(input *dto.Message, platform string) *message.Message {
 	if c.deps.MessageFromDTO == nil {
 		return &message.Message{}
 	}
@@ -49,28 +49,28 @@ func (c *Converter) messageFromDTO(input *botgodto.Message, platform string) *me
 	return result
 }
 
-func (c *Converter) userFromDTO(input *botgodto.User) *user.User {
+func (c *Converter) userFromDTO(input *dto.User) *user.User {
 	if c.deps.UserFromDTO == nil {
 		return nil
 	}
 	return c.deps.UserFromDTO(input)
 }
 
-func (c *Converter) memberFromDTO(input *botgodto.Member) *guildmember.GuildMember {
+func (c *Converter) memberFromDTO(input *dto.Member) *guildmember.GuildMember {
 	if c.deps.MemberFromDTO == nil {
 		return nil
 	}
 	return c.deps.MemberFromDTO(input)
 }
 
-func (c *Converter) guildFromDTO(input *botgodto.Guild) *guild.Guild {
+func (c *Converter) guildFromDTO(input *dto.Guild) *guild.Guild {
 	if c.deps.GuildFromDTO == nil {
 		return nil
 	}
 	return c.deps.GuildFromDTO(input)
 }
 
-func (c *Converter) channelFromDTO(input *botgodto.Channel) *channel.Channel {
+func (c *Converter) channelFromDTO(input *dto.Channel) *channel.Channel {
 	if c.deps.ChannelFromDTO == nil {
 		return nil
 	}

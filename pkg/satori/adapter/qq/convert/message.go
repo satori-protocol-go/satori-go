@@ -1,11 +1,11 @@
-package codec
+package convert
 
 import (
 	"fmt"
 	"regexp"
 	"strings"
 
-	botgodto "github.com/WindowsSov8forUs/botgo-plus/dto"
+	"github.com/WindowsSov8forUs/botgo-plus/dto"
 	"github.com/satori-protocol-go/satori-go/pkg/satori/model/channel"
 	"github.com/satori-protocol-go/satori-go/pkg/satori/model/guild"
 	"github.com/satori-protocol-go/satori-go/pkg/satori/model/message"
@@ -17,7 +17,7 @@ var (
 	emojiPattern   = regexp.MustCompile(`<emoji:(\w+)>`)
 )
 
-func MessageFromDTO(input *botgodto.Message, platform string) *message.Message {
+func MessageFromDTO(input *dto.Message, platform string) *message.Message {
 	if input == nil {
 		return &message.Message{}
 	}
@@ -69,7 +69,7 @@ func MessageFromDTO(input *botgodto.Message, platform string) *message.Message {
 	return result
 }
 
-func messageContentFromDTO(input *botgodto.Message) string {
+func messageContentFromDTO(input *dto.Message) string {
 	if input == nil {
 		return ""
 	}

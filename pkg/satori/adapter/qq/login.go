@@ -6,7 +6,8 @@ import (
 	"strings"
 	"time"
 
-	qqcodec "github.com/satori-protocol-go/satori-go/pkg/satori/adapter/qq/codec"
+	"github.com/WindowsSov8forUs/botgo-plus/dto"
+	"github.com/satori-protocol-go/satori-go/pkg/satori/adapter/qq/convert"
 	"github.com/satori-protocol-go/satori-go/pkg/satori/model/event"
 	"github.com/satori-protocol-go/satori-go/pkg/satori/model/login"
 	"github.com/satori-protocol-go/satori-go/pkg/satori/model/user"
@@ -28,7 +29,7 @@ func (a *Adapter) ensureLogins(ctx context.Context) error {
 		return err
 	}
 
-	identity := qqcodec.UserFromDTO(me)
+	identity := convert.UserFromDTO(me)
 	identity.IsBot = true
 
 	a.mu.Lock()
@@ -168,5 +169,66 @@ func (a *Adapter) pushEvent(evt *event.Event) {
 	select {
 	case a.eventCh <- evt:
 	default:
+	}
+}
+
+func firstNonEmpty(items ...string) string {
+	for _, item := range items {
+		if strings.TrimSpace(item) != "" {
+			return item
+		}
+	}
+	return ""
+}
+
+func copyStrings(items []string) []string {
+	if len(items) == 0 {
+		return nil
+	}
+	result := make([]string, len(items))
+	copy(result, items)
+	return result
+}
+
+func valueOrDefaultFeatures(values []string, defaults []string) []string {
+	if len(values) == 0 {
+		return copyStrings(defaults)
+	}
+	return copyStrings(values)
+}
+
+func copyUser(item *user.User) *user.User {
+	if item == nil {
+		return nil
+	}
+	cloned := *item
+	return &cloned
+}
+
+func cloneLogin(item *login.Login) *login.Login {
+	if item == nil {
+		return nil
+	}
+	cloned := *item
+	cloned.User = copyUser(item.User)
+	cloned.Features = copyStrings(item.Features)
+	return &cloned
+}
+
+func platformByEventType(eventType string) string {
+	switch eventType {
+	case string(dto.EventGroupAtMessageCreate),
+		string(dto.EventGroupAddRobot),
+		string(dto.EventGroupDelRobot),
+		string(dto.EventGroupMsgReject),
+		string(dto.EventGroupMsgReceive),
+		string(dto.EventC2CMessageCreate),
+		string(dto.EventFriendAdd),
+		string(dto.EventFriendDel),
+		string(dto.EventC2CMsgReceive),
+		string(dto.EventC2CMsgReject):
+		return "qq"
+	default:
+		return "qqguild"
 	}
 }

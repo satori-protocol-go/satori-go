@@ -1,13 +1,12 @@
 package qq
 
 import (
-	"context"
 	"net/http"
 	"time"
 
-	botgodto "github.com/WindowsSov8forUs/botgo-plus/dto"
-	botgoopenapi "github.com/WindowsSov8forUs/botgo-plus/openapi"
-	botgotoken "github.com/WindowsSov8forUs/botgo-plus/token"
+	"github.com/WindowsSov8forUs/botgo-plus/dto"
+	"github.com/WindowsSov8forUs/botgo-plus/openapi"
+	"github.com/WindowsSov8forUs/botgo-plus/token"
 )
 
 const (
@@ -15,6 +14,18 @@ const (
 	defaultAdapterName    = "qqbot"
 	defaultRequestTimeout = 10 * time.Second
 	defaultEventBuffer    = 128
+	defaultWSReconnect    = 5 * time.Second
+	defaultWSHandshake    = 30 * time.Second
+)
+
+const defaultWSIntents = int64(
+	dto.IntentGuilds |
+		dto.IntentGuildMembers |
+		dto.IntentGuildMessageReactions |
+		dto.IntentGroupAndC2CEvent |
+		dto.IntentInteraction |
+		dto.IntentMessageAudit |
+		dto.IntentPublicGuildMessages,
 )
 
 var defaultQQFeatures = []string{
@@ -58,56 +69,6 @@ var defaultQQGuildFeatures = []string{
 	"user.channel.create",
 }
 
-// OpenAPI defines the minimum botgo-plus API set used by this adapter.
-type OpenAPI interface {
-	Me(ctx context.Context) (*botgodto.User, error)
-	Message(ctx context.Context, channelID string, messageID string) (*botgodto.Message, error)
-	PostMessage(ctx context.Context, channelID string, msg *botgodto.MessageToCreate) (*botgodto.Message, error)
-	PostDirectMessage(
-		ctx context.Context,
-		dm *botgodto.DirectMessage,
-		msg *botgodto.MessageToCreate,
-	) (*botgodto.Message, error)
-	RetractMessage(
-		ctx context.Context,
-		channelID string,
-		msgID string,
-		options ...botgoopenapi.RetractMessageOption,
-	) error
-	RetractDMMessage(
-		ctx context.Context,
-		guildID string,
-		msgID string,
-		options ...botgoopenapi.RetractMessageOption,
-	) error
-	CreateDirectMessage(
-		ctx context.Context,
-		dm *botgodto.DirectMessageToCreate,
-	) (*botgodto.DirectMessage, error)
-	PostGroupMessage(
-		ctx context.Context,
-		groupID string,
-		msg botgodto.APIMessage,
-	) (*botgodto.GroupMessageResponse, error)
-	PostC2CMessage(
-		ctx context.Context,
-		userID string,
-		msg botgodto.APIMessage,
-	) (*botgodto.C2CMessageResponse, error)
-	RetractGroupMessage(
-		ctx context.Context,
-		groupID string,
-		msgID string,
-		options ...botgoopenapi.RetractMessageOption,
-	) error
-	RetractC2CMessage(
-		ctx context.Context,
-		userID string,
-		msgID string,
-		options ...botgoopenapi.RetractMessageOption,
-	) error
-}
-
 type Config struct {
 	AppID  uint64
 	Secret string
@@ -122,10 +83,18 @@ type Config struct {
 	RequestTimeout     time.Duration
 	SkipTokenInit      bool
 	SkipSignatureCheck bool
+	UseWebSocket       bool
+	WSGatewayURL       string
+	WSIntents          int64
+	WSIntentNames      []string
+	WSShardID          uint32
+	WSShardCount       uint32
+	WSReconnectDelay   time.Duration
+	WSHandshakeTimeout time.Duration
 
-	TokenInstance *botgotoken.Token
-	APIV1         OpenAPI
-	APIV2         OpenAPI
+	TokenInstance *token.Token
+	APIV1         openapi.OpenAPI
+	APIV2         openapi.OpenAPI
 	HTTPClient    *http.Client
 
 	QQFeatures      []string

@@ -1,14 +1,14 @@
-package eventconv
+package event
 
 import (
 	"context"
 
-	botgodto "github.com/WindowsSov8forUs/botgo-plus/dto"
+	"github.com/WindowsSov8forUs/botgo-plus/dto"
 	"github.com/satori-protocol-go/satori-go/pkg/satori/model/channel"
-	"github.com/satori-protocol-go/satori-go/pkg/satori/model/event"
+	satorievent "github.com/satori-protocol-go/satori-go/pkg/satori/model/event"
 	"github.com/satori-protocol-go/satori-go/pkg/satori/model/guild"
 	"github.com/satori-protocol-go/satori-go/pkg/satori/model/guildmember"
-	satoriinteraction "github.com/satori-protocol-go/satori-go/pkg/satori/model/interaction"
+	"github.com/satori-protocol-go/satori-go/pkg/satori/model/interaction"
 	"github.com/satori-protocol-go/satori-go/pkg/satori/model/login"
 	"github.com/satori-protocol-go/satori-go/pkg/satori/model/message"
 	"github.com/satori-protocol-go/satori-go/pkg/satori/model/user"
@@ -18,18 +18,18 @@ func (c *Converter) makeInteractionEvent(
 	ctx context.Context,
 	loginValue *login.Login,
 	data map[string]any,
-) *event.Event {
-	interactionValue := &botgodto.Interaction{}
+) *satorievent.Event {
+	interactionValue := &dto.Interaction{}
 	if !decodeInto(data, interactionValue) {
-		return &event.Event{
-			Type:      event.EventTypeInternal,
+		return &satorievent.Event{
+			Type:      satorievent.EventTypeInternal,
 			Timestamp: pickEventTimestamp(data),
 			Login:     loginValue,
 		}
 	}
 	if interactionValue.Data == nil {
-		return &event.Event{
-			Type:      event.EventTypeInternal,
+		return &satorievent.Event{
+			Type:      satorievent.EventTypeInternal,
 			Timestamp: pickEventTimestamp(data),
 			Login:     loginValue,
 		}
@@ -87,11 +87,11 @@ func (c *Converter) makeInteractionEvent(
 		Member:  memberValue,
 	}
 
-	return &event.Event{
-		Type:      event.EventTypeInteractionButton,
+	return &satorievent.Event{
+		Type:      satorievent.EventTypeInteractionButton,
 		Timestamp: timestamp,
 		Login:     currentLogin,
-		Button: &satoriinteraction.Button{
+		Button: &interaction.Button{
 			Id: interactionValue.Data.Resolved.ButtonID,
 		},
 		Channel: channelValue,

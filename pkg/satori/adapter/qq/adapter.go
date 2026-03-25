@@ -10,13 +10,14 @@ import (
 	"time"
 
 	_ "github.com/WindowsSov8forUs/botgo-plus"
-	botgotoken "github.com/WindowsSov8forUs/botgo-plus/token"
-	qqaction "github.com/satori-protocol-go/satori-go/pkg/satori/adapter/qq/action"
-	qqcodec "github.com/satori-protocol-go/satori-go/pkg/satori/adapter/qq/codec"
-	qqeventconv "github.com/satori-protocol-go/satori-go/pkg/satori/adapter/qq/eventconv"
+	"github.com/WindowsSov8forUs/botgo-plus/openapi"
+	"github.com/WindowsSov8forUs/botgo-plus/token"
+	"github.com/gorilla/websocket"
+	"github.com/satori-protocol-go/satori-go/pkg/satori/adapter/qq/convert"
+	qqevent "github.com/satori-protocol-go/satori-go/pkg/satori/adapter/qq/event"
 	"github.com/satori-protocol-go/satori-go/pkg/satori/model/event"
 	"github.com/satori-protocol-go/satori-go/pkg/satori/model/login"
-	satoriserver "github.com/satori-protocol-go/satori-go/pkg/satori/server"
+	"github.com/satori-protocol-go/satori-go/pkg/satori/server"
 )
 
 const (
@@ -25,9 +26,10 @@ const (
 )
 
 type Adapter struct {
-	satoriserver.RouterMixin
+	server.RouterMixin
 
 	cfg Config
+	srv *server.Server
 
 	path               string
 	appID              string
@@ -36,17 +38,31 @@ type Adapter struct {
 	httpClient         *http.Client
 	requestTimeout     time.Duration
 
-	apiV1 OpenAPI
-	apiV2 OpenAPI
-	token *botgotoken.Token
+	apiV1 openapi.OpenAPI
+	apiV2 openapi.OpenAPI
+	token *token.Token
 
 	qqFeatures      []string
 	qqGuildFeatures []string
 
 	eventCh       chan *event.Event
 	publisherOnce sync.Once
-	converter     *qqeventconv.Converter
-	actions       *qqaction.Handler
+	converter     *qqevent.Converter
+	sender        *messageSender
+	wsEnabled     bool
+	wsGatewayURL  string
+	wsIntents     int64
+	wsShardID     uint32
+	wsShardCount  uint32
+	wsReconnect   time.Duration
+	wsHandshake   time.Duration
+
+	wsConnMu   sync.RWMutex
+	wsWriteMu  sync.Mutex
+	wsConn     *websocket.Conn
+	wsSession  string
+	wsSequence int64
+	wsHasSeq   bool
 
 	mu     sync.RWMutex
 	logins []*login.Login
@@ -74,10 +90,25 @@ func New(cfg Config) (*Adapter, error) {
 	if httpClient == nil {
 		httpClient = &http.Client{Timeout: requestTimeout}
 	}
+	wsIntents := cfg.WSIntents
+	if wsIntents == 0 {
+		wsIntents = parseWSIntentNames(cfg.WSIntentNames)
+	}
+	if wsIntents == 0 {
+		wsIntents = defaultWSIntents
+	}
+	wsReconnect := cfg.WSReconnectDelay
+	if wsReconnect <= 0 {
+		wsReconnect = defaultWSReconnect
+	}
+	wsHandshake := cfg.WSHandshakeTimeout
+	if wsHandshake <= 0 {
+		wsHandshake = defaultWSHandshake
+	}
 
 	tokenInstance := cfg.TokenInstance
 	if tokenInstance == nil {
-		tokenInstance = botgotoken.BotToken(cfg.AppID, cfg.Secret, cfg.Token, botgotoken.TypeQQBot)
+		tokenInstance = token.BotToken(cfg.AppID, cfg.Secret, cfg.Token, token.TypeQQBot)
 		if strings.TrimSpace(cfg.TokenURL) != "" {
 			tokenInstance.SetTokenURL(strings.TrimSpace(cfg.TokenURL))
 		}
@@ -120,13 +151,20 @@ func New(cfg Config) (*Adapter, error) {
 		qqFeatures:         valueOrDefaultFeatures(cfg.QQFeatures, defaultQQFeatures),
 		qqGuildFeatures:    valueOrDefaultFeatures(cfg.QQGuildFeatures, defaultQQGuildFeatures),
 		eventCh:            make(chan *event.Event, buffer),
+		wsEnabled:          cfg.UseWebSocket,
+		wsGatewayURL:       strings.TrimSpace(cfg.WSGatewayURL),
+		wsIntents:          wsIntents,
+		wsShardID:          cfg.WSShardID,
+		wsShardCount:       cfg.WSShardCount,
+		wsReconnect:        wsReconnect,
+		wsHandshake:        wsHandshake,
 	}
-	adapter.converter = qqeventconv.New(qqeventconv.Dependencies{
-		MessageFromDTO: qqcodec.MessageFromDTO,
-		UserFromDTO:    qqcodec.UserFromDTO,
-		MemberFromDTO:  qqcodec.MemberFromDTO,
-		GuildFromDTO:   qqcodec.GuildFromDTO,
-		ChannelFromDTO: qqcodec.ChannelFromDTO,
+	adapter.converter = qqevent.New(qqevent.Dependencies{
+		MessageFromDTO: convert.MessageFromDTO,
+		UserFromDTO:    convert.UserFromDTO,
+		MemberFromDTO:  convert.MemberFromDTO,
+		GuildFromDTO:   convert.GuildFromDTO,
+		ChannelFromDTO: convert.ChannelFromDTO,
 		LoginForEvent: func(ctx context.Context, eventType string) *login.Login {
 			return adapter.loginForEventType(ctx, eventType)
 		},
@@ -134,19 +172,10 @@ func New(cfg Config) (*Adapter, error) {
 			return adapter.loginForPlatform(ctx, platform)
 		},
 	})
-	adapter.actions = qqaction.New(qqaction.Dependencies{
-		APIV1:        adapter.apiV1,
-		APIV2:        adapter.apiV2,
-		EnsureLogins: adapter.ensureLogins,
-		FindLogin:    adapter.findLogin,
-		HandleInternal: func(
-			request satoriserver.Request[map[string]any],
-			path string,
-		) (*satoriserver.Response, error) {
-			return adapter.HandleInternal(request, path)
-		},
-	})
-	adapter.actions.Register(&adapter.RouterMixin)
+
+	adapter.sender = newMessageSender(adapter.apiV1, adapter.apiV2, convert.MessageFromDTO)
+	adapter.registerRoutes()
+
 	return adapter, nil
 }
 
@@ -200,12 +229,43 @@ func (a *Adapter) Ensure(platform string, selfID string) bool {
 	return false
 }
 
-func (a *Adapter) HandleProxied(prefix string, rawURL string) (*satoriserver.Response, error) {
+func (a *Adapter) HandleProxied(prefix string, rawURL string) (*server.Response, error) {
 	_ = prefix
 	_ = rawURL
-	return nil, nil
+	return nil, server.NotFound("proxy is not supported")
 }
 
-var _ satoriserver.Adapter = (*Adapter)(nil)
-var _ satoriserver.EventPublisher = (*Adapter)(nil)
-var _ satoriserver.RootRouteProvider = (*Adapter)(nil)
+func (a *Adapter) EnsureServer(server *server.Server) {
+	a.mu.Lock()
+	a.srv = server
+	a.mu.Unlock()
+}
+
+var _ server.Adapter = (*Adapter)(nil)
+var _ server.EventPublisher = (*Adapter)(nil)
+var _ server.RootRouteRegistrar = (*Adapter)(nil)
+var _ server.Blockable = (*Adapter)(nil)
+var _ server.Cleanable = (*Adapter)(nil)
+
+func createOpenAPIClients(
+	token *token.Token,
+	sandbox bool,
+	timeout time.Duration,
+) (openapi.OpenAPI, openapi.OpenAPI, error) {
+	v1Impl, ok := openapi.VersionMapping[openapi.APIv1]
+	if !ok || v1Impl == nil {
+		return nil, nil, errors.New("botgo-plus openapi v1 is not registered")
+	}
+	v2Impl, ok := openapi.VersionMapping[openapi.APIv2]
+	if !ok || v2Impl == nil {
+		return nil, nil, errors.New("botgo-plus openapi v2 is not registered")
+	}
+
+	v1 := v1Impl.Setup(token, sandbox)
+	v2 := v2Impl.Setup(token, sandbox)
+	if timeout > 0 {
+		v1 = v1.WithTimeout(timeout)
+		v2 = v2.WithTimeout(timeout)
+	}
+	return v1, v2, nil
+}
