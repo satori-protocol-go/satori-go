@@ -1,13 +1,14 @@
 package interaction
 
-// 交互指令
+// Argv represents a command-style interaction payload.
 type Argv struct {
-	Name      string         `json:"name"`      // 指令名称
-	Arguments []any          `json:"arguments"` // 参数
-	Options   map[string]any `json:"options"`   // 选项
+	Name      string         `json:"name"`
+	Arguments []any          `json:"arguments"`
+	Options   map[string]any `json:"options"`
 }
 
-// 交互按钮
+// Button represents a button interaction payload.
 type Button struct {
-	Id string `json:"id"` // 按钮 ID
+	Id   string `json:"id"`
+	Data string `json:"data,omitempty"`
 }

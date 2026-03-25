@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"net/http"
-	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -38,6 +37,9 @@ type Adapter struct {
 	httpClient         *http.Client
 	requestTimeout     time.Duration
 
+	appStates    map[string]*appState
+	primaryAppID string
+
 	apiV1 openapi.OpenAPI
 	apiV2 openapi.OpenAPI
 	token *token.Token
@@ -48,7 +50,6 @@ type Adapter struct {
 	eventCh       chan *event.Event
 	publisherOnce sync.Once
 	converter     *qqevent.Converter
-	sender        *messageSender
 	wsEnabled     bool
 	wsGatewayURL  string
 	wsIntents     int64
@@ -57,26 +58,21 @@ type Adapter struct {
 	wsReconnect   time.Duration
 	wsHandshake   time.Duration
 
-	wsConnMu   sync.RWMutex
-	wsWriteMu  sync.Mutex
-	wsConn     *websocket.Conn
-	wsSession  string
-	wsSequence int64
-	wsHasSeq   bool
+	wsConnMu  sync.RWMutex
+	wsWriteMu sync.Mutex
+	wsConn    *websocket.Conn
+	wsConns   map[string]*websocket.Conn
 
-	mu     sync.RWMutex
-	logins []*login.Login
-	selfID string
+	auditMu      sync.Mutex
+	auditWaiters map[string][]chan string
+
+	mu        sync.RWMutex
+	logins    []*login.Login
+	selfID    string
+	selfToApp map[string]string
 }
 
 func New(cfg Config) (*Adapter, error) {
-	if cfg.AppID == 0 {
-		return nil, errors.New("qq adapter requires app_id")
-	}
-	if strings.TrimSpace(cfg.Secret) == "" {
-		return nil, errors.New("qq adapter requires secret")
-	}
-
 	requestTimeout := cfg.RequestTimeout
 	if requestTimeout <= 0 {
 		requestTimeout = defaultRequestTimeout
@@ -106,48 +102,33 @@ func New(cfg Config) (*Adapter, error) {
 		wsHandshake = defaultWSHandshake
 	}
 
-	tokenInstance := cfg.TokenInstance
-	if tokenInstance == nil {
-		tokenInstance = token.BotToken(cfg.AppID, cfg.Secret, cfg.Token, token.TypeQQBot)
-		if strings.TrimSpace(cfg.TokenURL) != "" {
-			tokenInstance.SetTokenURL(strings.TrimSpace(cfg.TokenURL))
-		}
-	}
-	if !cfg.SkipTokenInit {
-		_ = tokenInstance.InitToken(context.Background())
-	}
-
-	apiV1 := cfg.APIV1
-	apiV2 := cfg.APIV2
-	if apiV1 == nil || apiV2 == nil {
-		createdV1, createdV2, err := createOpenAPIClients(tokenInstance, cfg.Sandbox, requestTimeout)
-		if err != nil {
-			return nil, err
-		}
-		if apiV1 == nil {
-			apiV1 = createdV1
-		}
-		if apiV2 == nil {
-			apiV2 = createdV2
-		}
-	}
-
 	adapterName := strings.TrimSpace(cfg.Adapter)
 	if adapterName == "" {
 		adapterName = defaultAdapterName
 	}
 
+	appStates, primaryAppID, err := buildAppStates(cfg, requestTimeout)
+	if err != nil {
+		return nil, err
+	}
+	primary := appStates[primaryAppID]
+	if primary == nil {
+		return nil, errors.New("qq adapter primary app state not found")
+	}
+
 	adapter := &Adapter{
 		cfg:                cfg,
 		path:               normalizeWebhookPath(cfg.Path),
-		appID:              strconv.FormatUint(cfg.AppID, 10),
+		appID:              primary.appID,
 		adapterName:        adapterName,
 		skipSignatureCheck: cfg.SkipSignatureCheck,
 		httpClient:         httpClient,
 		requestTimeout:     requestTimeout,
-		apiV1:              apiV1,
-		apiV2:              apiV2,
-		token:              tokenInstance,
+		appStates:          appStates,
+		primaryAppID:       primaryAppID,
+		apiV1:              primary.apiV1,
+		apiV2:              primary.apiV2,
+		token:              primary.token,
 		qqFeatures:         valueOrDefaultFeatures(cfg.QQFeatures, defaultQQFeatures),
 		qqGuildFeatures:    valueOrDefaultFeatures(cfg.QQGuildFeatures, defaultQQGuildFeatures),
 		eventCh:            make(chan *event.Event, buffer),
@@ -158,6 +139,9 @@ func New(cfg Config) (*Adapter, error) {
 		wsShardCount:       cfg.WSShardCount,
 		wsReconnect:        wsReconnect,
 		wsHandshake:        wsHandshake,
+		selfToApp:          map[string]string{},
+		wsConns:            map[string]*websocket.Conn{},
+		auditWaiters:       map[string][]chan string{},
 	}
 	adapter.converter = qqevent.New(qqevent.Dependencies{
 		MessageFromDTO: convert.MessageFromDTO,
@@ -173,7 +157,6 @@ func New(cfg Config) (*Adapter, error) {
 		},
 	})
 
-	adapter.sender = newMessageSender(adapter.apiV1, adapter.apiV2, convert.MessageFromDTO)
 	adapter.registerRoutes()
 
 	return adapter, nil

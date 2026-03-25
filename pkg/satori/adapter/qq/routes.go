@@ -29,7 +29,11 @@ func (a *Adapter) handleChannelGet(request *server.Request[server.ChannelParam])
 	if request.Platform != "qqguild" {
 		return nil, server.NotFound("channel.get is not supported in current platform")
 	}
-	api := a.apiV1
+	state, err := a.resolveRequestState(request.Origin, request.SelfID)
+	if err != nil {
+		return nil, err
+	}
+	api := state.apiV1
 	channelID := request.Params.ChannelID
 
 	fetched, err := api.Channel(requestContext(request.Origin), convert.SplitChannelCompositeID(channelID))
@@ -46,7 +50,11 @@ func (a *Adapter) handleChannelList(request *server.Request[server.ChannelListPa
 	if request.Platform != "qqguild" {
 		return nil, server.NotFound("channel.list is not supported in current platform")
 	}
-	api := a.apiV1
+	state, err := a.resolveRequestState(request.Origin, request.SelfID)
+	if err != nil {
+		return nil, err
+	}
+	api := state.apiV1
 	guildID := request.Params.GuildID
 
 	channelsValue, err := api.Channels(requestContext(request.Origin), convert.SplitGuildCompositeID(guildID))
@@ -64,7 +72,11 @@ func (a *Adapter) handleChannelCreate(request *server.Request[server.ChannelCrea
 	if request.Platform != "qqguild" {
 		return nil, server.NotFound("channel.create is not supported in current platform")
 	}
-	api := a.apiV1
+	state, err := a.resolveRequestState(request.Origin, request.SelfID)
+	if err != nil {
+		return nil, err
+	}
+	api := state.apiV1
 	guildID := request.Params.GuildID
 
 	created, err := api.PostChannel(
@@ -85,7 +97,11 @@ func (a *Adapter) handleChannelUpdate(request *server.Request[server.ChannelUpda
 	if request.Platform != "qqguild" {
 		return nil, server.NotFound("channel.update is not supported in current platform")
 	}
-	api := a.apiV1
+	state, err := a.resolveRequestState(request.Origin, request.SelfID)
+	if err != nil {
+		return nil, err
+	}
+	api := state.apiV1
 	channelID := request.Params.ChannelID
 
 	updated, err := api.PatchChannel(
@@ -106,7 +122,11 @@ func (a *Adapter) handleChannelDelete(request *server.Request[server.ChannelPara
 	if request.Platform != "qqguild" {
 		return nil, server.NotFound("channel.delete is not supported in current platform")
 	}
-	api := a.apiV1
+	state, err := a.resolveRequestState(request.Origin, request.SelfID)
+	if err != nil {
+		return nil, err
+	}
+	api := state.apiV1
 	channelID := request.Params.ChannelID
 
 	if err := api.DeleteChannel(requestContext(request.Origin), convert.SplitChannelCompositeID(channelID)); err != nil {
@@ -123,7 +143,11 @@ func (a *Adapter) handleGuildGet(request *server.Request[server.GuildGetParam]) 
 	if request.Platform != "qqguild" {
 		return nil, server.NotFound("guild.get is not supported in current platform")
 	}
-	api := a.apiV1
+	state, err := a.resolveRequestState(request.Origin, request.SelfID)
+	if err != nil {
+		return nil, err
+	}
+	api := state.apiV1
 	guildID := request.Params.GuildID
 
 	fetched, err := api.Guild(requestContext(request.Origin), convert.SplitGuildCompositeID(guildID))
@@ -140,7 +164,11 @@ func (a *Adapter) handleGuildList(request *server.Request[server.GuildListParam]
 	if request.Platform != "qqguild" {
 		return nil, server.NotFound("guild.list is not supported in current platform")
 	}
-	api := a.apiV1
+	state, err := a.resolveRequestState(request.Origin, request.SelfID)
+	if err != nil {
+		return nil, err
+	}
+	api := state.apiV1
 
 	pager := &dto.GuildPager{Limit: "100"}
 	if nextValue, ok := request.Params.Next.Get(); ok {
@@ -219,7 +247,7 @@ func (a *Adapter) HandleInternal(
 		params = map[string]any{}
 	}
 
-	body, contentType, status, err := a.callRawAPI(ctx, method, action, params)
+	body, contentType, status, err := a.callRawAPI(ctx, request.SelfID, method, action, params)
 	if err != nil {
 		return nil, err
 	}
@@ -232,6 +260,7 @@ func (a *Adapter) HandleInternal(
 
 func (a *Adapter) callRawAPI(
 	ctx context.Context,
+	selfID string,
 	method string,
 	action string,
 	params map[string]any,
@@ -280,7 +309,7 @@ func (a *Adapter) callRawAPI(
 		return nil, "", 0, err
 	}
 
-	authorization, err := a.currentAuthorizationToken(ctx)
+	authorization, err := a.currentAuthorizationToken(ctx, selfID)
 	if err != nil {
 		return nil, "", 0, err
 	}
@@ -328,7 +357,11 @@ func (a *Adapter) handleGuildMemberGet(request *server.Request[server.GuildMembe
 	if request.Platform != "qqguild" {
 		return nil, server.NotFound("guild.member.get is not supported in current platform")
 	}
-	api := a.apiV1
+	state, err := a.resolveRequestState(request.Origin, request.SelfID)
+	if err != nil {
+		return nil, err
+	}
+	api := state.apiV1
 	guildID := request.Params.GuildID
 	userID := request.Params.UserID
 
@@ -346,7 +379,11 @@ func (a *Adapter) handleGuildMemberList(request *server.Request[server.GuildList
 	if request.Platform != "qqguild" {
 		return nil, server.NotFound("guild.member.list is not supported in current platform")
 	}
-	api := a.apiV1
+	state, err := a.resolveRequestState(request.Origin, request.SelfID)
+	if err != nil {
+		return nil, err
+	}
+	api := state.apiV1
 	guildID := request.Params.GuildID
 
 	pager := &dto.GuildMembersPager{After: "0", Limit: "400"}
@@ -376,7 +413,11 @@ func (a *Adapter) handleGuildMemberKick(request *server.Request[server.GuildMemb
 	if request.Platform != "qqguild" {
 		return nil, server.NotFound("guild.member.kick is not supported in current platform")
 	}
-	api := a.apiV1
+	state, err := a.resolveRequestState(request.Origin, request.SelfID)
+	if err != nil {
+		return nil, err
+	}
+	api := state.apiV1
 	guildID := request.Params.GuildID
 	userID := request.Params.UserID
 
@@ -390,7 +431,11 @@ func (a *Adapter) handleGuildMemberMute(request *server.Request[server.GuildMemb
 	if request.Platform != "qqguild" {
 		return nil, server.NotFound("guild.member.mute is not supported in current platform")
 	}
-	api := a.apiV1
+	state, err := a.resolveRequestState(request.Origin, request.SelfID)
+	if err != nil {
+		return nil, err
+	}
+	api := state.apiV1
 	guildID := request.Params.GuildID
 	userID := request.Params.UserID
 
@@ -420,7 +465,11 @@ func (a *Adapter) handleGuildMemberRoleChange(
 	if request.Platform != "qqguild" {
 		return nil, server.NotFound("guild.member.role action is not supported in current platform")
 	}
-	api := a.apiV1
+	state, err := a.resolveRequestState(request.Origin, request.SelfID)
+	if err != nil {
+		return nil, err
+	}
+	api := state.apiV1
 	guildID := request.Params.GuildID
 	userID := request.Params.UserID
 	roleID := request.Params.RoleID
@@ -446,11 +495,16 @@ func (a *Adapter) handleMessageCreate(request *server.Request[server.MessageCrea
 	if err != nil {
 		return nil, err
 	}
-	if a.sender == nil {
+	state, err := a.resolveRequestState(request.Origin, request.SelfID)
+	if err != nil {
+		return nil, err
+	}
+	sender := newMessageSender(state.apiV1, state.apiV2, convert.MessageFromDTO, a)
+	if sender == nil {
 		return []*message.Message{}, nil
 	}
 
-	result, err := a.sender.Send(requestContext(request.Origin), messageCreateInput{
+	result, err := sender.Send(requestContext(request.Origin), messageCreateInput{
 		Platform:  request.Platform,
 		ChannelID: channelID,
 		Content:   request.Params.Content,
@@ -478,7 +532,11 @@ func (a *Adapter) handleMessageUpdate(request *server.Request[server.MessageUpda
 	}
 	messageID := request.Params.MessageID
 
-	api := a.apiV1
+	state, err := a.resolveRequestState(request.Origin, request.SelfID)
+	if err != nil {
+		return nil, err
+	}
+	api := state.apiV1
 
 	payload := &dto.MessageToCreate{Content: request.Params.Content}
 	updated, err := api.PatchMessage(requestContext(request.Origin), channelID, messageID, payload)
@@ -495,26 +553,30 @@ func (a *Adapter) handleMessageDelete(request *server.Request[server.MessageOpPa
 	channelID := request.Params.ChannelID
 	messageID := request.Params.MessageID
 
+	state, err := a.resolveRequestState(request.Origin, request.SelfID)
+	if err != nil {
+		return nil, err
+	}
 	ctx := requestContext(request.Origin)
-	var err error
+	var callErr error
 	switch request.Platform {
 	case "qqguild":
 		if strings.Contains(channelID, "_") {
-			err = a.apiV1.RetractDMMessage(ctx, convert.SplitGuildCompositeID(channelID), messageID)
+			callErr = state.apiV1.RetractDMMessage(ctx, convert.SplitGuildCompositeID(channelID), messageID)
 		} else {
-			err = a.apiV1.RetractMessage(ctx, channelID, messageID)
+			callErr = state.apiV1.RetractMessage(ctx, channelID, messageID)
 		}
 	case "qq":
 		if userID, direct := convert.SplitPrivateChannelID(channelID); direct {
-			err = a.apiV2.RetractC2CMessage(ctx, userID, messageID)
+			callErr = state.apiV2.RetractC2CMessage(ctx, userID, messageID)
 		} else {
-			err = a.apiV2.RetractGroupMessage(ctx, channelID, messageID)
+			callErr = state.apiV2.RetractGroupMessage(ctx, channelID, messageID)
 		}
 	default:
 		return nil, server.NotFound("unsupported platform")
 	}
-	if err != nil {
-		return nil, err
+	if callErr != nil {
+		return nil, callErr
 	}
 	return map[string]any{}, nil
 }
@@ -529,7 +591,11 @@ func (a *Adapter) handleMessageGet(request *server.Request[server.MessageOpParam
 	}
 	messageID := request.Params.MessageID
 
-	fetched, err := a.apiV1.Message(requestContext(request.Origin), channelID, messageID)
+	state, err := a.resolveRequestState(request.Origin, request.SelfID)
+	if err != nil {
+		return nil, err
+	}
+	fetched, err := state.apiV1.Message(requestContext(request.Origin), channelID, messageID)
 	if err != nil {
 		return nil, err
 	}
@@ -548,7 +614,11 @@ func (a *Adapter) handleMessageList(request *server.Request[server.MessageListPa
 		return nil, server.NotFound("message.list is not supported for user-channel")
 	}
 
-	api := a.apiV1
+	state, err := a.resolveRequestState(request.Origin, request.SelfID)
+	if err != nil {
+		return nil, err
+	}
+	api := state.apiV1
 
 	pager := &dto.MessagesPager{Limit: "20"}
 	if limit, ok := request.Params.Limit.Get(); ok && limit > 0 {
@@ -686,7 +756,11 @@ func (a *Adapter) handleReactionList(request *server.Request[server.ReactionList
 	if request.Platform != "qqguild" {
 		return nil, server.NotFound("reaction.list is not supported in current platform")
 	}
-	api := a.apiV1
+	state, err := a.resolveRequestState(request.Origin, request.SelfID)
+	if err != nil {
+		return nil, err
+	}
+	api := state.apiV1
 	channelID := request.Params.ChannelID
 	messageID := request.Params.MessageID
 	emojiRaw := request.Params.EmojiID
@@ -724,7 +798,11 @@ func (a *Adapter) handleReactionCreate(request *server.Request[server.ReactionCr
 	if request.Platform != "qqguild" {
 		return nil, server.NotFound("reaction.create is not supported in current platform")
 	}
-	api := a.apiV1
+	state, err := a.resolveRequestState(request.Origin, request.SelfID)
+	if err != nil {
+		return nil, err
+	}
+	api := state.apiV1
 	channelID := request.Params.ChannelID
 	messageID := request.Params.MessageID
 	emojiRaw := request.Params.EmojiID
@@ -744,7 +822,11 @@ func (a *Adapter) handleReactionDelete(request *server.Request[server.ReactionDe
 	if request.Platform != "qqguild" {
 		return nil, server.NotFound("reaction.delete is not supported in current platform")
 	}
-	api := a.apiV1
+	state, err := a.resolveRequestState(request.Origin, request.SelfID)
+	if err != nil {
+		return nil, err
+	}
+	api := state.apiV1
 	channelID := request.Params.ChannelID
 	messageID := request.Params.MessageID
 	emojiRaw := request.Params.EmojiID
@@ -822,7 +904,11 @@ func (a *Adapter) handleGuildRoleList(request *server.Request[server.GuildListBy
 	if request.Platform != "qqguild" {
 		return nil, server.NotFound("guild.role.list is not supported in current platform")
 	}
-	api := a.apiV1
+	state, err := a.resolveRequestState(request.Origin, request.SelfID)
+	if err != nil {
+		return nil, err
+	}
+	api := state.apiV1
 	guildID := request.Params.GuildID
 
 	roles, err := api.Roles(requestContext(request.Origin), convert.SplitGuildCompositeID(guildID))
@@ -839,7 +925,11 @@ func (a *Adapter) handleGuildRoleCreate(request *server.Request[server.GuildRole
 	if request.Platform != "qqguild" {
 		return nil, server.NotFound("guild.role.create is not supported in current platform")
 	}
-	api := a.apiV1
+	state, err := a.resolveRequestState(request.Origin, request.SelfID)
+	if err != nil {
+		return nil, err
+	}
+	api := state.apiV1
 	guildID := request.Params.GuildID
 
 	updated, err := api.PostRole(
@@ -864,7 +954,11 @@ func (a *Adapter) handleGuildRoleUpdate(request *server.Request[server.GuildRole
 	if request.Platform != "qqguild" {
 		return nil, server.NotFound("guild.role.update is not supported in current platform")
 	}
-	api := a.apiV1
+	state, err := a.resolveRequestState(request.Origin, request.SelfID)
+	if err != nil {
+		return nil, err
+	}
+	api := state.apiV1
 	guildID := request.Params.GuildID
 	roleID := request.Params.RoleID
 
@@ -891,7 +985,11 @@ func (a *Adapter) handleGuildRoleDelete(request *server.Request[server.GuildRole
 	if request.Platform != "qqguild" {
 		return nil, server.NotFound("guild.role.delete is not supported in current platform")
 	}
-	api := a.apiV1
+	state, err := a.resolveRequestState(request.Origin, request.SelfID)
+	if err != nil {
+		return nil, err
+	}
+	api := state.apiV1
 	guildID := request.Params.GuildID
 	roleID := request.Params.RoleID
 
@@ -908,6 +1006,10 @@ func requestContext(request *http.Request) context.Context {
 	return request.Context()
 }
 
+func (a *Adapter) resolveRequestState(origin *http.Request, selfID string) (*appState, error) {
+	return a.resolveStateBySelfID(requestContext(origin), selfID)
+}
+
 func int64ToInt(value int64, key string) (int, error) {
 	if strconv.IntSize == 32 && (value < -2147483648 || value > 2147483647) {
 		return 0, server.BadRequest(fmt.Sprintf("%s is out of range", key))
@@ -922,12 +1024,16 @@ func (a *Adapter) handleUserChannelCreate(request *server.Request[server.UserCha
 	case "qq":
 		return &channel.Channel{Id: convert.ComposePrivateChannelID(userID), Type: channel.ChannelTypeDirect}, nil
 	case "qqguild":
+		state, err := a.resolveRequestState(request.Origin, request.SelfID)
+		if err != nil {
+			return nil, err
+		}
 		guildIDRaw, ok := request.Params.GuildID.Get()
 		if !ok {
 			return nil, server.BadRequest("guild_id is required")
 		}
 		guildID := guildIDRaw
-		dm, callErr := a.apiV1.CreateDirectMessage(requestContext(request.Origin), &dto.DirectMessageToCreate{
+		dm, callErr := state.apiV1.CreateDirectMessage(requestContext(request.Origin), &dto.DirectMessageToCreate{
 			RecipientID:   userID,
 			SourceGuildID: guildID,
 		})
@@ -950,7 +1056,11 @@ func (a *Adapter) handleUserGet(request *server.Request[server.UserGetParam]) (a
 	}
 	userID := request.Params.UserID
 
-	api := a.apiV1
+	state, err := a.resolveRequestState(request.Origin, request.SelfID)
+	if err != nil {
+		return nil, err
+	}
+	api := state.apiV1
 
 	guildID, userID := convert.SplitGuildUserCompositeID(userID)
 	if guildID == "" {

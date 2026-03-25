@@ -2,6 +2,7 @@ package event
 
 import (
 	"github.com/WindowsSov8forUs/botgo-plus/dto"
+	"github.com/satori-protocol-go/satori-go/pkg/satori/model/channel"
 	satorievent "github.com/satori-protocol-go/satori-go/pkg/satori/model/event"
 	"github.com/satori-protocol-go/satori-go/pkg/satori/model/guild"
 	"github.com/satori-protocol-go/satori-go/pkg/satori/model/login"
@@ -25,11 +26,19 @@ func (c *Converter) makeGroupRobotEvent(
 	if guildID != "" {
 		guildValue = &guild.Guild{Id: guildID}
 	}
+	var channelValue *channel.Channel
+	if guildID != "" {
+		channelValue = &channel.Channel{Id: guildID, Type: channel.ChannelTypeText}
+	}
 	return &satorievent.Event{
 		Type:      eventType,
 		Timestamp: pickEventTimestamp(data),
 		Login:     loginValue,
 		Guild:     guildValue,
+		Channel:   channelValue,
 		Operator:  operatorValue,
+		Referrer: map[string]any{
+			"event_id": valueAsString(data["id"]),
+		},
 	}
 }

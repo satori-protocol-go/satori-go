@@ -86,13 +86,15 @@ func (a *Adapter) handleWebhookRequest(w http.ResponseWriter, request *http.Requ
 	}
 
 	appID := strings.TrimSpace(request.Header.Get("X-Bot-Appid"))
-	if appID == "" || appID != a.appID {
+	state := a.stateByAppID(appID)
+	if appID == "" || state == nil {
 		http.Error(w, "unauthorized", http.StatusUnauthorized)
 		return
 	}
+	secret := state.secret
 
 	if payload.Op == dto.HTTPCallbackValidation {
-		response, validationErr := buildWebhookValidationResponse(a.cfg.Secret, payload.Data)
+		response, validationErr := buildWebhookValidationResponse(secret, payload.Data)
 		if validationErr != nil {
 			http.Error(w, validationErr.Error(), http.StatusBadRequest)
 			return
@@ -102,13 +104,16 @@ func (a *Adapter) handleWebhookRequest(w http.ResponseWriter, request *http.Requ
 	}
 
 	if !a.skipSignatureCheck {
-		if verifyErr := verifyWebhookSignature(a.cfg.Secret, request.Header, body); verifyErr != nil {
+		if verifyErr := verifyWebhookSignature(secret, request.Header, body); verifyErr != nil {
 			http.Error(w, "invalid signature", http.StatusUnauthorized)
 			return
 		}
 	}
 
-	evt, convertErr := a.convertWebhookPayload(request.Context(), payload)
+	if strings.HasPrefix(string(payload.Type), "MESSAGE_AUDIT_") {
+		a.captureAuditResult(payload.Data)
+	}
+	evt, convertErr := a.convertWebhookPayload(withAppID(request.Context(), appID), payload)
 	if convertErr != nil {
 		http.Error(w, convertErr.Error(), http.StatusBadRequest)
 		return

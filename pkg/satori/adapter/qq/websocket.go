@@ -10,10 +10,13 @@ import (
 	"net/http"
 	"runtime"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/WindowsSov8forUs/botgo-plus/dto"
 	"github.com/gorilla/websocket"
+	"github.com/satori-protocol-go/satori-go/pkg/satori/model/event"
+	"github.com/satori-protocol-go/satori-go/pkg/satori/model/login"
 )
 
 var (
@@ -25,56 +28,110 @@ type wsPayloadDataEnvelope struct {
 	Data json.RawMessage `json:"d,omitempty"`
 }
 
+type wsShardTarget struct {
+	ID    uint32
+	Count uint32
+}
+
+type wsShardSession struct {
+	sessionID string
+	sequence  int64
+	hasSeq    bool
+}
+
 func (a *Adapter) Block(ctx context.Context) error {
 	if !a.wsEnabled {
 		<-ctx.Done()
 		return nil
 	}
+	state := a.primaryState()
+	if state == nil || state.apiV1 == nil {
+		return errors.New("qq websocket requires a valid app state")
+	}
 
+	gatewayURL, targets, startupInterval, err := a.resolveWebSocketTargets(ctx, state)
+	if err != nil {
+		return err
+	}
+
+	var wg sync.WaitGroup
+	for index, target := range targets {
+		if index > 0 && startupInterval > 0 {
+			timer := time.NewTimer(startupInterval)
+			select {
+			case <-ctx.Done():
+				timer.Stop()
+				wg.Wait()
+				return nil
+			case <-timer.C:
+			}
+		}
+		wg.Add(1)
+		go func(target wsShardTarget) {
+			defer wg.Done()
+			a.runShardLoop(ctx, state, gatewayURL, target)
+		}(target)
+	}
+
+	<-ctx.Done()
+	a.closeAllWSConnections()
+	wg.Wait()
+	return nil
+}
+
+func (a *Adapter) Cleanup(_ context.Context) error {
+	a.closeAllWSConnections()
+	for _, appID := range a.sortedAppIDs() {
+		a.publishLoginLifecycleByApp(appID, login.LoginStatusOffline, event.EventTypeLoginRemoved, true)
+	}
+	return nil
+}
+
+func (a *Adapter) runShardLoop(ctx context.Context, state *appState, gatewayURL string, target wsShardTarget) {
+	session := &wsShardSession{}
 	for {
 		if ctx.Err() != nil {
-			return nil
+			return
 		}
 
-		err := a.runWebSocketSession(ctx)
+		err := a.runWebSocketSession(ctx, state, gatewayURL, target, session)
 		if ctx.Err() != nil {
-			return nil
+			return
 		}
 		if err != nil {
-			log.Printf("[qq-adapter] websocket disconnected: %v", err)
+			log.Printf("[qq-adapter] websocket disconnected shard=%d/%d: %v", target.ID, target.Count, err)
 		}
+
+		a.publishLoginLifecycleByApp(state.appID, login.LoginStatusReconnect, event.EventTypeLoginUpdated, true)
 
 		timer := time.NewTimer(a.wsReconnect)
 		select {
 		case <-ctx.Done():
 			timer.Stop()
-			return nil
+			return
 		case <-timer.C:
 		}
 	}
 }
 
-func (a *Adapter) Cleanup(_ context.Context) error {
-	a.closeWSConnection()
-	return nil
-}
-
-func (a *Adapter) runWebSocketSession(ctx context.Context) error {
-	gatewayURL, shardID, shardCount, err := a.resolveWebSocketGateway(ctx)
-	if err != nil {
-		return err
-	}
-
+func (a *Adapter) runWebSocketSession(
+	ctx context.Context,
+	state *appState,
+	gatewayURL string,
+	target wsShardTarget,
+	session *wsShardSession,
+) error {
 	dialer := websocket.Dialer{
 		HandshakeTimeout: a.wsHandshake,
 		Proxy:            http.ProxyFromEnvironment,
 	}
-	conn, _, err := dialer.DialContext(ctx, gatewayURL, nil)
+	conn, _, err := dialer.DialContext(withAppID(ctx, state.appID), gatewayURL, nil)
 	if err != nil {
 		return err
 	}
-	a.setWSConnection(conn)
-	defer a.clearWSConnection(conn)
+	key := wsShardKey(state.appID, target.ID, target.Count)
+	a.setWSConnection(key, conn)
+	defer a.clearWSConnection(key, conn)
 
 	hello, err := readWSHello(conn)
 	if err != nil {
@@ -84,13 +141,14 @@ func (a *Adapter) runWebSocketSession(ctx context.Context) error {
 		hello.HeartbeatInterval = int((30 * time.Second) / time.Millisecond)
 	}
 
-	if err := a.authenticateWS(ctx, conn, shardID, shardCount); err != nil {
+	if err := a.authenticateWS(withAppID(ctx, state.appID), conn, state, target, session); err != nil {
 		return err
 	}
+	a.publishLoginLifecycleByApp(state.appID, login.LoginStatusOnline, event.EventTypeLoginUpdated, true)
 
 	heartbeatCtx, cancelHeartbeat := context.WithCancel(ctx)
 	defer cancelHeartbeat()
-	go a.heartbeatWS(heartbeatCtx, conn, time.Duration(hello.HeartbeatInterval)*time.Millisecond)
+	go a.heartbeatWS(heartbeatCtx, conn, time.Duration(hello.HeartbeatInterval)*time.Millisecond, session)
 
 	for {
 		if ctx.Err() != nil {
@@ -102,7 +160,8 @@ func (a *Adapter) runWebSocketSession(ctx context.Context) error {
 		}
 
 		if sequence, ok := payloadSequence(payload); ok {
-			a.setWSSequence(sequence, true)
+			session.sequence = sequence
+			session.hasSeq = true
 		}
 
 		switch payload.OPCode {
@@ -111,18 +170,27 @@ func (a *Adapter) runWebSocketSession(ctx context.Context) error {
 		case dto.WSReconnect:
 			return errWSReconnect
 		case dto.WSInvalidSession:
-			a.clearWSSession()
+			session.sessionID = ""
+			session.sequence = 0
+			session.hasSeq = false
 			return errWSInvalidSession
 		case dto.DispatchEvent:
 			if payload.Type == "READY" {
 				ready := &dto.WSReadyData{}
 				if err := json.Unmarshal(rawData, ready); err == nil && strings.TrimSpace(ready.SessionID) != "" {
-					a.setWSSession(ready.SessionID)
+					session.sessionID = strings.TrimSpace(ready.SessionID)
 				}
 				continue
 			}
 
-			evt, convertErr := a.converter.Convert(ctx, payload.OPCode, payload.Type, rawData)
+			if strings.HasPrefix(string(payload.Type), "MESSAGE_AUDIT_") {
+				a.captureAuditResult(rawData)
+			}
+			if payload.Type == dto.EventInteractionCreate {
+				a.ackInteraction(withAppID(ctx, state.appID), state, rawData)
+			}
+
+			evt, convertErr := a.converter.Convert(withAppID(ctx, state.appID), payload.OPCode, payload.Type, rawData)
 			if convertErr != nil {
 				log.Printf("[qq-adapter] websocket event convert failed: %v", convertErr)
 				continue
@@ -134,54 +202,73 @@ func (a *Adapter) runWebSocketSession(ctx context.Context) error {
 	}
 }
 
-func (a *Adapter) resolveWebSocketGateway(ctx context.Context) (string, uint32, uint32, error) {
+func (a *Adapter) resolveWebSocketTargets(
+	ctx context.Context,
+	state *appState,
+) (string, []wsShardTarget, time.Duration, error) {
 	gatewayURL := strings.TrimSpace(a.wsGatewayURL)
-	shardCount := a.wsShardCount
+	var gatewayInfo *dto.WebsocketAP
 	if gatewayURL == "" {
-		info, err := a.apiV1.WS(ctx, nil, "")
+		info, err := state.apiV1.WS(withAppID(ctx, state.appID), nil, "")
 		if err != nil {
-			return "", 0, 0, err
+			return "", nil, 0, err
 		}
 		if info == nil || strings.TrimSpace(info.URL) == "" {
-			return "", 0, 0, errors.New("qq gateway url is empty")
+			return "", nil, 0, errors.New("qq gateway url is empty")
+		}
+		if info.SessionStartLimit.Remaining == 0 {
+			return "", nil, 0, errors.New("qq gateway session start limit reached")
 		}
 		gatewayURL = strings.TrimSpace(info.URL)
-		if shardCount == 0 {
-			shardCount = info.Shards
-		}
+		gatewayInfo = info
 	}
 
-	if shardCount == 0 {
-		shardCount = 1
+	targets := []wsShardTarget{}
+	if a.wsShardCount > 0 {
+		shardID := a.wsShardID
+		if shardID >= a.wsShardCount {
+			shardID = 0
+		}
+		targets = append(targets, wsShardTarget{ID: shardID, Count: a.wsShardCount})
+	} else {
+		shards := uint32(1)
+		if gatewayInfo != nil && gatewayInfo.Shards > 0 {
+			shards = gatewayInfo.Shards
+		}
+		for i := uint32(0); i < shards; i++ {
+			targets = append(targets, wsShardTarget{ID: i, Count: shards})
+		}
 	}
-	shardID := a.wsShardID
-	if shardID >= shardCount {
-		shardID = 0
+	if len(targets) == 0 {
+		targets = append(targets, wsShardTarget{ID: 0, Count: 1})
 	}
-	return gatewayURL, shardID, shardCount, nil
+
+	startupInterval := time.Second
+	if gatewayInfo != nil && gatewayInfo.SessionStartLimit.MaxConcurrency > 0 {
+		startupInterval = time.Duration(gatewayInfo.SessionStartLimit.MaxConcurrency) * time.Second
+	}
+	return gatewayURL, targets, startupInterval, nil
 }
 
 func (a *Adapter) authenticateWS(
 	ctx context.Context,
 	conn *websocket.Conn,
-	shardID uint32,
-	shardCount uint32,
+	state *appState,
+	target wsShardTarget,
+	session *wsShardSession,
 ) error {
-	tokenValue, err := a.currentAuthorizationToken(ctx)
+	tokenValue, err := a.currentAuthorizationToken(ctx, state.selfID)
 	if err != nil {
 		return err
 	}
 
-	sessionID, hasSession := a.currentWSSession()
-	seq, hasSeq := a.currentWSSequence()
-
-	if hasSession {
+	if strings.TrimSpace(session.sessionID) != "" {
 		resume := &dto.WSResumeData{
 			Token:     tokenValue,
-			SessionID: sessionID,
-			Seq:       uint32(seq),
+			SessionID: session.sessionID,
+			Seq:       uint32(session.sequence),
 		}
-		if !hasSeq {
+		if !session.hasSeq {
 			resume.Seq = 0
 		}
 		payload := &dto.Payload{
@@ -194,7 +281,7 @@ func (a *Adapter) authenticateWS(
 	identity := &dto.WSIdentityData{
 		Token:   tokenValue,
 		Intents: dto.Intent(a.wsIntents),
-		Shard:   []uint32{shardID, shardCount},
+		Shard:   []uint32{target.ID, target.Count},
 	}
 	identity.Properties.Os = runtime.GOOS
 	identity.Properties.Browser = "satori-go"
@@ -213,10 +300,13 @@ func (a *Adapter) authenticateWS(
 		return err
 	}
 	if sequence, ok := payloadSequence(response); ok {
-		a.setWSSequence(sequence, true)
+		session.sequence = sequence
+		session.hasSeq = true
 	}
 	if response.OPCode == dto.WSInvalidSession {
-		a.clearWSSession()
+		session.sessionID = ""
+		session.sequence = 0
+		session.hasSeq = false
 		return errWSInvalidSession
 	}
 	if response.OPCode != dto.DispatchEvent || response.Type != "READY" {
@@ -225,12 +315,17 @@ func (a *Adapter) authenticateWS(
 
 	ready := &dto.WSReadyData{}
 	if err := json.Unmarshal(rawData, ready); err == nil && strings.TrimSpace(ready.SessionID) != "" {
-		a.setWSSession(ready.SessionID)
+		session.sessionID = strings.TrimSpace(ready.SessionID)
 	}
 	return nil
 }
 
-func (a *Adapter) heartbeatWS(ctx context.Context, conn *websocket.Conn, interval time.Duration) {
+func (a *Adapter) heartbeatWS(
+	ctx context.Context,
+	conn *websocket.Conn,
+	interval time.Duration,
+	session *wsShardSession,
+) {
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 
@@ -239,17 +334,15 @@ func (a *Adapter) heartbeatWS(ctx context.Context, conn *websocket.Conn, interva
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			_, hasSession := a.currentWSSession()
-			if !hasSession {
+			if strings.TrimSpace(session.sessionID) == "" {
 				continue
 			}
-			seq, hasSeq := a.currentWSSequence()
 			payload := map[string]any{
 				"op": dto.WSHeartbeat,
 				"d":  nil,
 			}
-			if hasSeq {
-				payload["d"] = seq
+			if session.hasSeq {
+				payload["d"] = session.sequence
 			}
 			if err := a.writeWSJSON(conn, payload); err != nil {
 				_ = conn.Close()
@@ -259,22 +352,35 @@ func (a *Adapter) heartbeatWS(ctx context.Context, conn *websocket.Conn, interva
 	}
 }
 
-func (a *Adapter) currentAuthorizationToken(ctx context.Context) (string, error) {
-	if a.token == nil {
+func (a *Adapter) currentAuthorizationToken(ctx context.Context, selfID string) (string, error) {
+	state := a.stateByAppID(appIDFromContext(ctx))
+	if state == nil && strings.TrimSpace(selfID) != "" {
+		state, _ = a.resolveStateBySelfID(ctx, selfID)
+	}
+	if state == nil {
+		state = a.stateFromContextOrEvent(ctx, "")
+	}
+	if state == nil {
+		state = a.primaryState()
+	}
+	if state == nil || state.token == nil {
 		return "", errors.New("qq token is not configured")
 	}
 
-	tokenValue := strings.TrimSpace(a.token.GetString())
+	tokenValue := strings.TrimSpace(state.token.GetString())
 	if isAuthorizationTokenValid(tokenValue) {
 		return tokenValue, nil
 	}
-	if err := a.token.InitToken(ctx); err == nil {
-		tokenValue = strings.TrimSpace(a.token.GetString())
+	if err := state.token.InitToken(ctx); err == nil {
+		tokenValue = strings.TrimSpace(state.token.GetString())
 		if isAuthorizationTokenValid(tokenValue) {
 			return tokenValue, nil
 		}
 	}
 
+	if direct := strings.TrimSpace(state.directToken); direct != "" {
+		return "QQBot " + direct, nil
+	}
 	if direct := strings.TrimSpace(a.cfg.Token); direct != "" {
 		return "QQBot " + direct, nil
 	}
@@ -364,25 +470,45 @@ var wsIntentByName = map[string]dto.Intent{
 	"GUILD_MEMBERS":           dto.IntentGuildMembers,
 	"GUILD_MESSAGES":          dto.IntentGuildMessages,
 	"GUILD_MESSAGE_REACTIONS": dto.IntentGuildMessageReactions,
+	"GUILD_MESSAGE_REACTION":  dto.IntentGuildMessageReactions,
 	"DIRECT_MESSAGES":         dto.IntentDirectMessages,
+	"DIRECT_MESSAGE":          dto.IntentDirectMessages,
 	"GROUP_AND_C2C_EVENT":     dto.IntentGroupAndC2CEvent,
+	"C2C_GROUP_AT_MESSAGES":   dto.IntentGroupAndC2CEvent,
+	"USER_MESSAGES":           dto.IntentGroupAndC2CEvent,
 	"INTERACTION":             dto.IntentInteraction,
 	"MESSAGE_AUDIT":           dto.IntentMessageAudit,
 	"FORUM_EVENT":             dto.IntentForumEvent,
+	"FORUMS_EVENT":            dto.IntentForumEvent,
+	"OPEN_FORUM_EVENT":        dto.IntentForumEvent,
+	"OPEN_FORUMS_EVENT":       dto.IntentForumEvent,
 	"AUDIO_ACTION":            dto.IntentAudioAction,
+	"AUDIO_LIVE_MEMBER":       dto.IntentAudioAction,
+	"AUDIO_OR_LIVE_CHANNEL_MEMBER": dto.IntentAudioAction,
 	"AT_MESSAGES":             dto.IntentPublicGuildMessages,
+	"PUBLIC_GUILD_MESSAGES":   dto.IntentPublicGuildMessages,
 }
 
-func (a *Adapter) setWSConnection(conn *websocket.Conn) {
+func wsShardKey(appID string, shardID uint32, shardCount uint32) string {
+	return fmt.Sprintf("%s:%d/%d", strings.TrimSpace(appID), shardID, shardCount)
+}
+
+func (a *Adapter) setWSConnection(key string, conn *websocket.Conn) {
 	a.wsConnMu.Lock()
 	a.wsConn = conn
+	if a.wsConns == nil {
+		a.wsConns = map[string]*websocket.Conn{}
+	}
+	a.wsConns[key] = conn
 	a.wsConnMu.Unlock()
 }
 
-func (a *Adapter) clearWSConnection(conn *websocket.Conn) {
+func (a *Adapter) clearWSConnection(key string, conn *websocket.Conn) {
 	a.wsConnMu.Lock()
-	current := a.wsConn
-	if current == conn {
+	if current, ok := a.wsConns[key]; ok && current == conn {
+		delete(a.wsConns, key)
+	}
+	if a.wsConn == conn {
 		a.wsConn = nil
 	}
 	a.wsConnMu.Unlock()
@@ -391,48 +517,82 @@ func (a *Adapter) clearWSConnection(conn *websocket.Conn) {
 	}
 }
 
-func (a *Adapter) closeWSConnection() {
+func (a *Adapter) closeAllWSConnections() {
 	a.wsConnMu.Lock()
-	conn := a.wsConn
+	connections := make([]*websocket.Conn, 0, len(a.wsConns)+1)
+	for _, conn := range a.wsConns {
+		if conn != nil {
+			connections = append(connections, conn)
+		}
+	}
+	if a.wsConn != nil {
+		connections = append(connections, a.wsConn)
+	}
+	a.wsConns = map[string]*websocket.Conn{}
 	a.wsConn = nil
 	a.wsConnMu.Unlock()
-	if conn != nil {
+	for _, conn := range connections {
 		_ = conn.Close()
 	}
 }
 
-func (a *Adapter) setWSSession(sessionID string) {
-	a.wsConnMu.Lock()
-	a.wsSession = strings.TrimSpace(sessionID)
-	a.wsConnMu.Unlock()
+func (a *Adapter) closeWSConnection() {
+	a.closeAllWSConnections()
 }
 
-func (a *Adapter) clearWSSession() {
-	a.wsConnMu.Lock()
-	a.wsSession = ""
-	a.wsSequence = 0
-	a.wsHasSeq = false
-	a.wsConnMu.Unlock()
-}
-
-func (a *Adapter) currentWSSession() (string, bool) {
-	a.wsConnMu.RLock()
-	defer a.wsConnMu.RUnlock()
-	if strings.TrimSpace(a.wsSession) == "" {
-		return "", false
+func (a *Adapter) publishLoginLifecycleByApp(
+	appID string,
+	status login.LoginStatus,
+	eventType event.EventType,
+	remove bool,
+) {
+	appID = strings.TrimSpace(appID)
+	a.mu.Lock()
+	events := make([]*event.Event, 0, 4)
+	filtered := make([]*login.Login, 0, len(a.logins))
+	for _, item := range a.logins {
+		if item == nil || item.User == nil {
+			continue
+		}
+		owner := a.selfToApp[item.User.Id]
+		if owner != appID {
+			filtered = append(filtered, item)
+			continue
+		}
+		item.Status = status
+		events = append(events, &event.Event{
+			Type:      eventType,
+			Timestamp: time.Now().UnixMilli(),
+			Login:     cloneLogin(item),
+		})
+		if !remove {
+			filtered = append(filtered, item)
+		}
 	}
-	return a.wsSession, true
+	if remove {
+		a.logins = filtered
+		for selfID, owner := range a.selfToApp {
+			if owner == appID {
+				delete(a.selfToApp, selfID)
+			}
+		}
+	}
+	a.mu.Unlock()
+	for _, item := range events {
+		a.pushEvent(item)
+	}
 }
 
-func (a *Adapter) setWSSequence(sequence int64, ok bool) {
-	a.wsConnMu.Lock()
-	a.wsSequence = sequence
-	a.wsHasSeq = ok
-	a.wsConnMu.Unlock()
-}
-
-func (a *Adapter) currentWSSequence() (int64, bool) {
-	a.wsConnMu.RLock()
-	defer a.wsConnMu.RUnlock()
-	return a.wsSequence, a.wsHasSeq
+func (a *Adapter) ackInteraction(ctx context.Context, state *appState, rawData json.RawMessage) {
+	if state == nil || state.apiV1 == nil {
+		return
+	}
+	interaction := &dto.Interaction{}
+	if err := json.Unmarshal(rawData, interaction); err != nil {
+		return
+	}
+	if strings.TrimSpace(interaction.ID) == "" {
+		return
+	}
+	_ = state.apiV1.PutInteraction(ctx, interaction.ID, `{"code":0}`)
 }

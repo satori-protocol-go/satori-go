@@ -92,7 +92,8 @@ func (c *Converter) makeInteractionEvent(
 		Timestamp: timestamp,
 		Login:     currentLogin,
 		Button: &interaction.Button{
-			Id: interactionValue.Data.Resolved.ButtonID,
+			Id:   interactionValue.Data.Resolved.ButtonID,
+			Data: interactionValue.Data.Resolved.ButtonData,
 		},
 		Channel: channelValue,
 		Guild:   guildValue,

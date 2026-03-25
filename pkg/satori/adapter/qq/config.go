@@ -21,10 +21,6 @@ const (
 const defaultWSIntents = int64(
 	dto.IntentGuilds |
 		dto.IntentGuildMembers |
-		dto.IntentGuildMessageReactions |
-		dto.IntentGroupAndC2CEvent |
-		dto.IntentInteraction |
-		dto.IntentMessageAudit |
 		dto.IntentPublicGuildMessages,
 )
 
@@ -40,17 +36,12 @@ var defaultQQGuildFeatures = []string{
 	"channel.get",
 	"channel.list",
 	"channel.create",
-	"channel.update",
-	"channel.delete",
 	"message.create",
-	"message.update",
 	"message.delete",
 	"message.get",
-	"message.list",
 	"reaction.create",
 	"reaction.delete",
 	"reaction.list",
-	"reaction.clear",
 	"upload.create",
 	"guild.get",
 	"guild.list",
@@ -58,21 +49,29 @@ var defaultQQGuildFeatures = []string{
 	"guild.member.list",
 	"guild.member.kick",
 	"guild.member.mute",
-	"guild.member.role.set",
-	"guild.member.role.unset",
-	"guild.role.list",
-	"guild.role.create",
-	"guild.role.update",
-	"guild.role.delete",
 	"login.get",
 	"user.get",
 	"user.channel.create",
+}
+
+type AppConfig struct {
+	AppID  uint64
+	Secret string
+	Token  string
+
+	TokenURL string
+
+	TokenInstance *token.Token
+	APIV1         openapi.OpenAPI
+	APIV2         openapi.OpenAPI
 }
 
 type Config struct {
 	AppID  uint64
 	Secret string
 	Token  string
+
+	Apps []AppConfig
 
 	TokenURL string
 	Sandbox  bool

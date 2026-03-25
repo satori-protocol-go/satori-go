@@ -26,6 +26,18 @@ type MessageSegment struct {
 	Text     string
 	QuoteID  string
 	Resource *MessageResource
+	ArkJSON  string
+	Markdown bool
+	Buttons  [][]MessageButton
+}
+
+type MessageButton struct {
+	Id    string
+	Type  string
+	Href  string
+	Text  string
+	Theme string
+	Label string
 }
 
 func ParseMessageSegments(content string, platform string) []MessageSegment {
@@ -108,7 +120,23 @@ func (p *qqMessageParser) walk(elements []element.Element) {
 		case *element.File:
 			p.appendResource(MessageResourceFile, typed.Src)
 		case *element.Extension:
+			if p.tryAppendExtendedSegment(typed) {
+				continue
+			}
 			p.writeText(p.renderExtension(typed))
+			p.walk(typed.Children())
+		case *element.Button:
+			// Buttons are only meaningful in qq markdown mode.
+			if p.platform == "qq" {
+				p.flushText()
+				row := []MessageButton{parseMessageButton(typed)}
+				p.segments = append(p.segments, MessageSegment{
+					QuoteID:  p.consumeQuote(),
+					Markdown: true,
+					Buttons:  [][]MessageButton{row},
+				})
+				continue
+			}
 			p.walk(typed.Children())
 		default:
 			p.walk(typed.Children())
@@ -186,4 +214,115 @@ func (p *qqMessageParser) renderExtension(input *element.Extension) string {
 		}
 	}
 	return ""
+}
+
+func (p *qqMessageParser) tryAppendExtendedSegment(input *element.Extension) bool {
+	if input == nil || p.platform != "qq" {
+		return false
+	}
+	switch input.Tag() {
+	case "qq:ark":
+		p.flushText()
+		raw := strings.TrimSpace(flattenElementsText(input.Children()))
+		if raw == "" {
+			return true
+		}
+		p.segments = append(p.segments, MessageSegment{
+			QuoteID: p.consumeQuote(),
+			ArkJSON: raw,
+		})
+		return true
+	case "markdown":
+		p.flushText()
+		text := strings.TrimSpace(flattenElementsText(input.Children()))
+		p.segments = append(p.segments, MessageSegment{
+			QuoteID:  p.consumeQuote(),
+			Text:     text,
+			Markdown: true,
+		})
+		return true
+	case "qq:button-group":
+		p.flushText()
+		rows := parseButtonRows(input.Children())
+		if len(rows) == 0 {
+			return true
+		}
+		p.segments = append(p.segments, MessageSegment{
+			QuoteID:  p.consumeQuote(),
+			Markdown: true,
+			Buttons:  rows,
+		})
+		return true
+	default:
+		return false
+	}
+}
+
+func parseMessageButton(input *element.Button) MessageButton {
+	if input == nil {
+		return MessageButton{}
+	}
+	return MessageButton{
+		Id:    strings.TrimSpace(input.Id),
+		Type:  strings.TrimSpace(input.Type),
+		Href:  strings.TrimSpace(input.Href),
+		Text:  strings.TrimSpace(input.Text),
+		Theme: strings.TrimSpace(input.Theme),
+		Label: strings.TrimSpace(flattenElementsText(input.Children())),
+	}
+}
+
+func parseButtonRows(elements []element.Element) [][]MessageButton {
+	rows := [][]MessageButton{}
+	current := []MessageButton{}
+	push := func() {
+		if len(current) == 0 {
+			return
+		}
+		row := make([]MessageButton, len(current))
+		copy(row, current)
+		rows = append(rows, row)
+		current = current[:0]
+	}
+	for _, item := range elements {
+		switch typed := item.(type) {
+		case *element.Button:
+			current = append(current, parseMessageButton(typed))
+			if len(current) >= 5 {
+				push()
+			}
+		case *element.Br:
+			push()
+		case *element.P:
+			push()
+			childRows := parseButtonRows(typed.Children())
+			rows = append(rows, childRows...)
+		default:
+			childRows := parseButtonRows(typed.Children())
+			if len(childRows) > 0 {
+				push()
+				rows = append(rows, childRows...)
+			}
+		}
+	}
+	push()
+	return rows
+}
+
+func flattenElementsText(elements []element.Element) string {
+	var builder strings.Builder
+	for _, item := range elements {
+		if item == nil {
+			continue
+		}
+		switch typed := item.(type) {
+		case *element.Text:
+			builder.WriteString(typed.Text)
+		case *element.Br:
+			builder.WriteString("\n")
+		default:
+			builder.WriteString(flattenElementsText(typed.Children()))
+		}
+	}
+	return builder.String()
 }

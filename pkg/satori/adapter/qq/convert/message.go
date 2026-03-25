@@ -1,6 +1,7 @@
 package convert
 
 import (
+	"encoding/json"
 	"fmt"
 	"regexp"
 	"strings"
@@ -81,6 +82,9 @@ func messageContentFromDTO(input *dto.Message) string {
 	}
 
 	chunks := []string{}
+	if input.MentionEveryone {
+		chunks = append(chunks, `<at type="all"/>`)
+	}
 	if content != "" {
 		chunks = append(chunks, content)
 	}
@@ -104,6 +108,22 @@ func messageContentFromDTO(input *dto.Message) string {
 			chunks = append(chunks, fmt.Sprintf(`<video src="%s"/>`, src))
 		default:
 			chunks = append(chunks, fmt.Sprintf(`<file src="%s"/>`, src))
+		}
+	}
+	for _, embed := range input.Embeds {
+		if embed == nil {
+			continue
+		}
+		raw, err := json.Marshal(embed)
+		if err != nil {
+			continue
+		}
+		chunks = append(chunks, fmt.Sprintf(`<qq:embed data='%s'/>`, strings.ReplaceAll(string(raw), `'`, "&apos;")))
+	}
+	if input.Ark != nil {
+		raw, err := json.Marshal(input.Ark)
+		if err == nil {
+			chunks = append(chunks, fmt.Sprintf(`<qq:ark>%s</qq:ark>`, string(raw)))
 		}
 	}
 	return strings.TrimSpace(strings.Join(chunks, " "))

@@ -11,6 +11,7 @@ import (
 	"github.com/satori-protocol-go/satori-go/pkg/satori/model/event"
 	"github.com/satori-protocol-go/satori-go/pkg/satori/model/login"
 	"github.com/satori-protocol-go/satori-go/pkg/satori/model/user"
+	"github.com/satori-protocol-go/satori-go/pkg/satori/server"
 )
 
 func (a *Adapter) ensureLogins(ctx context.Context) error {
@@ -24,46 +25,86 @@ func (a *Adapter) ensureLogins(ctx context.Context) error {
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	me, err := a.apiV1.Me(ctx)
-	if err != nil {
-		return err
+
+	nextLogins := []*login.Login{}
+	nextSelfToApp := map[string]string{}
+	fallbackSelfID := ""
+	var firstErr error
+	for _, appID := range a.sortedAppIDs() {
+		state := a.appStates[appID]
+		if state == nil || state.apiV1 == nil {
+			continue
+		}
+		me, err := state.apiV1.Me(withAppID(ctx, appID))
+		if err != nil {
+			if firstErr == nil {
+				firstErr = err
+			}
+			continue
+		}
+		identity := convert.UserFromDTO(me)
+		if identity == nil || strings.TrimSpace(identity.Id) == "" {
+			continue
+		}
+		identity.IsBot = true
+		selfID := strings.TrimSpace(identity.Id)
+		if fallbackSelfID == "" {
+			fallbackSelfID = selfID
+		}
+		state.selfID = selfID
+		nextSelfToApp[selfID] = appID
+
+		nextLogins = append(nextLogins, &login.Login{
+			Platform: "qq",
+			User:     copyUser(identity),
+			Status:   login.LoginStatusOnline,
+			Adapter:  a.adapterName,
+			Features: copyStrings(a.qqFeatures),
+		})
+		nextLogins = append(nextLogins, &login.Login{
+			Platform: "qqguild",
+			User:     copyUser(identity),
+			Status:   login.LoginStatusOnline,
+			Adapter:  a.adapterName,
+			Features: copyStrings(a.qqGuildFeatures),
+		})
 	}
 
-	identity := convert.UserFromDTO(me)
-	identity.IsBot = true
+	if len(nextLogins) == 0 {
+		if firstErr != nil {
+			return firstErr
+		}
+		return server.NotFound("qq login not found")
+	}
 
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	if len(a.logins) > 0 {
 		return nil
 	}
-
-	a.selfID = identity.Id
-	a.logins = []*login.Login{
-		{
-			Platform: "qq",
-			User:     copyUser(identity),
-			Status:   login.LoginStatusOnline,
-			Adapter:  a.adapterName,
-			Features: copyStrings(a.qqFeatures),
-		},
-		{
-			Platform: "qqguild",
-			User:     copyUser(identity),
-			Status:   login.LoginStatusOnline,
-			Adapter:  a.adapterName,
-			Features: copyStrings(a.qqGuildFeatures),
-		},
-	}
+	a.logins = nextLogins
+	a.selfToApp = nextSelfToApp
+	a.selfID = fallbackSelfID
 	return nil
 }
 
 func (a *Adapter) loginForEventType(ctx context.Context, eventType string) *login.Login {
 	platform := platformByEventType(eventType)
+	state := a.stateFromContextOrEvent(ctx, eventType)
 	if err := a.ensureLogins(ctx); err != nil {
-		fallbackID := a.selfID
+		fallbackID := ""
+		if state != nil {
+			fallbackID = strings.TrimSpace(state.selfID)
+		}
 		if fallbackID == "" {
-			fallbackID = a.appID
+			fallbackID = a.selfID
+		}
+		if fallbackID == "" {
+			if state != nil {
+				fallbackID = state.appID
+			} else {
+				fallbackID = a.appID
+			}
 		}
 		features := a.qqGuildFeatures
 		if platform == "qq" {
@@ -81,15 +122,13 @@ func (a *Adapter) loginForEventType(ctx context.Context, eventType string) *logi
 		}
 	}
 
-	a.mu.RLock()
-	defer a.mu.RUnlock()
-	for _, item := range a.logins {
-		if item == nil {
-			continue
+	if state != nil {
+		if loginValue := a.findLoginInState(platform, state.appID); loginValue != nil {
+			return loginValue
 		}
-		if item.Platform == platform {
-			return cloneLogin(item)
-		}
+	}
+	if loginValue := a.findLoginInState(platform, a.primaryAppID); loginValue != nil {
+		return loginValue
 	}
 	return nil
 }
@@ -98,16 +137,15 @@ func (a *Adapter) loginForPlatform(ctx context.Context, platform string) *login.
 	if strings.TrimSpace(platform) == "" {
 		return nil
 	}
+	state := a.stateFromContextOrEvent(ctx, "")
 	if err := a.ensureLogins(ctx); err == nil {
-		a.mu.RLock()
-		defer a.mu.RUnlock()
-		for _, item := range a.logins {
-			if item == nil {
-				continue
+		if state != nil {
+			if loginValue := a.findLoginInState(platform, state.appID); loginValue != nil {
+				return loginValue
 			}
-			if item.Platform == platform {
-				return cloneLogin(item)
-			}
+		}
+		if loginValue := a.findLoginInState(platform, a.primaryAppID); loginValue != nil {
+			return loginValue
 		}
 	}
 
@@ -118,13 +156,39 @@ func (a *Adapter) loginForPlatform(ctx context.Context, platform string) *login.
 	return &login.Login{
 		Platform: platform,
 		User: &user.User{
-			Id:    firstNonEmpty(a.selfID, a.appID),
+			Id:    firstNonEmpty(a.selfID, stateAppID(state), a.appID),
 			IsBot: true,
 		},
 		Status:   login.LoginStatusOnline,
 		Adapter:  a.adapterName,
 		Features: copyStrings(features),
 	}
+}
+
+func stateAppID(state *appState) string {
+	if state == nil {
+		return ""
+	}
+	return state.appID
+}
+
+func (a *Adapter) findLoginInState(platform string, appID string) *login.Login {
+	appID = strings.TrimSpace(appID)
+	if appID == "" {
+		return nil
+	}
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	for _, item := range a.logins {
+		if item == nil || item.User == nil || item.Platform != platform {
+			continue
+		}
+		if a.selfToApp[item.User.Id] != appID {
+			continue
+		}
+		return cloneLogin(item)
+	}
+	return nil
 }
 
 func (a *Adapter) findLogin(platform string, selfID string) *login.Login {
