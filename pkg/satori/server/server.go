@@ -59,6 +59,7 @@ type Config struct {
 	Path            string
 	Version         string
 	Token           string
+	ResponseHeaders http.Header
 	BaseHandler     http.Handler
 	ReplaceRouter   chi.Router
 	Webhooks        []WebhookEndpoint
@@ -101,12 +102,13 @@ type Server struct {
 
 	tempDir string
 
-	httpClient    *http.Client
-	httpServer    *http.Server
-	listener      net.Listener
-	logger        Logger
-	baseHandler   http.Handler
-	replaceRouter chi.Router
+	httpClient     *http.Client
+	httpServer     *http.Server
+	listener       net.Listener
+	logger         Logger
+	responseHeader http.Header
+	baseHandler    http.Handler
+	replaceRouter  chi.Router
 
 	runMu     sync.Mutex
 	running   bool
@@ -186,6 +188,7 @@ func NewServer(cfg Config) (*Server, error) {
 		tempDir:                tempDir,
 		httpClient:             httpClient,
 		logger:                 logger,
+		responseHeader:         cloneHTTPHeader(cfg.ResponseHeaders),
 		baseHandler:            cfg.BaseHandler,
 		replaceRouter:          cfg.ReplaceRouter,
 		registeredRouteTargets: map[uintptr]struct{}{},
@@ -205,6 +208,70 @@ func (s *Server) RegisterLogger(logger Logger) {
 	s.mu.Lock()
 	s.logger = logger
 	s.mu.Unlock()
+}
+
+func (s *Server) SetResponseHeader(key string, value string) {
+	key = strings.TrimSpace(key)
+	if key == "" {
+		return
+	}
+	s.mu.Lock()
+	if s.responseHeader == nil {
+		s.responseHeader = http.Header{}
+	}
+	s.responseHeader.Set(key, value)
+	s.mu.Unlock()
+}
+
+func (s *Server) AddResponseHeader(key string, value string) {
+	key = strings.TrimSpace(key)
+	if key == "" {
+		return
+	}
+	s.mu.Lock()
+	if s.responseHeader == nil {
+		s.responseHeader = http.Header{}
+	}
+	s.responseHeader.Add(key, value)
+	s.mu.Unlock()
+}
+
+func (s *Server) SetResponseHeaders(header http.Header) {
+	s.mu.Lock()
+	s.responseHeader = cloneHTTPHeader(header)
+	s.mu.Unlock()
+}
+
+func (s *Server) ResponseHeaders() http.Header {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return cloneHTTPHeader(s.responseHeader)
+}
+
+func (s *Server) applyResponseHeaders(w http.ResponseWriter) {
+	if w == nil {
+		return
+	}
+	headers := s.ResponseHeaders()
+	for key, values := range headers {
+		if len(values) == 0 {
+			continue
+		}
+		w.Header().Del(key)
+		for _, value := range values {
+			w.Header().Add(key, value)
+		}
+	}
+}
+
+func (s *Server) wrapResponseHeaders(next http.Handler) http.Handler {
+	if next == nil {
+		return nil
+	}
+	return http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		s.applyResponseHeaders(w)
+		next.ServeHTTP(w, request)
+	})
 }
 
 func (s *Server) ReplaceRouter(router chi.Router) {
@@ -293,7 +360,7 @@ func (s *Server) Handler() (http.Handler, error) {
 		if err := s.RegisterRoutes(replaceRouter); err != nil {
 			return nil, err
 		}
-		return replaceRouter, nil
+		return s.wrapResponseHeaders(replaceRouter), nil
 	}
 
 	router := chi.NewRouter()
@@ -304,7 +371,7 @@ func (s *Server) Handler() (http.Handler, error) {
 		router.NotFound(baseHandler.ServeHTTP)
 		router.MethodNotAllowed(baseHandler.ServeHTTP)
 	}
-	return router, nil
+	return s.wrapResponseHeaders(router), nil
 }
 
 func (s *Server) RegisterRoutes(router chi.Router) error {
@@ -1784,6 +1851,22 @@ func toInt64(value any) (int64, bool) {
 		}
 	}
 	return 0, false
+}
+
+func cloneHTTPHeader(source http.Header) http.Header {
+	if source == nil {
+		return http.Header{}
+	}
+	cloned := http.Header{}
+	for key, values := range source {
+		if len(values) == 0 {
+			continue
+		}
+		copied := make([]string, 0, len(values))
+		copied = append(copied, values...)
+		cloned[key] = copied
+	}
+	return cloned
 }
 
 func asString(value any) string {
