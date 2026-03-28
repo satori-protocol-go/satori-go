@@ -2,12 +2,12 @@ package qq
 
 import (
 	"context"
-	"log"
 	"strings"
 	"time"
 
 	"github.com/WindowsSov8forUs/botgo-plus/dto"
 	"github.com/satori-protocol-go/satori-go/pkg/satori/adapter/qq/convert"
+	"github.com/satori-protocol-go/satori-go/pkg/satori/logging"
 	"github.com/satori-protocol-go/satori-go/pkg/satori/model/event"
 	"github.com/satori-protocol-go/satori-go/pkg/satori/model/login"
 	"github.com/satori-protocol-go/satori-go/pkg/satori/model/user"
@@ -207,12 +207,28 @@ func (a *Adapter) findLogin(platform string, selfID string) *login.Login {
 
 func (a *Adapter) bootstrap(ctx context.Context) {
 	if err := a.ensureLogins(ctx); err != nil {
-		log.Printf("[qq-adapter] bootstrap login failed: %v", err)
+		a.log(ctx, logging.LevelError, "bootstrap login failed", logging.Field{Key: "error", Value: err})
 		return
 	}
+	a.log(ctx, logging.LevelInfo, "已成功连接 QQ 开放平台")
 	logins, err := a.GetLogins(ctx)
 	if err != nil {
 		return
+	}
+	welcomed := map[string]struct{}{}
+	for _, item := range logins {
+		if item == nil || item.User == nil {
+			continue
+		}
+		name := strings.TrimSpace(item.User.Name)
+		if name == "" {
+			continue
+		}
+		if _, exists := welcomed[name]; exists {
+			continue
+		}
+		welcomed[name] = struct{}{}
+		a.log(ctx, logging.LevelInfo, "欢迎使用机器人", logging.Field{Key: "name", Value: name})
 	}
 	for _, item := range logins {
 		if item == nil {

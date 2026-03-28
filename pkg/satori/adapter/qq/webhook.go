@@ -15,6 +15,7 @@ import (
 	"github.com/WindowsSov8forUs/botgo-plus/dto"
 	"github.com/WindowsSov8forUs/botgo-plus/interaction/signature"
 	"github.com/go-chi/chi/v5"
+	"github.com/satori-protocol-go/satori-go/pkg/satori/logging"
 	"github.com/satori-protocol-go/satori-go/pkg/satori/model/event"
 )
 
@@ -26,6 +27,7 @@ func (a *Adapter) RegisterRootRoutes(router chi.Router) {
 	for _, path := range normalizeWebhookPaths(a.path) {
 		router.Handle(path, handler)
 	}
+	a.log(context.Background(), logging.LevelInfo, "WebHook 监听建立成功")
 }
 
 func normalizeWebhookPath(path string) string {
@@ -119,6 +121,7 @@ func (a *Adapter) handleWebhookRequest(w http.ResponseWriter, request *http.Requ
 		return
 	}
 	if evt != nil {
+		a.logEventBySource(payload.Type, evt)
 		a.pushEvent(evt)
 	}
 	w.WriteHeader(http.StatusOK)

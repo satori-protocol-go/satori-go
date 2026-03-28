@@ -5,13 +5,13 @@ import (
 	"context"
 	"fmt"
 	"io"
-	"log"
 	"net"
 	"net/http"
 	"strings"
 	"sync"
 	"time"
 
+	"github.com/satori-protocol-go/satori-go/pkg/satori/logging"
 	"github.com/satori-protocol-go/satori-go/pkg/satori/model/event"
 	"github.com/satori-protocol-go/satori-go/pkg/satori/model/login"
 	"github.com/satori-protocol-go/satori-go/pkg/satori/model/meta"
@@ -55,7 +55,7 @@ func NewWebhook(app AppBridge, options WebhookOptions) *Webhook {
 		timeout: normalizedTimeout(options.Timeout),
 		client:  &http.Client{Timeout: normalizedTimeout(options.Timeout)},
 	}
-	network.base = newBaseNetwork(app, options.APIConfig, fmt.Sprintf("satori/net/wh/%s#%p", identity, network))
+	network.base = newBaseNetwork(app, options.APIConfig, fmt.Sprintf("satori/net/wh/%s#%p", identity, network), options.Logger)
 	return network
 }
 
@@ -139,6 +139,13 @@ func (n *Webhook) WaitForAvailable(ctx context.Context) error {
 	return n.base.WaitAvailable(ctx)
 }
 
+func (n *Webhook) SetLogger(logger logging.Logger) {
+	if n == nil || n.base == nil {
+		return
+	}
+	n.base.SetLogger(logger)
+}
+
 func (n *Webhook) fetchMeta(ctx context.Context) error {
 	endpoint := joinURLPath(n.base.Config().APIBase(), "meta")
 	body := bytes.NewReader([]byte("{}"))
@@ -210,7 +217,10 @@ func (n *Webhook) handleRequest(w http.ResponseWriter, request *http.Request) {
 	case operation.OpcodeEvent:
 		var evt event.Event
 		if err := decodeJSON(payload, &evt); err != nil {
-			log.Printf("[satori-client] failed to parse webhook event: %v", err)
+			n.base.Log(request.Context(), logging.LevelWarn, "failed to parse webhook event",
+				logging.Field{Key: "network_id", Value: n.ID()},
+				logging.Field{Key: "error", Value: err},
+			)
 			w.WriteHeader(http.StatusInternalServerError)
 			return
 		}
@@ -228,3 +238,4 @@ func (n *Webhook) handleRequest(w http.ResponseWriter, request *http.Request) {
 
 var _ Runner = (*Webhook)(nil)
 var _ Availability = (*Webhook)(nil)
+var _ LoggerSetter = (*Webhook)(nil)

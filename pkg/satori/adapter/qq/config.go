@@ -7,6 +7,7 @@ import (
 	"github.com/WindowsSov8forUs/botgo-plus/dto"
 	"github.com/WindowsSov8forUs/botgo-plus/openapi"
 	"github.com/WindowsSov8forUs/botgo-plus/token"
+	"github.com/satori-protocol-go/satori-go/pkg/satori/logging"
 )
 
 const (
@@ -95,6 +96,7 @@ type Config struct {
 	APIV1         openapi.OpenAPI
 	APIV2         openapi.OpenAPI
 	HTTPClient    *http.Client
+	Logger        logging.Logger
 
 	QQFeatures      []string
 	QQGuildFeatures []string
