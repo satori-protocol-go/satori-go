@@ -4,12 +4,12 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"log"
 	"strings"
 	"sync"
 	"sync/atomic"
 
 	clientnetwork "github.com/satori-protocol-go/satori-go/pkg/satori/client/network"
+	"github.com/satori-protocol-go/satori-go/pkg/satori/logging"
 	"github.com/satori-protocol-go/satori-go/pkg/satori/model/event"
 	"github.com/satori-protocol-go/satori-go/pkg/satori/model/login"
 )
@@ -38,22 +38,23 @@ type App struct {
 
 	defaultProtocolFactory ProtocolFactory
 	networkFactories       map[string]NetworkFactory
+	logger                 logging.Logger
 }
 
 var defaultApp atomic.Pointer[App]
 
 func NewApp(configs ...Config) (*App, error) {
-	if defaultApp.Load() != nil {
-		log.Printf("[satori-client] default app already exists and will be replaced")
-	}
-
 	app := &App{
 		accounts:         map[string]*Account{},
 		networkStates:    map[string]*networkState{},
 		networkFactories: map[string]NetworkFactory{},
+		logger:           logging.NewStdLogger(),
 		defaultProtocolFactory: func(account *Account) *APIProtocol {
 			return NewAPIProtocol(account, nil)
 		},
+	}
+	if defaultApp.Load() != nil {
+		app.log(context.Background(), logging.LevelWarn, "default app already exists and will be replaced")
 	}
 	app.registerNetworkFactoryLocked("ws", wsNetworkFactory)
 	app.registerNetworkFactoryLocked("webhook", webhookNetworkFactory)
@@ -64,6 +65,30 @@ func NewApp(configs ...Config) (*App, error) {
 	}
 	defaultApp.Store(app)
 	return app, nil
+}
+
+func (a *App) RegisterLogger(logger logging.Logger) {
+	if logger == nil {
+		logger = logging.NopLogger{}
+	}
+	a.mu.Lock()
+	a.logger = logger
+	networks := append([]clientnetwork.Runner(nil), a.networks...)
+	a.mu.Unlock()
+	for _, runner := range networks {
+		if setter, ok := runner.(clientnetwork.LoggerSetter); ok {
+			setter.SetLogger(logger)
+		}
+	}
+}
+
+func (a *App) Logger() logging.Logger {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	if a.logger == nil {
+		return logging.NopLogger{}
+	}
+	return a.logger
 }
 
 func GetApp() (*App, error) {
@@ -432,7 +457,10 @@ func (a *App) post(evt *event.Event, networkID string) {
 		a.mu.RUnlock()
 		if !ok {
 			if evt.Login == nil || evt.Login.Status != login.LoginStatusOnline {
-				log.Printf("[satori-client] received login update for unknown account: %+v", evt)
+				a.log(context.Background(), logging.LevelWarn, "received login update for unknown account",
+					logging.Field{Key: "event_type", Value: evt.Type},
+					logging.Field{Key: "event_sn", Value: evt.Sn},
+				)
 				return
 			}
 			_, account, ok = a.ensureAccount(evt.Login, networkID)
@@ -452,7 +480,10 @@ func (a *App) post(evt *event.Event, networkID string) {
 		account, ok = a.accounts[identity]
 		a.mu.RUnlock()
 		if !ok {
-			log.Printf("[satori-client] received login removed for unknown account: %+v", evt)
+			a.log(context.Background(), logging.LevelWarn, "received login removed for unknown account",
+				logging.Field{Key: "event_type", Value: evt.Type},
+				logging.Field{Key: "event_sn", Value: evt.Sn},
+			)
 			return
 		}
 	default:
@@ -464,7 +495,10 @@ func (a *App) post(evt *event.Event, networkID string) {
 		account, ok = a.accounts[identity]
 		a.mu.RUnlock()
 		if !ok {
-			log.Printf("[satori-client] received event for unknown account: %+v", evt)
+			a.log(context.Background(), logging.LevelWarn, "received event for unknown account",
+				logging.Field{Key: "event_type", Value: evt.Type},
+				logging.Field{Key: "event_sn", Value: evt.Sn},
+			)
 			return
 		}
 	}
@@ -570,6 +604,14 @@ func (a *App) ensureNetworkStateLocked(networkID string) *networkState {
 	return state
 }
 
+func (a *App) log(ctx context.Context, level logging.Level, message string, fields ...logging.Field) {
+	logger := a.Logger()
+	if logger == nil {
+		return
+	}
+	logger.Log(ctx, level, message, fields...)
+}
+
 func (a *App) dispatchEvent(account *Account, evt *event.Event) {
 	a.mu.RLock()
 	callbacks := append([]EventCallback(nil), a.eventCallbacks...)
@@ -598,7 +640,7 @@ func (a *App) dispatchEvent(account *Account, evt *event.Event) {
 	close(errCh)
 
 	for err := range errCh {
-		log.Printf("[satori-client] event callback error: %v", err)
+		a.log(context.Background(), logging.LevelError, "event callback error", logging.Field{Key: "error", Value: err})
 	}
 }
 
@@ -630,7 +672,7 @@ func (a *App) accountUpdate(account *Account, status login.LoginStatus) {
 	close(errCh)
 
 	for err := range errCh {
-		log.Printf("[satori-client] lifecycle callback error: %v", err)
+		a.log(context.Background(), logging.LevelError, "lifecycle callback error", logging.Field{Key: "error", Value: err})
 	}
 }
 
@@ -667,6 +709,7 @@ func wsNetworkFactory(app *App, cfg Config) (clientnetwork.Runner, APIConfig, er
 			Token:            normalized.Token,
 			APIConfig:        normalized,
 			HandshakeTimeout: handshakeTimeout,
+			Logger:           app.Logger(),
 		}), normalized, nil
 	case *WebSocketConfig:
 		if typed == nil {
@@ -684,6 +727,7 @@ func wsNetworkFactory(app *App, cfg Config) (clientnetwork.Runner, APIConfig, er
 			Token:            normalized.Token,
 			APIConfig:        normalized,
 			HandshakeTimeout: handshakeTimeout,
+			Logger:           app.Logger(),
 		}), normalized, nil
 	default:
 		return nil, nil, fmt.Errorf("ws factory does not support config type %T", cfg)
@@ -703,6 +747,7 @@ func webhookNetworkFactory(app *App, cfg Config) (clientnetwork.Runner, APIConfi
 			Token:     normalized.Token,
 			APIConfig: normalized,
 			Timeout:   normalized.Timeout,
+			Logger:    app.Logger(),
 		}), normalized, nil
 	case *WebhookConfig:
 		if typed == nil {
@@ -718,6 +763,7 @@ func webhookNetworkFactory(app *App, cfg Config) (clientnetwork.Runner, APIConfi
 			Token:     normalized.Token,
 			APIConfig: normalized,
 			Timeout:   normalized.Timeout,
+			Logger:    app.Logger(),
 		}), normalized, nil
 	default:
 		return nil, nil, fmt.Errorf("webhook factory does not support config type %T", cfg)

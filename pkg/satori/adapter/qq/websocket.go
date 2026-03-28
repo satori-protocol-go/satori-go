@@ -6,7 +6,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"log"
 	"net/http"
 	"runtime"
 	"strings"
@@ -15,6 +14,7 @@ import (
 
 	"github.com/WindowsSov8forUs/botgo-plus/dto"
 	"github.com/gorilla/websocket"
+	"github.com/satori-protocol-go/satori-go/pkg/satori/logging"
 	"github.com/satori-protocol-go/satori-go/pkg/satori/model/event"
 	"github.com/satori-protocol-go/satori-go/pkg/satori/model/login"
 )
@@ -51,6 +51,7 @@ func (a *Adapter) Block(ctx context.Context) error {
 
 	gatewayURL, targets, startupInterval, err := a.resolveWebSocketTargets(ctx, state)
 	if err != nil {
+		a.log(ctx, logging.LevelError, "启动 WebSocket 失败", logging.Field{Key: "error", Value: err})
 		return err
 	}
 
@@ -99,9 +100,15 @@ func (a *Adapter) runShardLoop(ctx context.Context, state *appState, gatewayURL 
 			return
 		}
 		if err != nil {
-			log.Printf("[qq-adapter] websocket disconnected shard=%d/%d: %v", target.ID, target.Count, err)
+			a.log(ctx, logging.LevelError, "QQ 开放平台连接出现错误", logging.Field{Key: "error", Value: err})
+			a.log(ctx, logging.LevelWarn, "websocket disconnected",
+				logging.Field{Key: "shard_id", Value: target.ID},
+				logging.Field{Key: "shard_count", Value: target.Count},
+				logging.Field{Key: "error", Value: err},
+			)
 		}
 
+		a.log(ctx, logging.LevelInfo, "正在尝试重新连接 QQ 开放平台...")
 		a.publishLoginLifecycleByApp(state.appID, login.LoginStatusReconnect, event.EventTypeLoginUpdated, true)
 
 		timer := time.NewTimer(a.wsReconnect)
@@ -140,10 +147,15 @@ func (a *Adapter) runWebSocketSession(
 	if hello.HeartbeatInterval <= 0 {
 		hello.HeartbeatInterval = int((30 * time.Second) / time.Millisecond)
 	}
+	a.log(ctx, logging.LevelInfo, "成功与 QQ 开放平台建立 WebSocket 连接",
+		logging.Field{Key: "heartbeat_interval_ms", Value: hello.HeartbeatInterval},
+	)
 
 	if err := a.authenticateWS(withAppID(ctx, state.appID), conn, state, target, session); err != nil {
 		return err
 	}
+	a.log(ctx, logging.LevelInfo, "WebSocket 连接成功")
+	a.log(ctx, logging.LevelInfo, "连接成功！")
 	a.publishLoginLifecycleByApp(state.appID, login.LoginStatusOnline, event.EventTypeLoginUpdated, true)
 
 	heartbeatCtx, cancelHeartbeat := context.WithCancel(ctx)
@@ -168,6 +180,7 @@ func (a *Adapter) runWebSocketSession(
 		case dto.WSHeartbeatAck:
 			continue
 		case dto.WSReconnect:
+			a.log(ctx, logging.LevelInfo, "正在尝试重新连接 QQ 开放平台...")
 			return errWSReconnect
 		case dto.WSInvalidSession:
 			session.sessionID = ""
@@ -192,10 +205,11 @@ func (a *Adapter) runWebSocketSession(
 
 			evt, convertErr := a.converter.Convert(withAppID(ctx, state.appID), payload.OPCode, payload.Type, rawData)
 			if convertErr != nil {
-				log.Printf("[qq-adapter] websocket event convert failed: %v", convertErr)
+				a.log(ctx, logging.LevelWarn, "websocket event convert failed", logging.Field{Key: "error", Value: convertErr})
 				continue
 			}
 			if evt != nil {
+				a.logEventBySource(payload.Type, evt)
 				a.pushEvent(evt)
 			}
 		}
@@ -451,7 +465,10 @@ func payloadSequence(payload *dto.Payload) (int64, bool) {
 	return 0, false
 }
 
-func parseWSIntentNames(names []string) int64 {
+func parseWSIntentNames(names []string, logger logging.Logger) int64 {
+	if logger == nil {
+		logger = logging.NopLogger{}
+	}
 	var intents dto.Intent
 	for _, raw := range names {
 		name := strings.ToUpper(strings.TrimSpace(raw))
@@ -460,33 +477,35 @@ func parseWSIntentNames(names []string) int64 {
 		}
 		if value, ok := wsIntentByName[name]; ok {
 			intents |= value
+			continue
 		}
+		logger.Log(context.Background(), logging.LevelWarn, "未知的 intent", logging.Field{Key: "intent", Value: raw})
 	}
 	return int64(intents)
 }
 
 var wsIntentByName = map[string]dto.Intent{
-	"GUILDS":                  dto.IntentGuilds,
-	"GUILD_MEMBERS":           dto.IntentGuildMembers,
-	"GUILD_MESSAGES":          dto.IntentGuildMessages,
-	"GUILD_MESSAGE_REACTIONS": dto.IntentGuildMessageReactions,
-	"GUILD_MESSAGE_REACTION":  dto.IntentGuildMessageReactions,
-	"DIRECT_MESSAGES":         dto.IntentDirectMessages,
-	"DIRECT_MESSAGE":          dto.IntentDirectMessages,
-	"GROUP_AND_C2C_EVENT":     dto.IntentGroupAndC2CEvent,
-	"C2C_GROUP_AT_MESSAGES":   dto.IntentGroupAndC2CEvent,
-	"USER_MESSAGES":           dto.IntentGroupAndC2CEvent,
-	"INTERACTION":             dto.IntentInteraction,
-	"MESSAGE_AUDIT":           dto.IntentMessageAudit,
-	"FORUM_EVENT":             dto.IntentForumEvent,
-	"FORUMS_EVENT":            dto.IntentForumEvent,
-	"OPEN_FORUM_EVENT":        dto.IntentForumEvent,
-	"OPEN_FORUMS_EVENT":       dto.IntentForumEvent,
-	"AUDIO_ACTION":            dto.IntentAudioAction,
-	"AUDIO_LIVE_MEMBER":       dto.IntentAudioAction,
+	"GUILDS":                       dto.IntentGuilds,
+	"GUILD_MEMBERS":                dto.IntentGuildMembers,
+	"GUILD_MESSAGES":               dto.IntentGuildMessages,
+	"GUILD_MESSAGE_REACTIONS":      dto.IntentGuildMessageReactions,
+	"GUILD_MESSAGE_REACTION":       dto.IntentGuildMessageReactions,
+	"DIRECT_MESSAGES":              dto.IntentDirectMessages,
+	"DIRECT_MESSAGE":               dto.IntentDirectMessages,
+	"GROUP_AND_C2C_EVENT":          dto.IntentGroupAndC2CEvent,
+	"C2C_GROUP_AT_MESSAGES":        dto.IntentGroupAndC2CEvent,
+	"USER_MESSAGES":                dto.IntentGroupAndC2CEvent,
+	"INTERACTION":                  dto.IntentInteraction,
+	"MESSAGE_AUDIT":                dto.IntentMessageAudit,
+	"FORUM_EVENT":                  dto.IntentForumEvent,
+	"FORUMS_EVENT":                 dto.IntentForumEvent,
+	"OPEN_FORUM_EVENT":             dto.IntentForumEvent,
+	"OPEN_FORUMS_EVENT":            dto.IntentForumEvent,
+	"AUDIO_ACTION":                 dto.IntentAudioAction,
+	"AUDIO_LIVE_MEMBER":            dto.IntentAudioAction,
 	"AUDIO_OR_LIVE_CHANNEL_MEMBER": dto.IntentAudioAction,
-	"AT_MESSAGES":             dto.IntentPublicGuildMessages,
-	"PUBLIC_GUILD_MESSAGES":   dto.IntentPublicGuildMessages,
+	"AT_MESSAGES":                  dto.IntentPublicGuildMessages,
+	"PUBLIC_GUILD_MESSAGES":        dto.IntentPublicGuildMessages,
 }
 
 func wsShardKey(appID string, shardID uint32, shardCount uint32) string {

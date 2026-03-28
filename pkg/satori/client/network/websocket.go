@@ -5,12 +5,12 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"log"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/gorilla/websocket"
+	"github.com/satori-protocol-go/satori-go/pkg/satori/logging"
 	"github.com/satori-protocol-go/satori-go/pkg/satori/model/event"
 	"github.com/satori-protocol-go/satori-go/pkg/satori/model/login"
 	"github.com/satori-protocol-go/satori-go/pkg/satori/model/operation"
@@ -47,7 +47,7 @@ func NewWS(app AppBridge, options WebSocketOptions) *WS {
 		wsBase: options.WSBase,
 		dialer: dialer,
 	}
-	network.base = newBaseNetwork(app, options.APIConfig, fmt.Sprintf("satori/net/ws/%s#%p", identity, network))
+	network.base = newBaseNetwork(app, options.APIConfig, fmt.Sprintf("satori/net/ws/%s#%p", identity, network), options.Logger)
 	return network
 }
 
@@ -88,7 +88,10 @@ func (n *WS) Run(ctx context.Context) error {
 			return nil
 		}
 
-		log.Printf("[satori-client] websocket network %s disconnected: %v", n.ID(), err)
+		n.base.Log(ctx, logging.LevelWarn, "websocket network disconnected",
+			logging.Field{Key: "network_id", Value: n.ID()},
+			logging.Field{Key: "error", Value: err},
+		)
 		n.base.app.MarkNetworkStatus(n.ID(), login.LoginStatusReconnect, false)
 
 		select {
@@ -113,6 +116,13 @@ func (n *WS) Alive() bool {
 
 func (n *WS) WaitForAvailable(ctx context.Context) error {
 	return n.base.WaitAvailable(ctx)
+}
+
+func (n *WS) SetLogger(logger logging.Logger) {
+	if n == nil || n.base == nil {
+		return
+	}
+	n.base.SetLogger(logger)
 }
 
 func (n *WS) connectAndServe(ctx context.Context) error {
@@ -187,7 +197,9 @@ func (n *WS) authenticate(connection *websocket.Conn) error {
 	n.base.SetProxyURLs(ready.ProxyUrls)
 	n.base.app.SyncLogins(n.ID(), n.base.Config(), ready.ProxyUrls, ready.Logins)
 	if len(ready.Logins) == 0 {
-		log.Printf("[satori-client] no login available for websocket %s", n.ID())
+		n.base.Log(context.Background(), logging.LevelWarn, "no login available for websocket",
+			logging.Field{Key: "network_id", Value: n.ID()},
+		)
 	}
 	return nil
 }
@@ -211,7 +223,10 @@ func (n *WS) receiveLoop(connection *websocket.Conn) error {
 		case operation.OpcodeEvent:
 			var evt event.Event
 			if err := decodeJSON(frame.Body, &evt); err != nil {
-				log.Printf("[satori-client] failed to parse event payload: %v", err)
+				n.base.Log(context.Background(), logging.LevelWarn, "failed to parse event payload",
+					logging.Field{Key: "network_id", Value: n.ID()},
+					logging.Field{Key: "error", Value: err},
+				)
 				continue
 			}
 			n.base.SetSequence(evt.Sn)
@@ -231,7 +246,10 @@ func (n *WS) receiveLoop(connection *websocket.Conn) error {
 
 		default:
 			if frame.Op > operation.OpcodeMeta {
-				log.Printf("[satori-client] received unknown opcode: %d", frame.Op)
+				n.base.Log(context.Background(), logging.LevelWarn, "received unknown opcode",
+					logging.Field{Key: "network_id", Value: n.ID()},
+					logging.Field{Key: "opcode", Value: frame.Op},
+				)
 			}
 		}
 	}
@@ -300,3 +318,4 @@ func joinURLPath(base string, suffix string) string {
 
 var _ Runner = (*WS)(nil)
 var _ Availability = (*WS)(nil)
+var _ LoggerSetter = (*WS)(nil)

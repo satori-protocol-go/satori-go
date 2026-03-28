@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/gorilla/websocket"
+	"github.com/satori-protocol-go/satori-go/pkg/satori/logging"
 	"github.com/satori-protocol-go/satori-go/pkg/satori/model/event"
 	"github.com/satori-protocol-go/satori-go/pkg/satori/model/login"
 	"github.com/satori-protocol-go/satori-go/pkg/satori/protocol"
@@ -36,6 +37,10 @@ type Availability interface {
 	WaitForAvailable(ctx context.Context) error
 }
 
+type LoggerSetter interface {
+	SetLogger(logger logging.Logger)
+}
+
 type WebSocketOptions struct {
 	Identity         string
 	WSBase           string
@@ -43,6 +48,7 @@ type WebSocketOptions struct {
 	APIConfig        APIConfig
 	Dialer           *websocket.Dialer
 	HandshakeTimeout time.Duration
+	Logger           logging.Logger
 }
 
 type WebhookOptions struct {
@@ -53,6 +59,7 @@ type WebhookOptions struct {
 	Token     string
 	APIConfig APIConfig
 	Timeout   time.Duration
+	Logger    logging.Logger
 }
 
 func webhookAddress(host string, port int) string {
@@ -70,6 +77,7 @@ type baseNetwork struct {
 	id     string
 	app    AppBridge
 	config APIConfig
+	logger logging.Logger
 
 	sequence atomic.Int64
 
@@ -83,11 +91,15 @@ type baseNetwork struct {
 	availableOnce   sync.Once
 }
 
-func newBaseNetwork(app AppBridge, cfg APIConfig, id string) *baseNetwork {
+func newBaseNetwork(app AppBridge, cfg APIConfig, id string, logger logging.Logger) *baseNetwork {
+	if logger == nil {
+		logger = logging.NopLogger{}
+	}
 	result := &baseNetwork{
 		id:              id,
 		app:             app,
 		config:          cfg,
+		logger:          logger,
 		closeSignal:     make(chan struct{}),
 		availableSignal: make(chan struct{}),
 	}
@@ -151,4 +163,23 @@ func (b *baseNetwork) WaitAvailable(ctx context.Context) error {
 	case <-b.availableSignal:
 		return nil
 	}
+}
+
+func (b *baseNetwork) Log(ctx context.Context, level logging.Level, message string, fields ...logging.Field) {
+	if b == nil || b.logger == nil {
+		return
+	}
+	b.logger.Log(ctx, level, message, fields...)
+}
+
+func (b *baseNetwork) SetLogger(logger logging.Logger) {
+	if b == nil {
+		return
+	}
+	if logger == nil {
+		logger = logging.NopLogger{}
+	}
+	b.mu.Lock()
+	b.logger = logger
+	b.mu.Unlock()
 }

@@ -1,66 +1,22 @@
 package server
 
-import (
-	"context"
-	"fmt"
-	"log"
-	"os"
-	"strings"
-)
+import "github.com/satori-protocol-go/satori-go/pkg/satori/logging"
 
-type LogLevel string
+type LogLevel = logging.Level
 
 const (
-	LogLevelDebug LogLevel = "debug"
-	LogLevelInfo  LogLevel = "info"
-	LogLevelWarn  LogLevel = "warn"
-	LogLevelError LogLevel = "error"
+	LogLevelDebug LogLevel = logging.LevelDebug
+	LogLevelInfo  LogLevel = logging.LevelInfo
+	LogLevelWarn  LogLevel = logging.LevelWarn
+	LogLevelError LogLevel = logging.LevelError
 )
 
-type Field struct {
-	Key   string
-	Value any
-}
+type Field = logging.Field
 
-type Logger interface {
-	Log(ctx context.Context, level LogLevel, message string, fields ...Field)
-}
+type Logger = logging.Logger
 
-type stdLogger struct {
-	inner *log.Logger
-}
-
-type NopLogger struct{}
+type NopLogger = logging.NopLogger
 
 func NewStdLogger() Logger {
-	return &stdLogger{
-		inner: log.New(os.Stderr, "", log.LstdFlags),
-	}
-}
-
-func (NopLogger) Log(context.Context, LogLevel, string, ...Field) {}
-
-func (l *stdLogger) Log(_ context.Context, level LogLevel, message string, fields ...Field) {
-	if l == nil || l.inner == nil {
-		return
-	}
-
-	var builder strings.Builder
-	builder.WriteString("level=")
-	builder.WriteString(string(level))
-	if message != "" {
-		builder.WriteString(" msg=")
-		builder.WriteString(message)
-	}
-	for _, field := range fields {
-		key := strings.TrimSpace(field.Key)
-		if key == "" {
-			continue
-		}
-		builder.WriteString(" ")
-		builder.WriteString(key)
-		builder.WriteString("=")
-		builder.WriteString(fmt.Sprint(field.Value))
-	}
-	l.inner.Print(builder.String())
+	return logging.NewStdLogger()
 }

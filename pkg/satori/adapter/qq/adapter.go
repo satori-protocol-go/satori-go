@@ -14,6 +14,7 @@ import (
 	"github.com/gorilla/websocket"
 	"github.com/satori-protocol-go/satori-go/pkg/satori/adapter/qq/convert"
 	qqevent "github.com/satori-protocol-go/satori-go/pkg/satori/adapter/qq/event"
+	"github.com/satori-protocol-go/satori-go/pkg/satori/logging"
 	"github.com/satori-protocol-go/satori-go/pkg/satori/model/event"
 	"github.com/satori-protocol-go/satori-go/pkg/satori/model/login"
 	"github.com/satori-protocol-go/satori-go/pkg/satori/server"
@@ -36,6 +37,7 @@ type Adapter struct {
 	skipSignatureCheck bool
 	httpClient         *http.Client
 	requestTimeout     time.Duration
+	logger             logging.Logger
 
 	appStates    map[string]*appState
 	primaryAppID string
@@ -86,13 +88,18 @@ func New(cfg Config) (*Adapter, error) {
 	if httpClient == nil {
 		httpClient = &http.Client{Timeout: requestTimeout}
 	}
+	logger := cfg.Logger
+	if logger == nil {
+		logger = logging.NewStdLogger()
+	}
 	wsIntents := cfg.WSIntents
 	if wsIntents == 0 {
-		wsIntents = parseWSIntentNames(cfg.WSIntentNames)
+		wsIntents = parseWSIntentNames(cfg.WSIntentNames, logger)
 	}
 	if wsIntents == 0 {
 		wsIntents = defaultWSIntents
 	}
+	logger.Log(context.Background(), logging.LevelInfo, "订阅的 intent", logging.Field{Key: "intent", Value: wsIntents})
 	wsReconnect := cfg.WSReconnectDelay
 	if wsReconnect <= 0 {
 		wsReconnect = defaultWSReconnect
@@ -124,6 +131,7 @@ func New(cfg Config) (*Adapter, error) {
 		skipSignatureCheck: cfg.SkipSignatureCheck,
 		httpClient:         httpClient,
 		requestTimeout:     requestTimeout,
+		logger:             logger,
 		appStates:          appStates,
 		primaryAppID:       primaryAppID,
 		apiV1:              primary.apiV1,
