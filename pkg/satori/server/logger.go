@@ -11,8 +11,6 @@ const (
 	LogLevelError LogLevel = logging.LevelError
 )
 
-type Field = logging.Field
-
 type Logger = logging.Logger
 
 type NopLogger = logging.NopLogger

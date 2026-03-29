@@ -3,6 +3,7 @@ package qq
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net/http"
 	"strings"
 	"sync"
@@ -99,7 +100,7 @@ func New(cfg Config) (*Adapter, error) {
 	if wsIntents == 0 {
 		wsIntents = defaultWSIntents
 	}
-	logger.Log(context.Background(), logging.LevelInfo, "订阅的 intent", logging.Field{Key: "intent", Value: wsIntents})
+	logger.Log(context.Background(), logging.LevelInfo, fmt.Sprintf("subscribed intents=%d", wsIntents))
 	wsReconnect := cfg.WSReconnectDelay
 	if wsReconnect <= 0 {
 		wsReconnect = defaultWSReconnect

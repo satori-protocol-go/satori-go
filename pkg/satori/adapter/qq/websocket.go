@@ -51,7 +51,7 @@ func (a *Adapter) Block(ctx context.Context) error {
 
 	gatewayURL, targets, startupInterval, err := a.resolveWebSocketTargets(ctx, state)
 	if err != nil {
-		a.log(ctx, logging.LevelError, "启动 WebSocket 失败", logging.Field{Key: "error", Value: err})
+		a.log(ctx, logging.LevelError, fmt.Sprintf("启动 WebSocket 失败 error=%v", err))
 		return err
 	}
 
@@ -100,11 +100,11 @@ func (a *Adapter) runShardLoop(ctx context.Context, state *appState, gatewayURL 
 			return
 		}
 		if err != nil {
-			a.log(ctx, logging.LevelError, "QQ 开放平台连接出现错误", logging.Field{Key: "error", Value: err})
-			a.log(ctx, logging.LevelWarn, "websocket disconnected",
-				logging.Field{Key: "shard_id", Value: target.ID},
-				logging.Field{Key: "shard_count", Value: target.Count},
-				logging.Field{Key: "error", Value: err},
+			a.log(ctx, logging.LevelError, fmt.Sprintf("QQ 开放平台连接出现错误 error=%v", err))
+			a.log(
+				ctx,
+				logging.LevelWarn,
+				fmt.Sprintf("websocket disconnected shard_id=%d shard_count=%d error=%v", target.ID, target.Count, err),
 			)
 		}
 
@@ -147,9 +147,7 @@ func (a *Adapter) runWebSocketSession(
 	if hello.HeartbeatInterval <= 0 {
 		hello.HeartbeatInterval = int((30 * time.Second) / time.Millisecond)
 	}
-	a.log(ctx, logging.LevelInfo, "成功与 QQ 开放平台建立 WebSocket 连接",
-		logging.Field{Key: "heartbeat_interval_ms", Value: hello.HeartbeatInterval},
-	)
+	a.log(ctx, logging.LevelInfo, fmt.Sprintf("成功与 QQ 开放平台建立 WebSocket 连接 heartbeat_interval_ms=%d", hello.HeartbeatInterval))
 
 	if err := a.authenticateWS(withAppID(ctx, state.appID), conn, state, target, session); err != nil {
 		return err
@@ -205,7 +203,7 @@ func (a *Adapter) runWebSocketSession(
 
 			evt, convertErr := a.converter.Convert(withAppID(ctx, state.appID), payload.OPCode, payload.Type, rawData)
 			if convertErr != nil {
-				a.log(ctx, logging.LevelWarn, "websocket event convert failed", logging.Field{Key: "error", Value: convertErr})
+				a.log(ctx, logging.LevelWarn, fmt.Sprintf("websocket event convert failed error=%v", convertErr))
 				continue
 			}
 			if evt != nil {
@@ -479,7 +477,7 @@ func parseWSIntentNames(names []string, logger logging.Logger) int64 {
 			intents |= value
 			continue
 		}
-		logger.Log(context.Background(), logging.LevelWarn, "未知的 intent", logging.Field{Key: "intent", Value: raw})
+		logger.Log(context.Background(), logging.LevelWarn, fmt.Sprintf("未知的 intent=%s", raw))
 	}
 	return int64(intents)
 }

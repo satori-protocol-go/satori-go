@@ -25,7 +25,7 @@ type websocketConnection struct {
 	id         string
 	remoteAddr string
 
-	logFn func(level LogLevel, message string, fields ...Field)
+	logFn func(level LogLevel, v ...any)
 
 	stateMu              sync.RWMutex
 	closeReason          string
@@ -37,7 +37,7 @@ type websocketConnection struct {
 func newWebsocketConnection(
 	connection *websocket.Conn,
 	remoteAddr string,
-	logFn func(level LogLevel, message string, fields ...Field),
+	logFn func(level LogLevel, v ...any),
 ) *websocketConnection {
 	connectionID := strconv.FormatUint(websocketConnectionCounter.Add(1), 10)
 	return &websocketConnection{
@@ -134,11 +134,12 @@ func (c *websocketConnection) Heartbeat(timeout time.Duration) {
 		if err != nil {
 			if isTimeoutError(err) {
 				c.setCloseInfo("heartbeat timeout", err)
-				c.log(LogLevelWarn, "websocket heartbeat timeout",
-					Field{Key: "connection_id", Value: c.id},
-					Field{Key: "remote_addr", Value: c.remoteAddr},
-					Field{Key: "error", Value: err},
-				)
+				c.log(LogLevelWarn, fmt.Sprintf(
+					"websocket heartbeat timeout connection_id=%s remote_addr=%s error=%v",
+					c.id,
+					c.remoteAddr,
+					err,
+				))
 			} else {
 				var closeErr *websocket.CloseError
 				if errors.As(err, &closeErr) {
@@ -167,19 +168,21 @@ func (c *websocketConnection) Heartbeat(timeout time.Duration) {
 		latency := time.Since(start)
 		c.setHeartbeat(latency)
 		if err := c.Send(map[string]any{"op": operation.OpcodePong}); err != nil {
-			c.log(LogLevelWarn, "websocket pong failed",
-				Field{Key: "connection_id", Value: c.id},
-				Field{Key: "remote_addr", Value: c.remoteAddr},
-				Field{Key: "error", Value: err},
-			)
+			c.log(LogLevelWarn, fmt.Sprintf(
+				"websocket pong failed connection_id=%s remote_addr=%s error=%v",
+				c.id,
+				c.remoteAddr,
+				err,
+			))
 			_ = c.Close()
 			return
 		}
-		c.log(LogLevelDebug, "websocket heartbeat pong",
-			Field{Key: "connection_id", Value: c.id},
-			Field{Key: "remote_addr", Value: c.remoteAddr},
-			Field{Key: "latency_ms", Value: latency.Milliseconds()},
-		)
+		c.log(LogLevelDebug, fmt.Sprintf(
+			"websocket heartbeat pong connection_id=%s remote_addr=%s latency_ms=%d",
+			c.id,
+			c.remoteAddr,
+			latency.Milliseconds(),
+		))
 	}
 }
 
@@ -213,11 +216,11 @@ func (c *websocketConnection) setHeartbeat(latency time.Duration) {
 	c.stateMu.Unlock()
 }
 
-func (c *websocketConnection) log(level LogLevel, message string, fields ...Field) {
+func (c *websocketConnection) log(level LogLevel, v ...any) {
 	if c.logFn == nil {
 		return
 	}
-	c.logFn(level, message, fields...)
+	c.logFn(level, v...)
 }
 
 func isTimeoutError(err error) bool {

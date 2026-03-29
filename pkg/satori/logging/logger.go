@@ -17,13 +17,8 @@ const (
 	LevelError Level = "error"
 )
 
-type Field struct {
-	Key   string
-	Value any
-}
-
 type Logger interface {
-	Log(ctx context.Context, level Level, message string, fields ...Field)
+	Log(ctx context.Context, level Level, v ...any)
 }
 
 type stdLogger struct {
@@ -38,9 +33,9 @@ func NewStdLogger() Logger {
 	}
 }
 
-func (NopLogger) Log(context.Context, Level, string, ...Field) {}
+func (NopLogger) Log(context.Context, Level, ...any) {}
 
-func (l *stdLogger) Log(_ context.Context, level Level, message string, fields ...Field) {
+func (l *stdLogger) Log(_ context.Context, level Level, v ...any) {
 	if l == nil || l.inner == nil {
 		return
 	}
@@ -48,19 +43,9 @@ func (l *stdLogger) Log(_ context.Context, level Level, message string, fields .
 	var builder strings.Builder
 	builder.WriteString("level=")
 	builder.WriteString(string(level))
-	if message != "" {
+	if len(v) > 0 {
 		builder.WriteString(" msg=")
-		builder.WriteString(message)
-	}
-	for _, field := range fields {
-		key := strings.TrimSpace(field.Key)
-		if key == "" {
-			continue
-		}
-		builder.WriteString(" ")
-		builder.WriteString(key)
-		builder.WriteString("=")
-		builder.WriteString(fmt.Sprint(field.Value))
+		builder.WriteString(fmt.Sprint(v...))
 	}
 	l.inner.Print(builder.String())
 }
