@@ -6,13 +6,13 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"net/http"
 	"net/url"
 	"strconv"
 	"strings"
 
 	"github.com/WindowsSov8forUs/botgo-plus/dto"
+	"github.com/WindowsSov8forUs/botgo-plus/errs"
 	"github.com/satori-protocol-go/satori-go/pkg/satori/adapter/qq/convert"
 	"github.com/satori-protocol-go/satori-go/pkg/satori/model"
 	"github.com/satori-protocol-go/satori-go/pkg/satori/model/channel"
@@ -247,7 +247,12 @@ func (a *Adapter) HandleInternal(
 		params = map[string]any{}
 	}
 
-	body, contentType, status, err := a.callRawAPI(ctx, request.SelfID, method, action, params)
+	state, err := a.resolveRequestState(request.Origin, request.SelfID)
+	if err != nil {
+		return nil, err
+	}
+
+	body, contentType, status, err := a.callRawAPI(ctx, state, method, action, params)
 	if err != nil {
 		return nil, err
 	}
@@ -260,7 +265,7 @@ func (a *Adapter) HandleInternal(
 
 func (a *Adapter) callRawAPI(
 	ctx context.Context,
-	selfID string,
+	state *appState,
 	method string,
 	action string,
 	params map[string]any,
@@ -268,13 +273,29 @@ func (a *Adapter) callRawAPI(
 	if ctx == nil {
 		ctx = context.Background()
 	}
+	if state == nil {
+		return nil, "", 0, server.NotFound("qq app state not found")
+	}
+
 	method = strings.ToUpper(strings.TrimSpace(method))
 	if method == "" {
 		method = http.MethodGet
 	}
 
+	api := state.apiV1
+	action = strings.TrimSpace(action)
+	if strings.HasPrefix(strings.TrimLeft(action, "/"), "v2/") && state.apiV2 != nil {
+		api = state.apiV2
+	}
+	if api == nil {
+		api = state.apiV2
+	}
+	if api == nil {
+		return nil, "", 0, server.NotFound("qq openapi client is not configured")
+	}
+
 	targetURL := strings.TrimRight(a.apiBaseURL(), "/") + "/" + strings.TrimLeft(action, "/")
-	var body io.Reader
+	var payload any
 	if method == http.MethodGet || method == http.MethodDelete {
 		query := url.Values{}
 		for key, value := range params {
@@ -297,42 +318,15 @@ func (a *Adapter) callRawAPI(
 			targetURL += "?" + encoded
 		}
 	} else {
-		payload, err := json.Marshal(params)
-		if err != nil {
-			return nil, "", 0, err
-		}
-		body = bytes.NewReader(payload)
+		payload = params
 	}
 
-	req, err := http.NewRequestWithContext(ctx, method, targetURL, body)
+	data, err := api.Transport(ctx, method, targetURL, payload)
 	if err != nil {
-		return nil, "", 0, err
+		status, message := mapTransportError(err)
+		return nil, "", 0, server.NewActionError(status, message, err)
 	}
-
-	authorization, err := a.currentAuthorizationToken(ctx, selfID)
-	if err != nil {
-		return nil, "", 0, err
-	}
-	req.Header.Set("Authorization", authorization)
-	req.Header.Set("X-Union-Appid", a.appID)
-	if body != nil {
-		req.Header.Set("Content-Type", "application/json")
-	}
-
-	resp, err := a.httpClient.Do(req)
-	if err != nil {
-		return nil, "", 0, err
-	}
-	defer resp.Body.Close()
-
-	data, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, "", 0, err
-	}
-	if resp.StatusCode >= 400 {
-		return nil, "", 0, server.NewActionError(resp.StatusCode, string(data), nil)
-	}
-	return data, resp.Header.Get("Content-Type"), resp.StatusCode, nil
+	return data, detectRawResponseContentType(data), http.StatusOK, nil
 }
 
 func (a *Adapter) apiBaseURL() string {
@@ -340,6 +334,33 @@ func (a *Adapter) apiBaseURL() string {
 		return qqSandboxAPIBaseURL
 	}
 	return qqAPIBaseURL
+}
+
+func mapTransportError(err error) (int, string) {
+	if err == nil {
+		return http.StatusOK, ""
+	}
+	typed := errs.Error(err)
+	status := typed.Code()
+	if status < 100 || status > 599 {
+		status = http.StatusInternalServerError
+	}
+	message := strings.TrimSpace(typed.Text())
+	if message == "" {
+		message = err.Error()
+	}
+	return status, message
+}
+
+func detectRawResponseContentType(data []byte) string {
+	content := bytes.TrimSpace(data)
+	if len(content) == 0 {
+		return ""
+	}
+	if json.Valid(content) {
+		return "application/json"
+	}
+	return http.DetectContentType(content)
 }
 
 func (a *Adapter) handleLoginGet(request *server.Request[server.LoginGetParam]) (any, error) {

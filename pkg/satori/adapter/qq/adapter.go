@@ -11,7 +11,7 @@ import (
 
 	"github.com/WindowsSov8forUs/botgo-plus/openapi"
 	"github.com/WindowsSov8forUs/botgo-plus/token"
-	"github.com/gorilla/websocket"
+	"github.com/WindowsSov8forUs/botgo-plus/websocket"
 	"github.com/satori-protocol-go/satori-go/pkg/satori/adapter/qq/convert"
 	qqevent "github.com/satori-protocol-go/satori-go/pkg/satori/adapter/qq/event"
 	"github.com/satori-protocol-go/satori-go/pkg/satori/logging"
@@ -58,12 +58,9 @@ type Adapter struct {
 	wsShardID     uint32
 	wsShardCount  uint32
 	wsReconnect   time.Duration
-	wsHandshake   time.Duration
 
 	wsConnMu  sync.RWMutex
-	wsWriteMu sync.Mutex
-	wsConn    *websocket.Conn
-	wsConns   map[string]*websocket.Conn
+	wsClients map[string]websocket.WebSocket
 
 	auditMu      sync.Mutex
 	auditWaiters map[string][]chan string
@@ -105,10 +102,6 @@ func New(cfg Config) (*Adapter, error) {
 	if wsReconnect <= 0 {
 		wsReconnect = defaultWSReconnect
 	}
-	wsHandshake := cfg.WSHandshakeTimeout
-	if wsHandshake <= 0 {
-		wsHandshake = defaultWSHandshake
-	}
 
 	adapterName := strings.TrimSpace(cfg.Adapter)
 	if adapterName == "" {
@@ -147,9 +140,8 @@ func New(cfg Config) (*Adapter, error) {
 		wsShardID:          cfg.WSShardID,
 		wsShardCount:       cfg.WSShardCount,
 		wsReconnect:        wsReconnect,
-		wsHandshake:        wsHandshake,
 		selfToApp:          map[string]string{},
-		wsConns:            map[string]*websocket.Conn{},
+		wsClients:          map[string]websocket.WebSocket{},
 		auditWaiters:       map[string][]chan string{},
 	}
 	adapter.converter = qqevent.New(qqevent.Dependencies{
