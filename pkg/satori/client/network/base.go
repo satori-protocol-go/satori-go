@@ -165,11 +165,11 @@ func (b *baseNetwork) WaitAvailable(ctx context.Context) error {
 	}
 }
 
-func (b *baseNetwork) Log(ctx context.Context, level logging.Level, message string, fields ...logging.Field) {
+func (b *baseNetwork) Log(ctx context.Context, level logging.Level, v ...any) {
 	if b == nil || b.logger == nil {
 		return
 	}
-	b.logger.Log(ctx, level, message, fields...)
+	b.logger.Log(ctx, level, v...)
 }
 
 func (b *baseNetwork) SetLogger(logger logging.Logger) {

@@ -535,10 +535,10 @@ func (s *Server) Post(evt *event.Event) error {
 			continue
 		}
 		if err := connection.Send(payload); err != nil {
-			s.log(context.Background(), LogLevelWarn, "websocket broadcast failed",
-				Field{Key: "connection_id", Value: connection.ID()},
-				Field{Key: "remote_addr", Value: connection.RemoteAddr()},
-				Field{Key: "error", Value: err},
+			s.log(
+				context.Background(),
+				LogLevelWarn,
+				fmt.Sprintf("websocket broadcast failed connection_id=%s remote_addr=%s error=%v", connection.ID(), connection.RemoteAddr(), err),
 			)
 			_ = connection.Close()
 			s.removeConnection(connection)
@@ -547,10 +547,10 @@ func (s *Server) Post(evt *event.Event) error {
 
 	for _, webhook := range webhooks {
 		if err := s.sendWebhook(webhook, operation.OpcodeEvent, evt); err != nil {
-			s.log(context.Background(), LogLevelError, "webhook event delivery failed",
-				Field{Key: "url", Value: webhook.URL},
-				Field{Key: "opcode", Value: operation.OpcodeEvent},
-				Field{Key: "error", Value: err},
+			s.log(
+				context.Background(),
+				LogLevelError,
+				fmt.Sprintf("webhook event delivery failed url=%s opcode=%d error=%v", webhook.URL, operation.OpcodeEvent, err),
 			)
 		}
 	}
@@ -668,34 +668,32 @@ func (s *Server) websocketServerHandler(w http.ResponseWriter, request *http.Req
 	connection := newWebsocketConnection(
 		conn,
 		request.RemoteAddr,
-		func(level LogLevel, message string, fields ...Field) {
-			s.log(request.Context(), level, message, fields...)
+		func(level LogLevel, v ...any) {
+			s.log(request.Context(), level, v...)
 		},
 	)
 	defer connection.Close()
-	acceptFields := []Field{
-		{Key: "connection_id", Value: connection.ID()},
-		{Key: "remote_addr", Value: connection.RemoteAddr()},
-	}
+	acceptMessage := fmt.Sprintf("websocket accepted connection_id=%s remote_addr=%s", connection.ID(), connection.RemoteAddr())
 	if subprotocol := conn.Subprotocol(); subprotocol != "" {
-		acceptFields = append(acceptFields, Field{Key: "subprotocol", Value: subprotocol})
+		acceptMessage = fmt.Sprintf("%s subprotocol=%s", acceptMessage, subprotocol)
 	}
-	s.log(request.Context(), LogLevelInfo, "websocket accepted", acceptFields...)
+	s.log(request.Context(), LogLevelInfo, acceptMessage)
 
 	token, sequence, err := readIdentify(connection)
 	if err != nil {
-		s.log(request.Context(), LogLevelWarn, "websocket identify failed",
-			Field{Key: "connection_id", Value: connection.ID()},
-			Field{Key: "remote_addr", Value: connection.RemoteAddr()},
-			Field{Key: "error", Value: err},
+		s.log(
+			request.Context(),
+			LogLevelWarn,
+			fmt.Sprintf("websocket identify failed connection_id=%s remote_addr=%s error=%v", connection.ID(), connection.RemoteAddr(), err),
 		)
 		_ = connection.CloseWith(3000, "Unauthorized")
 		return
 	}
 	if token != s.Token {
-		s.log(request.Context(), LogLevelWarn, "websocket unauthorized token",
-			Field{Key: "connection_id", Value: connection.ID()},
-			Field{Key: "remote_addr", Value: connection.RemoteAddr()},
+		s.log(
+			request.Context(),
+			LogLevelWarn,
+			fmt.Sprintf("websocket unauthorized token connection_id=%s remote_addr=%s", connection.ID(), connection.RemoteAddr()),
 		)
 		_ = connection.CloseWith(3000, "Unauthorized")
 		return
@@ -703,10 +701,10 @@ func (s *Server) websocketServerHandler(w http.ResponseWriter, request *http.Req
 
 	logins, proxyUrls, err := s.collectMeta(request.Context())
 	if err != nil {
-		s.log(request.Context(), LogLevelError, "websocket prepare ready failed",
-			Field{Key: "connection_id", Value: connection.ID()},
-			Field{Key: "remote_addr", Value: connection.RemoteAddr()},
-			Field{Key: "error", Value: err},
+		s.log(
+			request.Context(),
+			LogLevelError,
+			fmt.Sprintf("websocket prepare ready failed connection_id=%s remote_addr=%s error=%v", connection.ID(), connection.RemoteAddr(), err),
 		)
 		_ = connection.CloseWith(websocket.CloseInternalServerErr, "Internal Server Error")
 		return
@@ -719,16 +717,17 @@ func (s *Server) websocketServerHandler(w http.ResponseWriter, request *http.Req
 			"proxy_urls": proxyUrls,
 		},
 	}); err != nil {
-		s.log(request.Context(), LogLevelWarn, "websocket send ready failed",
-			Field{Key: "connection_id", Value: connection.ID()},
-			Field{Key: "remote_addr", Value: connection.RemoteAddr()},
-			Field{Key: "error", Value: err},
+		s.log(
+			request.Context(),
+			LogLevelWarn,
+			fmt.Sprintf("websocket send ready failed connection_id=%s remote_addr=%s error=%v", connection.ID(), connection.RemoteAddr(), err),
 		)
 		return
 	}
-	s.log(request.Context(), LogLevelDebug, "websocket ready sent",
-		Field{Key: "connection_id", Value: connection.ID()},
-		Field{Key: "remote_addr", Value: connection.RemoteAddr()},
+	s.log(
+		request.Context(),
+		LogLevelDebug,
+		fmt.Sprintf("websocket ready sent connection_id=%s remote_addr=%s", connection.ID(), connection.RemoteAddr()),
 	)
 
 	s.addConnection(connection)
@@ -753,21 +752,19 @@ func (s *Server) websocketServerHandler(w http.ResponseWriter, request *http.Req
 	connection.WaitClosed()
 	closeReason, closeErr := connection.CloseInfo()
 	lastHeartbeatAt, lastHeartbeatLatency := connection.LastHeartbeat()
-	fields := []Field{
-		{Key: "connection_id", Value: connection.ID()},
-		{Key: "remote_addr", Value: connection.RemoteAddr()},
-		{Key: "reason", Value: closeReason},
-	}
+	var closedBuilder strings.Builder
+	closedBuilder.WriteString(fmt.Sprintf("websocket closed connection_id=%s remote_addr=%s reason=%s", connection.ID(), connection.RemoteAddr(), closeReason))
 	if closeErr != nil {
-		fields = append(fields, Field{Key: "error", Value: closeErr})
+		closedBuilder.WriteString(fmt.Sprintf(" error=%v", closeErr))
 	}
 	if !lastHeartbeatAt.IsZero() {
-		fields = append(fields,
-			Field{Key: "last_heartbeat_at", Value: lastHeartbeatAt.Format(time.RFC3339Nano)},
-			Field{Key: "last_heartbeat_latency_ms", Value: lastHeartbeatLatency.Milliseconds()},
-		)
+		closedBuilder.WriteString(fmt.Sprintf(
+			" last_heartbeat_at=%s last_heartbeat_latency_ms=%d",
+			lastHeartbeatAt.Format(time.RFC3339Nano),
+			lastHeartbeatLatency.Milliseconds(),
+		))
 	}
-	s.log(request.Context(), LogLevelInfo, "websocket closed", fields...)
+	s.log(request.Context(), LogLevelInfo, closedBuilder.String())
 }
 
 func (s *Server) httpServerHandler(w http.ResponseWriter, request *http.Request) {
@@ -1135,10 +1132,10 @@ func (s *Server) broadcastMetaToWebhooks(ctx context.Context) error {
 	body := map[string]any{"proxy_urls": proxyURLs}
 	for _, webhook := range webhooks {
 		if err := s.sendWebhook(webhook, operation.OpcodeMeta, body); err != nil {
-			s.log(ctx, LogLevelError, "webhook meta delivery failed",
-				Field{Key: "url", Value: webhook.URL},
-				Field{Key: "opcode", Value: operation.OpcodeMeta},
-				Field{Key: "error", Value: err},
+			s.log(
+				ctx,
+				LogLevelError,
+				fmt.Sprintf("webhook meta delivery failed url=%s opcode=%d error=%v", webhook.URL, operation.OpcodeMeta, err),
 			)
 			return err
 		}
@@ -1217,14 +1214,14 @@ func (s *Server) snapshotAdapters() []Adapter {
 	return append([]Adapter(nil), s.adapters...)
 }
 
-func (s *Server) log(ctx context.Context, level LogLevel, message string, fields ...Field) {
+func (s *Server) log(ctx context.Context, level LogLevel, v ...any) {
 	s.mu.RLock()
 	logger := s.logger
 	s.mu.RUnlock()
 	if logger == nil {
 		return
 	}
-	logger.Log(ctx, level, message, fields...)
+	logger.Log(ctx, level, v...)
 }
 
 func (s *Server) beginRun(cancel context.CancelFunc) (chan error, error) {
@@ -1327,14 +1324,14 @@ func (s *Server) runPreparing(ctx context.Context) error {
 	s.ensureDefaultUploadRoute()
 	handler, err := s.Handler()
 	if err != nil {
-		s.log(ctx, LogLevelError, "build server handler failed", Field{Key: "error", Value: err})
+		s.log(ctx, LogLevelError, fmt.Sprintf("build server handler failed error=%v", err))
 		return err
 	}
 
 	addr := net.JoinHostPort(s.Host, strconv.Itoa(s.Port))
 	listener, err := net.Listen("tcp", addr)
 	if err != nil {
-		s.log(ctx, LogLevelError, "listen failed", Field{Key: "address", Value: addr}, Field{Key: "error", Value: err})
+		s.log(ctx, LogLevelError, fmt.Sprintf("listen failed address=%s error=%v", addr, err))
 		return err
 	}
 

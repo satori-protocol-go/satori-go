@@ -25,12 +25,12 @@ func (a *Adapter) Logger() logging.Logger {
 	return a.logger
 }
 
-func (a *Adapter) log(ctx context.Context, level logging.Level, message string, fields ...logging.Field) {
+func (a *Adapter) log(ctx context.Context, level logging.Level, v ...any) {
 	logger := a.Logger()
 	if logger == nil {
 		return
 	}
-	logger.Log(ctx, level, message, fields...)
+	logger.Log(ctx, level, v...)
 }
 
 func (a *Adapter) logf(level logging.Level, format string, args ...any) {

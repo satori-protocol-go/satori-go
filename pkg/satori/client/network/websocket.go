@@ -88,10 +88,7 @@ func (n *WS) Run(ctx context.Context) error {
 			return nil
 		}
 
-		n.base.Log(ctx, logging.LevelWarn, "websocket network disconnected",
-			logging.Field{Key: "network_id", Value: n.ID()},
-			logging.Field{Key: "error", Value: err},
-		)
+		n.base.Log(ctx, logging.LevelWarn, fmt.Sprintf("websocket network disconnected network_id=%s error=%v", n.ID(), err))
 		n.base.app.MarkNetworkStatus(n.ID(), login.LoginStatusReconnect, false)
 
 		select {
@@ -197,9 +194,7 @@ func (n *WS) authenticate(connection *websocket.Conn) error {
 	n.base.SetProxyURLs(ready.ProxyUrls)
 	n.base.app.SyncLogins(n.ID(), n.base.Config(), ready.ProxyUrls, ready.Logins)
 	if len(ready.Logins) == 0 {
-		n.base.Log(context.Background(), logging.LevelWarn, "no login available for websocket",
-			logging.Field{Key: "network_id", Value: n.ID()},
-		)
+		n.base.Log(context.Background(), logging.LevelWarn, fmt.Sprintf("no login available for websocket network_id=%s", n.ID()))
 	}
 	return nil
 }
@@ -223,10 +218,7 @@ func (n *WS) receiveLoop(connection *websocket.Conn) error {
 		case operation.OpcodeEvent:
 			var evt event.Event
 			if err := decodeJSON(frame.Body, &evt); err != nil {
-				n.base.Log(context.Background(), logging.LevelWarn, "failed to parse event payload",
-					logging.Field{Key: "network_id", Value: n.ID()},
-					logging.Field{Key: "error", Value: err},
-				)
+				n.base.Log(context.Background(), logging.LevelWarn, fmt.Sprintf("failed to parse event payload network_id=%s error=%v", n.ID(), err))
 				continue
 			}
 			n.base.SetSequence(evt.Sn)
@@ -246,10 +238,7 @@ func (n *WS) receiveLoop(connection *websocket.Conn) error {
 
 		default:
 			if frame.Op > operation.OpcodeMeta {
-				n.base.Log(context.Background(), logging.LevelWarn, "received unknown opcode",
-					logging.Field{Key: "network_id", Value: n.ID()},
-					logging.Field{Key: "opcode", Value: frame.Op},
-				)
+				n.base.Log(context.Background(), logging.LevelWarn, fmt.Sprintf("received unknown opcode network_id=%s opcode=%d", n.ID(), frame.Op))
 			}
 		}
 	}

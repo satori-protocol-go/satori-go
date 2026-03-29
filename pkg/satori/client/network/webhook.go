@@ -217,10 +217,7 @@ func (n *Webhook) handleRequest(w http.ResponseWriter, request *http.Request) {
 	case operation.OpcodeEvent:
 		var evt event.Event
 		if err := decodeJSON(payload, &evt); err != nil {
-			n.base.Log(request.Context(), logging.LevelWarn, "failed to parse webhook event",
-				logging.Field{Key: "network_id", Value: n.ID()},
-				logging.Field{Key: "error", Value: err},
-			)
+			n.base.Log(request.Context(), logging.LevelWarn, fmt.Sprintf("failed to parse webhook event network_id=%s error=%v", n.ID(), err))
 			w.WriteHeader(http.StatusInternalServerError)
 			return
 		}

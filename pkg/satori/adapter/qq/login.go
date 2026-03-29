@@ -2,6 +2,7 @@ package qq
 
 import (
 	"context"
+	"fmt"
 	"strings"
 	"time"
 
@@ -207,10 +208,10 @@ func (a *Adapter) findLogin(platform string, selfID string) *login.Login {
 
 func (a *Adapter) bootstrap(ctx context.Context) {
 	if err := a.ensureLogins(ctx); err != nil {
-		a.log(ctx, logging.LevelError, "bootstrap login failed", logging.Field{Key: "error", Value: err})
+		a.log(ctx, logging.LevelError, fmt.Sprintf("bootstrap login failed error=%v", err))
 		return
 	}
-	a.log(ctx, logging.LevelInfo, "已成功连接 QQ 开放平台")
+	a.log(ctx, logging.LevelInfo, "connected to QQ platform")
 	logins, err := a.GetLogins(ctx)
 	if err != nil {
 		return
@@ -228,7 +229,7 @@ func (a *Adapter) bootstrap(ctx context.Context) {
 			continue
 		}
 		welcomed[name] = struct{}{}
-		a.log(ctx, logging.LevelInfo, "欢迎使用机器人", logging.Field{Key: "name", Value: name})
+		a.log(ctx, logging.LevelInfo, fmt.Sprintf("welcome %s", name))
 	}
 	for _, item := range logins {
 		if item == nil {

@@ -457,9 +457,10 @@ func (a *App) post(evt *event.Event, networkID string) {
 		a.mu.RUnlock()
 		if !ok {
 			if evt.Login == nil || evt.Login.Status != login.LoginStatusOnline {
-				a.log(context.Background(), logging.LevelWarn, "received login update for unknown account",
-					logging.Field{Key: "event_type", Value: evt.Type},
-					logging.Field{Key: "event_sn", Value: evt.Sn},
+				a.log(
+					context.Background(),
+					logging.LevelWarn,
+					fmt.Sprintf("received login update for unknown account event_type=%s event_sn=%d", evt.Type, evt.Sn),
 				)
 				return
 			}
@@ -480,9 +481,10 @@ func (a *App) post(evt *event.Event, networkID string) {
 		account, ok = a.accounts[identity]
 		a.mu.RUnlock()
 		if !ok {
-			a.log(context.Background(), logging.LevelWarn, "received login removed for unknown account",
-				logging.Field{Key: "event_type", Value: evt.Type},
-				logging.Field{Key: "event_sn", Value: evt.Sn},
+			a.log(
+				context.Background(),
+				logging.LevelWarn,
+				fmt.Sprintf("received login removed for unknown account event_type=%s event_sn=%d", evt.Type, evt.Sn),
 			)
 			return
 		}
@@ -495,9 +497,10 @@ func (a *App) post(evt *event.Event, networkID string) {
 		account, ok = a.accounts[identity]
 		a.mu.RUnlock()
 		if !ok {
-			a.log(context.Background(), logging.LevelWarn, "received event for unknown account",
-				logging.Field{Key: "event_type", Value: evt.Type},
-				logging.Field{Key: "event_sn", Value: evt.Sn},
+			a.log(
+				context.Background(),
+				logging.LevelWarn,
+				fmt.Sprintf("received event for unknown account event_type=%s event_sn=%d", evt.Type, evt.Sn),
 			)
 			return
 		}
@@ -604,12 +607,12 @@ func (a *App) ensureNetworkStateLocked(networkID string) *networkState {
 	return state
 }
 
-func (a *App) log(ctx context.Context, level logging.Level, message string, fields ...logging.Field) {
+func (a *App) log(ctx context.Context, level logging.Level, v ...any) {
 	logger := a.Logger()
 	if logger == nil {
 		return
 	}
-	logger.Log(ctx, level, message, fields...)
+	logger.Log(ctx, level, v...)
 }
 
 func (a *App) dispatchEvent(account *Account, evt *event.Event) {
@@ -640,7 +643,7 @@ func (a *App) dispatchEvent(account *Account, evt *event.Event) {
 	close(errCh)
 
 	for err := range errCh {
-		a.log(context.Background(), logging.LevelError, "event callback error", logging.Field{Key: "error", Value: err})
+		a.log(context.Background(), logging.LevelError, fmt.Sprintf("event callback error error=%v", err))
 	}
 }
 
@@ -672,7 +675,7 @@ func (a *App) accountUpdate(account *Account, status login.LoginStatus) {
 	close(errCh)
 
 	for err := range errCh {
-		a.log(context.Background(), logging.LevelError, "lifecycle callback error", logging.Field{Key: "error", Value: err})
+		a.log(context.Background(), logging.LevelError, fmt.Sprintf("lifecycle callback error error=%v", err))
 	}
 }
 
