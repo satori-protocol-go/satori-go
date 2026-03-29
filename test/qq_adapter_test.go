@@ -572,3 +572,78 @@ func TestQQAdapterMessageCreateQQGuildMultipartImage(t *testing.T) {
 		t.Fatalf("unexpected message count: %d", len(items))
 	}
 }
+
+func TestQQAdapterMessageCreateQQPassiveReferrerElement(t *testing.T) {
+	mock := &qqMockOpenAPI{me: &botgodto.User{ID: "bot-passive", Username: "tester", Bot: true}}
+	adapter := newQQTestAdapter(t, mock)
+
+	var captured *botgodto.MessageToCreate
+	mock.postGroupMessageHook = func(groupID string, msg botgodto.APIMessage) {
+		if groupID != "group-passive" {
+			t.Fatalf("unexpected group id: %s", groupID)
+		}
+		typed, ok := msg.(*botgodto.MessageToCreate)
+		if !ok {
+			t.Fatalf("unexpected api message type: %T", msg)
+		}
+		copied := *typed
+		captured = &copied
+	}
+
+	route, ok := adapter.Routes()[string(satoriserver.ApiMessageCreate)]
+	if !ok {
+		t.Fatal("message.create route not found")
+	}
+
+	_, err := route(satoriserver.Request[any]{
+		Action:   string(satoriserver.ApiMessageCreate),
+		Platform: "qq",
+		SelfID:   "bot-passive",
+		Params: map[string]any{
+			"channel_id": "group-passive",
+			"content":    `hello<qq:passive id="passive-msg" seq="-1"/>`,
+			"referrer": map[string]any{
+				"msg_id":  "legacy-msg",
+				"msg_seq": 8,
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("message.create with qq:passive failed: %v", err)
+	}
+	if captured == nil {
+		t.Fatal("group message payload was not captured")
+	}
+	if captured.Content != "hello" {
+		t.Fatalf("unexpected content: %q", captured.Content)
+	}
+	if captured.MsgID != "passive-msg" {
+		t.Fatalf("unexpected msg_id: %q", captured.MsgID)
+	}
+	if captured.MsgSeq != 0 {
+		t.Fatalf("unexpected msg_seq: %d", captured.MsgSeq)
+	}
+}
+
+func TestQQAdapterMessageCreateQQPassiveReferrerInvalidSeq(t *testing.T) {
+	mock := &qqMockOpenAPI{me: &botgodto.User{ID: "bot-passive-2", Username: "tester", Bot: true}}
+	adapter := newQQTestAdapter(t, mock)
+
+	route, ok := adapter.Routes()[string(satoriserver.ApiMessageCreate)]
+	if !ok {
+		t.Fatal("message.create route not found")
+	}
+
+	_, err := route(satoriserver.Request[any]{
+		Action:   string(satoriserver.ApiMessageCreate),
+		Platform: "qq",
+		SelfID:   "bot-passive-2",
+		Params: map[string]any{
+			"channel_id": "group-passive",
+			"content":    `<qq:passive id="passive-msg" seq="invalid-seq"/>hello`,
+		},
+	})
+	if err == nil {
+		t.Fatal("expected message.create to fail when qq:passive seq is invalid")
+	}
+}

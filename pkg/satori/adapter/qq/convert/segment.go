@@ -31,6 +31,12 @@ type MessageSegment struct {
 	Buttons  [][]MessageButton
 }
 
+type QQPassiveReferrer struct {
+	MsgID     string
+	MsgSeq    string
+	HasMsgSeq bool
+}
+
 type MessageButton struct {
 	Id    string
 	Type  string
@@ -41,14 +47,23 @@ type MessageButton struct {
 }
 
 func ParseMessageSegments(content string, platform string) []MessageSegment {
-	segments, err := parseQQMessageSegments(content, platform)
+	state, err := parseQQMessage(content, platform)
 	if err != nil {
 		return []MessageSegment{{Text: content}}
 	}
+	segments := state.segments
 	if len(segments) == 0 && strings.TrimSpace(content) != "" {
 		return []MessageSegment{{Text: content}}
 	}
 	return segments
+}
+
+func ParseQQPassiveReferrer(content string) QQPassiveReferrer {
+	state, err := parseQQMessage(content, "qq")
+	if err != nil || state == nil {
+		return QQPassiveReferrer{}
+	}
+	return state.passive
 }
 
 type qqMessageParser struct {
@@ -56,13 +71,14 @@ type qqMessageParser struct {
 	pendingQuote string
 	currentText  strings.Builder
 	segments     []MessageSegment
+	passive      QQPassiveReferrer
 }
 
-func parseQQMessageSegments(content string, platform string) ([]MessageSegment, error) {
+func parseQQMessage(content string, platform string) (*qqMessageParser, error) {
 	rawElements := xhtml.Parse(content, nil)
 	elements, err := element.Transform(rawElements)
 	if err != nil {
-		return []MessageSegment{{Text: content}}, err
+		return nil, err
 	}
 
 	state := &qqMessageParser{
@@ -72,7 +88,7 @@ func parseQQMessageSegments(content string, platform string) ([]MessageSegment, 
 	state.walk(elements)
 	state.flushText()
 
-	return state.segments, nil
+	return state, nil
 }
 
 func (p *qqMessageParser) walk(elements []element.Element) {
@@ -217,9 +233,26 @@ func (p *qqMessageParser) renderExtension(input *element.Extension) string {
 }
 
 func (p *qqMessageParser) tryAppendExtendedSegment(input *element.Extension) bool {
-	if input == nil || p.platform != "qq" {
+	if input == nil {
 		return false
 	}
+
+	switch input.Tag() {
+	case "qq:passive":
+		if raw, ok := input.Get("id"); ok {
+			p.passive.MsgID = strings.TrimSpace(fmt.Sprint(raw))
+		}
+		if raw, ok := input.Get("seq"); ok {
+			p.passive.MsgSeq = strings.TrimSpace(fmt.Sprint(raw))
+			p.passive.HasMsgSeq = true
+		}
+		return true
+	}
+
+	if p.platform != "qq" {
+		return false
+	}
+
 	switch input.Tag() {
 	case "qq:ark":
 		p.flushText()

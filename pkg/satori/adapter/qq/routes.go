@@ -495,6 +495,9 @@ func (a *Adapter) handleMessageCreate(request *server.Request[server.MessageCrea
 	if err != nil {
 		return nil, err
 	}
+	if err := mergePassiveReferrer(&referrer, convert.ParseQQPassiveReferrer(request.Params.Content)); err != nil {
+		return nil, err
+	}
 	state, err := a.resolveRequestState(request.Origin, request.SelfID)
 	if err != nil {
 		return nil, err
@@ -684,6 +687,30 @@ func parseMessageReferrer(raw map[string]any) (messageReferrer, error) {
 		}
 	}
 	return result, nil
+}
+
+func mergePassiveReferrer(referrer *messageReferrer, passive convert.QQPassiveReferrer) error {
+	if referrer == nil {
+		return nil
+	}
+	if msgID := strings.TrimSpace(passive.MsgID); msgID != "" {
+		referrer.MsgID = msgID
+	}
+	if !passive.HasMsgSeq {
+		return nil
+	}
+
+	parsed, ok := asInt64(passive.MsgSeq)
+	if !ok {
+		return server.BadRequest("qq:passive seq must be an integer")
+	}
+	seq, err := int64ToInt(parsed, "qq:passive seq")
+	if err != nil {
+		return err
+	}
+	referrer.MsgSeq = seq
+	referrer.HasMsgSeq = true
+	return nil
 }
 
 func asInt64(value any) (int64, bool) {
