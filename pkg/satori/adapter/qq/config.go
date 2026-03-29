@@ -16,7 +16,6 @@ const (
 	defaultRequestTimeout = 10 * time.Second
 	defaultEventBuffer    = 128
 	defaultWSReconnect    = 5 * time.Second
-	defaultWSHandshake    = 30 * time.Second
 )
 
 const defaultWSIntents = int64(
@@ -90,7 +89,6 @@ type Config struct {
 	WSShardID          uint32
 	WSShardCount       uint32
 	WSReconnectDelay   time.Duration
-	WSHandshakeTimeout time.Duration
 
 	TokenInstance *token.Token
 	APIV1         openapi.OpenAPI
