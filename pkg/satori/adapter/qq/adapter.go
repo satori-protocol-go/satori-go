@@ -9,7 +9,6 @@ import (
 	"sync"
 	"time"
 
-	_ "github.com/WindowsSov8forUs/botgo-plus"
 	"github.com/WindowsSov8forUs/botgo-plus/openapi"
 	"github.com/WindowsSov8forUs/botgo-plus/token"
 	"github.com/gorilla/websocket"
@@ -93,6 +92,7 @@ func New(cfg Config) (*Adapter, error) {
 	if logger == nil {
 		logger = logging.NewStdLogger()
 	}
+	registerQQLogger(logger)
 	wsIntents := cfg.WSIntents
 	if wsIntents == 0 {
 		wsIntents = parseWSIntentNames(cfg.WSIntentNames, logger)
