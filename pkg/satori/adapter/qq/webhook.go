@@ -22,11 +22,15 @@ func (a *Adapter) RegisterRootRoutes(router chi.Router) {
 	if router == nil {
 		return
 	}
+	if a.wsEnabled {
+		a.log(context.Background(), logging.LevelInfo, "qq adapter is in websocket mode, webhook routes are disabled")
+		return
+	}
 	handler := http.HandlerFunc(a.handleWebhookRequest)
 	for _, path := range normalizeWebhookPaths(a.path) {
 		router.Handle(path, handler)
 	}
-	a.log(context.Background(), logging.LevelInfo, "WebHook 监听建立成功")
+	a.log(context.Background(), logging.LevelInfo, "qq webhook routes registered")
 }
 
 func normalizeWebhookPath(path string) string {
