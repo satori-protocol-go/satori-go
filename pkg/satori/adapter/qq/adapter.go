@@ -65,10 +65,11 @@ type Adapter struct {
 	auditMu      sync.Mutex
 	auditWaiters map[string][]chan string
 
-	mu        sync.RWMutex
-	logins    []*login.Login
-	selfID    string
-	selfToApp map[string]string
+	mu          sync.RWMutex
+	logins      []*login.Login
+	nextLoginSN int64
+	selfID      string
+	selfToApp   map[string]string
 }
 
 func New(cfg Config) (*Adapter, error) {
@@ -178,12 +179,11 @@ func (a *Adapter) GetLogins(ctx context.Context) ([]*login.Login, error) {
 	defer a.mu.RUnlock()
 
 	result := make([]*login.Login, 0, len(a.logins))
-	for index, item := range a.logins {
+	for _, item := range a.logins {
 		if item == nil {
 			continue
 		}
 		cloned := cloneLogin(item)
-		cloned.Sn = int64(index)
 		result = append(result, cloned)
 	}
 	return result, nil

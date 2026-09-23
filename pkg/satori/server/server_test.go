@@ -5,10 +5,12 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"github.com/go-chi/chi/v5"
 	"github.com/gorilla/websocket"
 	"github.com/satori-protocol-go/satori-go/pkg/satori/model/event"
 	"github.com/satori-protocol-go/satori-go/pkg/satori/model/login"
+	"github.com/satori-protocol-go/satori-go/pkg/satori/model/message"
 	"github.com/satori-protocol-go/satori-go/pkg/satori/model/operation"
 	"github.com/satori-protocol-go/satori-go/pkg/satori/model/user"
 	"github.com/satori-protocol-go/satori-go/pkg/satori/protocol"
@@ -1291,5 +1293,131 @@ func TestServerShutdownResult(t *testing.T) {
 		}
 	case <-ctx.Done():
 		t.Fatal(ctx.Err())
+	}
+}
+
+type eventProvider struct {
+	mockProvider
+	events chan *event.Event
+}
+
+func (p *eventProvider) Publisher(context.Context) <-chan *event.Event { return p.events }
+
+func TestProviderEventsAndSnapshots(t *testing.T) {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	port := listener.Addr().(*net.TCPAddr).Port
+	listener.Close()
+	srv, err := satoriserver.NewServer(satoriserver.Config{Port: port, Token: "fixture"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer srv.Close()
+	alpha := &login.Login{Sn: 0, Platform: "mock", User: &user.User{Id: "alpha"}, Status: login.LoginStatusOnline, Adapter: "fixture"}
+	beta := &login.Login{Sn: 0, Platform: "mock", User: &user.User{Id: "beta"}, Status: login.LoginStatusOnline, Adapter: "fixture"}
+	one := &eventProvider{mockProvider: mockProvider{logins: []*login.Login{alpha}}, events: make(chan *event.Event, 2)}
+	two := &eventProvider{mockProvider: mockProvider{logins: []*login.Login{beta}}, events: make(chan *event.Event, 2)}
+	if err := srv.Apply(one); err != nil {
+		t.Fatal(err)
+	}
+	if err := srv.Apply(two); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	finished := make(chan error, 1)
+	go func() { finished <- srv.Run(ctx) }()
+	defer func() {
+		cancel()
+		select {
+		case err := <-finished:
+			if err != nil {
+				t.Error(err)
+			}
+		case <-time.After(3 * time.Second):
+			t.Error("server completion timeout")
+		}
+	}()
+	endpoint := fmt.Sprintf("ws://127.0.0.1:%d/v1/events", port)
+	connect := func(sn *int64) (*websocket.Conn, []*login.Login) {
+		t.Helper()
+		var conn *websocket.Conn
+		deadline := time.Now().Add(2 * time.Second)
+		for time.Now().Before(deadline) {
+			conn, _, err = websocket.DefaultDialer.Dial(endpoint, nil)
+			if err == nil {
+				break
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+		conn.SetReadDeadline(time.Now().Add(2 * time.Second))
+		if err := conn.WriteJSON(operation.Operation{Op: operation.OpcodeIdentify, Body: operation.IdentifyBody{Token: "fixture", Sn: sn}}); err != nil {
+			t.Fatal(err)
+		}
+		var ready struct {
+			Op   operation.Opcode    `json:"op"`
+			Body operation.ReadyBody `json:"body"`
+		}
+		if err := conn.ReadJSON(&ready); err != nil {
+			t.Fatal(err)
+		}
+		if ready.Op != operation.OpcodeReady {
+			t.Fatalf("ready opcode=%d", ready.Op)
+		}
+		return conn, ready.Body.Logins
+	}
+	conn, logins := connect(nil)
+	defer conn.Close()
+	if len(logins) != 2 || logins[0].Sn == logins[1].Sn {
+		t.Fatalf("downstream logins=%+v", logins)
+	}
+	numbers := map[string]int64{}
+	for _, info := range logins {
+		numbers[info.User.Id] = info.Sn
+	}
+	readEvent := func(connection *websocket.Conn) *event.Event {
+		t.Helper()
+		var frame struct {
+			Op   operation.Opcode `json:"op"`
+			Body event.Event      `json:"body"`
+		}
+		if err := connection.ReadJSON(&frame); err != nil {
+			t.Fatal(err)
+		}
+		if frame.Op != operation.OpcodeEvent {
+			t.Fatalf("event opcode=%d", frame.Op)
+		}
+		return &frame.Body
+	}
+	first := &event.Event{Sn: 91, Type: event.EventTypeMessageCreated, Timestamp: 1, Login: alpha, Message: &message.Message{Id: "a", Content: "alpha"}}
+	one.events <- first
+	received := readEvent(conn)
+	if received.Sn != 0 || received.Login.Sn != numbers["alpha"] || received.Login.User.Id != "alpha" {
+		t.Fatalf("first event=%+v", received)
+	}
+	second := &event.Event{Sn: 92, Type: event.EventTypeMessageCreated, Timestamp: 2, Login: beta, Message: &message.Message{Id: "b", Content: "original"}, Data_: map[string]any{"value": "original"}}
+	two.events <- second
+	received = readEvent(conn)
+	if received.Sn != 1 || received.Login.Sn != numbers["beta"] || received.Login.User.Id != "beta" {
+		t.Fatalf("second event=%+v", received)
+	}
+	if first.Sn != 91 || second.Sn != 92 || beta.Sn != 0 {
+		t.Fatalf("source numbers=%d,%d,%d", first.Sn, second.Sn, beta.Sn)
+	}
+	second.Message.Content = "changed"
+	second.Data_.(map[string]any)["value"] = "changed"
+	resume := int64(0)
+	replay, again := connect(&resume)
+	defer replay.Close()
+	if len(again) != 2 || again[0].Sn != logins[0].Sn || again[1].Sn != logins[1].Sn {
+		t.Fatalf("ready mapping changed=%+v", again)
+	}
+	received = readEvent(replay)
+	if received.Sn != 1 || received.Message.Content != "original" || received.Data_.(map[string]any)["value"] != "original" || received.Login.Sn != numbers["beta"] {
+		t.Fatalf("frozen replay=%+v", received)
 	}
 }
