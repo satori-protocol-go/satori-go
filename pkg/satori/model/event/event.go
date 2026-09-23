@@ -2,6 +2,9 @@ package event
 
 import (
 	"encoding/json"
+	"github.com/satori-protocol-go/satori-go/pkg/satori/model/emoji"
+	"github.com/satori-protocol-go/satori-go/pkg/satori/model/friend"
+	"github.com/satori-protocol-go/satori-go/pkg/satori/types"
 	"strings"
 
 	"github.com/satori-protocol-go/satori-go/pkg/satori/model/channel"
@@ -56,6 +59,9 @@ const (
 
 // Event is the canonical Satori event payload.
 type Event struct {
+	fields    types.FieldPresence
+	Emoji     *emoji.Emoji             `json:"emoji,omitempty"`
+	Friend    *friend.Friend           `json:"friend,omitempty"`
 	Sn        int64                    `json:"sn"`
 	Type      EventType                `json:"type"`
 	Timestamp int64                    `json:"timestamp"`
@@ -76,6 +82,8 @@ type Event struct {
 
 func (e *Event) UnmarshalJSON(data []byte) error {
 	type eventWire struct {
+		Emoji     *emoji.Emoji             `json:"emoji"`
+		Friend    *friend.Friend           `json:"friend"`
 		Sn        *int64                   `json:"sn"`
 		ID        *int64                   `json:"id"`
 		Type      EventType                `json:"type"`
@@ -98,9 +106,13 @@ func (e *Event) UnmarshalJSON(data []byte) error {
 	}
 
 	var wire eventWire
-	if err := json.Unmarshal(data, &wire); err != nil {
+	fields, err := types.DecodeFields(data, &wire)
+	if err != nil {
 		return err
 	}
+	e.fields = fields
+	e.Emoji = wire.Emoji
+	e.Friend = wire.Friend
 
 	e.Sn = 0
 	if wire.Sn != nil {
@@ -152,4 +164,58 @@ func (e *Event) UnmarshalJSON(data []byte) error {
 		e.Login.Platform = platform
 	}
 	return nil
+}
+
+// MarshalJSON applies Satori resource promotion only to a temporary wire view.
+func (e Event) MarshalJSON() ([]byte, error) {
+	if e.Message != nil {
+		if e.Channel == nil && !e.fields.Has("channel") {
+			e.Channel = e.Message.Channel
+		}
+		if e.Guild == nil && !e.fields.Has("guild") {
+			e.Guild = e.Message.Guild
+		}
+		if e.Member == nil && !e.fields.Has("member") {
+			e.Member = e.Message.Member
+		}
+	}
+	if e.User == nil && !e.fields.Has("user") {
+		if e.Member != nil {
+			e.User = e.Member.User
+		}
+		if e.User == nil && e.Message != nil {
+			e.User = e.Message.User
+		}
+		if e.User == nil && e.Friend != nil {
+			e.User = e.Friend.User
+		}
+	}
+	if e.Message != nil {
+		e.Message = e.Message.WithoutResources()
+	}
+	if e.Member != nil {
+		e.Member = e.Member.WithoutUser()
+	}
+	if e.Friend != nil {
+		e.Friend = e.Friend.WithoutUser()
+	}
+	out := map[string]any{"sn": e.Sn, "type": e.Type, "timestamp": e.Timestamp, "login": e.Login}
+	if e.Login != nil && e.Type != EventTypeLoginAdded && e.Type != EventTypeLoginUpdated && e.Type != EventTypeLoginRemoved {
+		out["login"] = map[string]any{"sn": e.Login.Sn, "platform": e.Login.Platform, "user": e.Login.User}
+	}
+	e.fields.Put(out, "argv", e.Argv, e.Argv != nil)
+	e.fields.Put(out, "button", e.Button, e.Button != nil)
+	e.fields.Put(out, "channel", e.Channel, e.Channel != nil)
+	e.fields.Put(out, "emoji", e.Emoji, e.Emoji != nil)
+	e.fields.Put(out, "friend", e.Friend, e.Friend != nil)
+	e.fields.Put(out, "guild", e.Guild, e.Guild != nil)
+	e.fields.Put(out, "member", e.Member, e.Member != nil)
+	e.fields.Put(out, "message", e.Message, e.Message != nil)
+	e.fields.Put(out, "operator", e.Operator, e.Operator != nil)
+	e.fields.Put(out, "role", e.Role, e.Role != nil)
+	e.fields.Put(out, "user", e.User, e.User != nil)
+	e.fields.Put(out, "referrer", e.Referrer, e.Referrer != nil)
+	e.fields.Put(out, "_type", e.Type_, e.Type_ != "")
+	e.fields.Put(out, "_data", e.Data_, e.Data_ != nil)
+	return json.Marshal(out)
 }
