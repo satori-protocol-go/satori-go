@@ -1191,3 +1191,50 @@ func decodeTestParams[T any](value any) (T, error) {
 	_, err := handler(&satoriserver.Request[any]{Params: value})
 	return result, err
 }
+
+func TestProtocolAuthorization(t *testing.T) {
+	srv, err := satoriserver.NewServer(satoriserver.Config{Token: "fixture-secret"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer srv.Close()
+	srv.Route(protocol.ApiMessageCreate, func(r *satoriserver.Request[any]) (any, error) {
+		return []map[string]string{{"id": "sent", "content": "hello"}}, nil
+	})
+	if err := srv.Method(http.MethodPost, "/platform-callback", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(202) })); err != nil {
+		t.Fatal(err)
+	}
+	handler, err := srv.Handler()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, path := range []string{"/v1/message.create", "/v1/meta", "/v1/meta/webhook.delete"} {
+		for _, auth := range []string{"", "Bearer wrong", "Bearer fixture-secret"} {
+			r := httptest.NewRequest(http.MethodPost, path, strings.NewReader(`{"url":"http://fixture.invalid"}`))
+			r.Header.Set("Satori-Platform", "mock")
+			r.Header.Set("Satori-User-ID", "bot")
+			r.Header.Set("Authorization", auth)
+			w := httptest.NewRecorder()
+			handler.ServeHTTP(w, r)
+			want := 401
+			if auth == "Bearer fixture-secret" {
+				want = 200
+			}
+			if w.Code != want {
+				t.Errorf("%s auth=%q status=%d body=%s", path, auth, w.Code, w.Body)
+			}
+		}
+	}
+	r := httptest.NewRequest(http.MethodPost, "/platform-callback", nil)
+	w := httptest.NewRecorder()
+	handler.ServeHTTP(w, r)
+	if w.Code != 202 {
+		t.Fatalf("platform callback=%d", w.Code)
+	}
+	r = httptest.NewRequest(http.MethodGet, "/v1/proxy/"+url.PathEscape("internal:mock/bot/_api/users"), nil)
+	w = httptest.NewRecorder()
+	handler.ServeHTTP(w, r)
+	if w.Code != 401 {
+		t.Fatalf("native proxy authorization=%d", w.Code)
+	}
+}

@@ -144,6 +144,7 @@ func TestSatoriAdapterRouteForward(t *testing.T) {
 	request.Header.Set("Content-Type", "application/json")
 	request.Header.Set("X-Platform", "satori")
 	request.Header.Set("X-Self-ID", "bot")
+	request.Header.Set("Authorization", "Bearer local-secret")
 
 	response, err := http.DefaultClient.Do(request)
 	if err != nil {

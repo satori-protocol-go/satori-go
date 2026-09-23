@@ -421,9 +421,9 @@ func (s *Server) mountProtocolRoutes(router chi.Router) {
 	base := s.apiBasePath()
 	router.Route(base, func(r chi.Router) {
 		r.Get("/events", s.websocketServerHandler)
-		r.Post("/meta", s.metaGetHandler)
-		r.Post("/meta/webhook.create", s.webhookCreateHandler)
-		r.Post("/meta/webhook.delete", s.webhookDeleteHandler)
+		r.Post("/meta", s.authorized(s.metaGetHandler))
+		r.Post("/meta/webhook.create", s.authorized(s.webhookCreateHandler))
+		r.Post("/meta/webhook.delete", s.authorized(s.webhookDeleteHandler))
 		for _, method := range [...]string{
 			http.MethodGet,
 			http.MethodPost,
@@ -431,7 +431,7 @@ func (s *Server) mountProtocolRoutes(router chi.Router) {
 			http.MethodDelete,
 		} {
 			r.MethodFunc(method, "/proxy/*", s.proxyURLHandler)
-			r.MethodFunc(method, "/*", s.httpServerHandler)
+			r.MethodFunc(method, "/*", s.authorized(s.httpServerHandler))
 		}
 	})
 }
@@ -767,10 +767,36 @@ func (s *Server) websocketServerHandler(w http.ResponseWriter, request *http.Req
 	s.log(request.Context(), LogLevelInfo, closedBuilder.String())
 }
 
+// authorized protects Satori RPC and metadata routes, not platform callbacks or static files.
+func (s *Server) authorized(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if s.authorize(w, r) {
+			next(w, r)
+		}
+	}
+}
+
+func (s *Server) authorize(w http.ResponseWriter, r *http.Request) bool {
+	if s.Token == "" {
+		return true
+	}
+	token, ok := protocol.ParseBearer(r.Header.Get(protocol.HeaderAuthorization))
+	if !ok || token != s.Token {
+		w.Header().Set("WWW-Authenticate", "Bearer")
+		writeError(w, Unauthorized("invalid Satori authorization"))
+		return false
+	}
+	return true
+}
+
 func (s *Server) httpServerHandler(w http.ResponseWriter, request *http.Request) {
 	s.ensureDefaultUploadRoute()
 
 	action := s.extractAction(request)
+	if protocol.IsApi(protocol.ParseApi(action)) && request.Method != http.MethodPost {
+		writeMethodNotAllowed(w)
+		return
+	}
 	s.mu.RLock()
 	hasAdapters := len(s.adapters) > 0
 	hasServerRoutes := len(s.routes) > 0
@@ -814,6 +840,18 @@ func (s *Server) proxyURLHandler(w http.ResponseWriter, request *http.Request) {
 		return
 	}
 
+	// Public GET resources contain opaque identifiers. Native API proxying always
+	// uses Satori authorization, including GET requests that may disclose platform data.
+	normalized, parseErr := normalizeProxyURL(rawURL)
+	if parseErr != nil {
+		writeError(w, BadRequest(parseErr.Error()))
+		return
+	}
+	match := internalURLPattern.FindStringSubmatch(normalized)
+	native := len(match) == 4 && (match[3] == "_api" || strings.HasPrefix(match[3], "_api/"))
+	if (native || (request.Method != http.MethodGet && request.Method != http.MethodHead)) && !s.authorize(w, request) {
+		return
+	}
 	resp, err := s.fetchProxy(rawURL, request)
 	if err != nil {
 		writeError(w, err)
