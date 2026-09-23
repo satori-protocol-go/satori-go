@@ -110,6 +110,9 @@ func (c *websocketConnection) Close() error {
 func (c *websocketConnection) Send(payload any) error {
 	c.writeMu.Lock()
 	defer c.writeMu.Unlock()
+	if err := c.connection.SetWriteDeadline(time.Now().Add(10 * time.Second)); err != nil {
+		return err
+	}
 	if err := c.connection.WriteJSON(payload); err != nil {
 		c.setCloseInfo("write failed", err)
 		return err

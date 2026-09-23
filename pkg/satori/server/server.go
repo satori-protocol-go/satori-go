@@ -40,7 +40,7 @@ const (
 	defaultStreamThreshold = 16 * 1024 * 1024
 	defaultStreamChunkSize = 64 * 1024
 	defaultHeartbeat       = 12 * time.Second
-	defaultIdentifyTimeout = 30 * time.Second
+	defaultIdentifyTimeout = 10 * time.Second
 	defaultReadFormMemory  = 32 << 20 // 32 MB
 	defaultCleanupTimeout  = 10 * time.Second
 	defaultWebhookTimeout  = protocol.DefaultRequestTimeout
@@ -97,6 +97,8 @@ type Server struct {
 	streamThreshold int
 	streamChunkSize int
 
+	// Lock order: publishMu, then mu. Provider calls and network I/O never hold mu.
+	publishMu   sync.Mutex
 	mu          sync.RWMutex
 	routers     []Router
 	adapters    []Adapter
@@ -544,6 +546,8 @@ func (s *Server) Post(evt *event.Event) error {
 }
 
 func (s *Server) postFrom(source int, evt *event.Event) error {
+	s.publishMu.Lock()
+	defer s.publishMu.Unlock()
 	if evt == nil {
 		return nil
 	}
@@ -785,56 +789,12 @@ func (s *Server) websocketServerHandler(w http.ResponseWriter, request *http.Req
 		return
 	}
 
-	logins, proxyUrls, err := s.collectMeta(request.Context())
-	if err != nil {
-		s.log(
-			request.Context(),
-			LogLevelError,
-			fmt.Sprintf("websocket prepare ready failed connection_id=%s remote_addr=%s error=%v", connection.ID(), connection.RemoteAddr(), err),
-		)
-		_ = connection.CloseWith(websocket.CloseInternalServerErr, "Internal Server Error")
+	if err := s.openEventStream(request.Context(), connection, sequence); err != nil {
+		s.log(request.Context(), LogLevelWarn, fmt.Sprintf("websocket initialization failed connection_id=%s error=%v", connection.ID(), err))
 		return
 	}
-
-	if err := connection.Send(map[string]any{
-		"op": operation.OpcodeReady,
-		"body": map[string]any{
-			"logins":     logins,
-			"proxy_urls": proxyUrls,
-		},
-	}); err != nil {
-		s.log(
-			request.Context(),
-			LogLevelWarn,
-			fmt.Sprintf("websocket send ready failed connection_id=%s remote_addr=%s error=%v", connection.ID(), connection.RemoteAddr(), err),
-		)
-		return
-	}
-	s.log(
-		request.Context(),
-		LogLevelDebug,
-		fmt.Sprintf("websocket ready sent connection_id=%s remote_addr=%s", connection.ID(), connection.RemoteAddr()),
-	)
-
-	s.addConnection(connection)
 	defer s.removeConnection(connection)
 
-	if sequence > -1 {
-		for _, evt := range s.eventCache.After(sequence) {
-			if isLoginEventType(evt.kind) {
-				continue
-			}
-			if err := connection.Send(map[string]any{
-				"op":   operation.OpcodeEvent,
-				"body": evt.body,
-			}); err != nil {
-				return
-			}
-			time.Sleep(100 * time.Millisecond)
-		}
-	}
-
-	go connection.Heartbeat(defaultHeartbeat)
 	connection.WaitClosed()
 	closeReason, closeErr := connection.CloseInfo()
 	lastHeartbeatAt, lastHeartbeatLatency := connection.LastHeartbeat()
@@ -851,6 +811,33 @@ func (s *Server) websocketServerHandler(w http.ResponseWriter, request *http.Req
 		))
 	}
 	s.log(request.Context(), LogLevelInfo, closedBuilder.String())
+}
+
+// openEventStream shares the publication order boundary. Provider snapshots run
+// without the general state lock; events produced meanwhile wait for this handoff.
+func (s *Server) openEventStream(ctx context.Context, connection *websocketConnection, sequence int64) error {
+	s.publishMu.Lock()
+	defer s.publishMu.Unlock()
+	logins, proxyURLs, err := s.collectMeta(ctx)
+	if err != nil {
+		return err
+	}
+	if err := connection.Send(map[string]any{"op": operation.OpcodeReady, "body": map[string]any{"logins": logins, "proxy_urls": proxyURLs}}); err != nil {
+		return err
+	}
+	go connection.Heartbeat(defaultHeartbeat)
+	if sequence >= 0 {
+		for _, evt := range s.eventCache.After(sequence) {
+			if isLoginEventType(evt.kind) {
+				continue
+			}
+			if err := connection.Send(map[string]any{"op": operation.OpcodeEvent, "body": evt.body}); err != nil {
+				return err
+			}
+		}
+	}
+	s.addConnection(connection)
+	return nil
 }
 
 // authorized protects Satori RPC and metadata routes, not platform callbacks or static files.
@@ -1771,36 +1758,34 @@ func (s *Server) mountAdapterRootRoutes(router chi.Router) {
 func readIdentify(connection *websocketConnection) (string, int64, error) {
 	connection.connection.SetReadDeadline(time.Now().Add(defaultIdentifyTimeout))
 	defer connection.connection.SetReadDeadline(time.Time{})
-
 	_, payload, err := connection.connection.ReadMessage()
 	if err != nil {
 		return "", -1, err
 	}
-
 	var frame struct {
-		Op   operation.Opcode `json:"op"`
-		Body map[string]any   `json:"body"`
+		Op   *operation.Opcode `json:"op"`
+		Body struct {
+			Token    string `json:"token"`
+			Sn       *int64 `json:"sn"`
+			Sequence *int64 `json:"sequence"`
+		} `json:"body"`
 	}
 	if err := json.Unmarshal(payload, &frame); err != nil {
 		return "", -1, err
 	}
-	if frame.Op != operation.OpcodeIdentify {
+	if frame.Op == nil || *frame.Op != operation.OpcodeIdentify {
 		return "", -1, errors.New("invalid identify opcode")
 	}
-
-	token := asString(frame.Body["token"])
-	sequence := int64(-1)
-	if value, ok := frame.Body["sequence"]; ok {
-		if parsed, ok := toInt64(value); ok {
-			sequence = parsed
-		}
-	} else if value, ok := frame.Body["sn"]; ok {
-		if parsed, ok := toInt64(value); ok {
-			sequence = parsed
-		}
+	position := frame.Body.Sn
+	if position == nil {
+		position = frame.Body.Sequence
 	}
-
-	return token, sequence, nil
+	sequence := int64(-1)
+	if position != nil {
+		// Preserve the existing negative sentinel for clients that explicitly opt out of replay.
+		sequence = *position
+	}
+	return frame.Body.Token, sequence, nil
 }
 
 func parseParams(action string, request *http.Request) (any, error) {
@@ -1954,50 +1939,6 @@ func randomToken(size int) (string, error) {
 	return base64.RawURLEncoding.EncodeToString(buffer), nil
 }
 
-func toInt64(value any) (int64, bool) {
-	switch typed := value.(type) {
-	case int:
-		return int64(typed), true
-	case int8:
-		return int64(typed), true
-	case int16:
-		return int64(typed), true
-	case int32:
-		return int64(typed), true
-	case int64:
-		return typed, true
-	case uint:
-		return int64(typed), true
-	case uint8:
-		return int64(typed), true
-	case uint16:
-		return int64(typed), true
-	case uint32:
-		return int64(typed), true
-	case uint64:
-		return int64(typed), true
-	case float64:
-		return int64(typed), true
-	case float32:
-		return int64(typed), true
-	case json.Number:
-		result, err := typed.Int64()
-		if err == nil {
-			return result, true
-		}
-		floatResult, err := typed.Float64()
-		if err == nil {
-			return int64(floatResult), true
-		}
-	case string:
-		result, err := strconv.ParseInt(typed, 10, 64)
-		if err == nil {
-			return result, true
-		}
-	}
-	return 0, false
-}
-
 func cloneHTTPHeader(source http.Header) http.Header {
 	if source == nil {
 		return http.Header{}
@@ -2012,20 +1953,6 @@ func cloneHTTPHeader(source http.Header) http.Header {
 		cloned[key] = copied
 	}
 	return cloned
-}
-
-func asString(value any) string {
-	switch typed := value.(type) {
-	case string:
-		return typed
-	case json.Number:
-		return typed.String()
-	default:
-		if value == nil {
-			return ""
-		}
-		return fmt.Sprint(value)
-	}
 }
 
 func isLoginEventType(typ event.EventType) bool {

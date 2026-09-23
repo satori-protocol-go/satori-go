@@ -23,6 +23,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -1419,5 +1420,89 @@ func TestProviderEventsAndSnapshots(t *testing.T) {
 	received = readEvent(replay)
 	if received.Sn != 1 || received.Message.Content != "original" || received.Data_.(map[string]any)["value"] != "original" || received.Login.Sn != numbers["beta"] {
 		t.Fatalf("frozen replay=%+v", received)
+	}
+}
+
+func TestReplayAndConcurrentPublication(t *testing.T) {
+	srv, err := satoriserver.NewServer(satoriserver.Config{Token: "fixture"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer srv.Close()
+	source := &login.Login{Sn: 0, Platform: "mock", User: &user.User{Id: "bot"}, Status: login.LoginStatusOnline, Adapter: "fixture"}
+	if err := srv.Apply(&mockProvider{logins: []*login.Login{source}}); err != nil {
+		t.Fatal(err)
+	}
+	publish := func(content string) error {
+		return srv.Post(&event.Event{Type: event.EventTypeMessageCreated, Timestamp: 1, Login: source, Message: &message.Message{Id: content, Content: content}})
+	}
+	for n := 0; n < 4; n++ {
+		if err := publish(strconv.Itoa(n)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	httpServer := newTestHTTPServer(t, srv)
+	defer httpServer.Close()
+	conn, _, err := websocket.DefaultDialer.Dial("ws"+strings.TrimPrefix(httpServer.URL, "http")+"/v1/events", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	conn.SetReadDeadline(time.Now().Add(3 * time.Second))
+	zero := int64(0)
+	if err := conn.WriteJSON(operation.Operation{Op: operation.OpcodeIdentify, Body: operation.IdentifyBody{Token: "fixture", Sn: &zero}}); err != nil {
+		t.Fatal(err)
+	}
+	var frame struct {
+		Op   operation.Opcode `json:"op"`
+		Body json.RawMessage  `json:"body"`
+	}
+	if err := conn.ReadJSON(&frame); err != nil {
+		t.Fatal(err)
+	}
+	if frame.Op != operation.OpcodeReady {
+		t.Fatalf("ready=%d", frame.Op)
+	}
+	readSequence := func() int64 {
+		t.Helper()
+		if err := conn.ReadJSON(&frame); err != nil {
+			t.Fatal(err)
+		}
+		if frame.Op != operation.OpcodeEvent {
+			t.Fatalf("event=%d", frame.Op)
+		}
+		var body event.Event
+		if err := json.Unmarshal(frame.Body, &body); err != nil {
+			t.Fatal(err)
+		}
+		return body.Sn
+	}
+	if sn := readSequence(); sn != 1 {
+		t.Fatalf("first replay=%d", sn)
+	}
+	sent := make(chan error, 1)
+	go func() { sent <- publish("4") }()
+	for _, want := range []int64{2, 3, 4} {
+		if sn := readSequence(); sn != want {
+			t.Fatalf("replay sequence=%d want=%d", sn, want)
+		}
+	}
+	if err := <-sent; err != nil {
+		t.Fatal(err)
+	}
+	const count = 12
+	results := make(chan error, count)
+	for n := 0; n < count; n++ {
+		go func(n int) { results <- publish(fmt.Sprintf("parallel-%d", n)) }(n)
+	}
+	for want := int64(5); want < 5+count; want++ {
+		if sn := readSequence(); sn != want {
+			t.Fatalf("concurrent sequence=%d want=%d", sn, want)
+		}
+	}
+	for n := 0; n < count; n++ {
+		if err := <-results; err != nil {
+			t.Fatal(err)
+		}
 	}
 }
