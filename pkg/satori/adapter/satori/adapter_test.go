@@ -1,10 +1,11 @@
-package testsuite
+package satori_test
 
 import (
 	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
+	"github.com/satori-protocol-go/satori-go/pkg/satori/protocol"
 	"io"
 	"net"
 	"net/http"
@@ -83,16 +84,14 @@ func TestSatoriAdapterRouteForward(t *testing.T) {
 	if err := remoteServer.Apply(&satoriRemoteProvider{login: remoteLogin}); err != nil {
 		t.Fatalf("apply remote provider failed: %v", err)
 	}
-	if err := remoteServer.Route(string(satoriserver.ApiMessageCreate), func(request satoriserver.Request[any]) (any, error) {
+	remoteServer.Route(protocol.ApiMessageCreate, func(request *satoriserver.Request[any]) (any, error) {
 		params, ok := request.Params.(map[string]any)
 		if !ok {
 			return nil, satoriserver.BadRequest("invalid params")
 		}
 		content, _ := params["content"].(string)
 		return []*message.Message{{Id: "1", Content: content}}, nil
-	}); err != nil {
-		t.Fatalf("register remote route failed: %v", err)
-	}
+	})
 
 	remoteCtx, remoteCancel := context.WithCancel(context.Background())
 	defer remoteCancel()
@@ -271,7 +270,7 @@ func TestSatoriAdapterEventForward(t *testing.T) {
 	if err := connection.ReadJSON(&pushed); err != nil {
 		t.Fatalf("read pushed event failed: %v", err)
 	}
-	if toInt(t, pushed["op"]) != int(operation.OpcodeEvent) {
+	if pushed["op"] != float64(operation.OpcodeEvent) {
 		t.Fatalf("unexpected opcode: %#v", pushed["op"])
 	}
 

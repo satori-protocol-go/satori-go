@@ -1,10 +1,11 @@
-package testsuite
+package qq_test
 
 import (
 	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
+	"github.com/satori-protocol-go/satori-go/pkg/satori/protocol"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -14,6 +15,7 @@ import (
 
 	botgodto "github.com/WindowsSov8forUs/botgo-plus/dto"
 	botgoopenapi "github.com/WindowsSov8forUs/botgo-plus/openapi"
+	"github.com/go-chi/chi/v5"
 	adapterqq "github.com/satori-protocol-go/satori-go/pkg/satori/adapter/qq"
 	"github.com/satori-protocol-go/satori-go/pkg/satori/model/event"
 	"github.com/satori-protocol-go/satori-go/pkg/satori/model/message"
@@ -21,6 +23,7 @@ import (
 )
 
 type qqMockOpenAPI struct {
+	botgoopenapi.OpenAPI
 	me *botgodto.User
 
 	postMessageHook      func(channelID string, msg *botgodto.MessageToCreate)
@@ -271,13 +274,13 @@ func TestQQAdapterMessageCreate(t *testing.T) {
 		privateCalls++
 	}
 
-	route, ok := adapter.Routes()[string(satoriserver.ApiMessageCreate)]
+	route, ok := adapter.Routes()[string(protocol.ApiMessageCreate)]
 	if !ok {
 		t.Fatal("message.create route not found")
 	}
 
-	_, err := route(satoriserver.Request[any]{
-		Action:   string(satoriserver.ApiMessageCreate),
+	_, err := route(&satoriserver.Request[any]{
+		Action:   string(protocol.ApiMessageCreate),
 		Platform: "qq",
 		SelfID:   "bot-2",
 		Params: map[string]any{
@@ -289,8 +292,8 @@ func TestQQAdapterMessageCreate(t *testing.T) {
 		t.Fatalf("group message.create failed: %v", err)
 	}
 
-	_, err = route(satoriserver.Request[any]{
-		Action:   string(satoriserver.ApiMessageCreate),
+	_, err = route(&satoriserver.Request[any]{
+		Action:   string(protocol.ApiMessageCreate),
 		Platform: "qq",
 		SelfID:   "bot-2",
 		Params: map[string]any{
@@ -314,11 +317,9 @@ func TestQQAdapterWebhookValidationAndDispatch(t *testing.T) {
 	mock := &qqMockOpenAPI{me: &botgodto.User{ID: "bot-3", Username: "tester", Bot: true}}
 	adapter := newQQTestAdapter(t, mock)
 
-	routes := adapter.RootRoutes()
-	if len(routes) == 0 {
-		t.Fatal("root routes not found")
-	}
-	handler := routes[0].Handler
+	router := chi.NewRouter()
+	adapter.RegisterRootRoutes(router)
+	handler := router
 
 	validationBody := map[string]any{
 		"op": int(botgodto.HTTPCallbackValidation),
@@ -328,7 +329,7 @@ func TestQQAdapterWebhookValidationAndDispatch(t *testing.T) {
 		},
 	}
 	validationRaw, _ := json.Marshal(validationBody)
-	validationReq := httptest.NewRequest(http.MethodPost, routes[0].Path, bytes.NewReader(validationRaw))
+	validationReq := httptest.NewRequest(http.MethodPost, "/qqbot", bytes.NewReader(validationRaw))
 	validationReq.Header.Set("X-Bot-Appid", "123")
 	validationResp := httptest.NewRecorder()
 	handler.ServeHTTP(validationResp, validationReq)
@@ -365,7 +366,7 @@ func TestQQAdapterWebhookValidationAndDispatch(t *testing.T) {
 		},
 	}
 	dispatchRaw, _ := json.Marshal(dispatchBody)
-	dispatchReq := httptest.NewRequest(http.MethodPost, routes[0].Path, bytes.NewReader(dispatchRaw))
+	dispatchReq := httptest.NewRequest(http.MethodPost, "/qqbot", bytes.NewReader(dispatchRaw))
 	dispatchReq.Header.Set("X-Bot-Appid", "123")
 	dispatchResp := httptest.NewRecorder()
 	handler.ServeHTTP(dispatchResp, dispatchReq)
@@ -418,13 +419,13 @@ func TestQQAdapterMessageCreateQQResourceSegments(t *testing.T) {
 		}
 	}
 
-	route, ok := adapter.Routes()[string(satoriserver.ApiMessageCreate)]
+	route, ok := adapter.Routes()[string(protocol.ApiMessageCreate)]
 	if !ok {
 		t.Fatal("message.create route not found")
 	}
 
-	result, err := route(satoriserver.Request[any]{
-		Action:   string(satoriserver.ApiMessageCreate),
+	result, err := route(&satoriserver.Request[any]{
+		Action:   string(protocol.ApiMessageCreate),
 		Platform: "qq",
 		SelfID:   "bot-4",
 		Params: map[string]any{
@@ -488,13 +489,13 @@ func TestQQAdapterMessageCreateQQGuildQuoteAndImage(t *testing.T) {
 		}
 	}
 
-	route, ok := adapter.Routes()[string(satoriserver.ApiMessageCreate)]
+	route, ok := adapter.Routes()[string(protocol.ApiMessageCreate)]
 	if !ok {
 		t.Fatal("message.create route not found")
 	}
 
-	result, err := route(satoriserver.Request[any]{
-		Action:   string(satoriserver.ApiMessageCreate),
+	result, err := route(&satoriserver.Request[any]{
+		Action:   string(protocol.ApiMessageCreate),
 		Platform: "qqguild",
 		SelfID:   "bot-5",
 		Params: map[string]any{
@@ -544,13 +545,13 @@ func TestQQAdapterMessageCreateQQGuildMultipartImage(t *testing.T) {
 		}
 	}
 
-	route, ok := adapter.Routes()[string(satoriserver.ApiMessageCreate)]
+	route, ok := adapter.Routes()[string(protocol.ApiMessageCreate)]
 	if !ok {
 		t.Fatal("message.create route not found")
 	}
 
-	result, err := route(satoriserver.Request[any]{
-		Action:   string(satoriserver.ApiMessageCreate),
+	result, err := route(&satoriserver.Request[any]{
+		Action:   string(protocol.ApiMessageCreate),
 		Platform: "qqguild",
 		SelfID:   "bot-6",
 		Params: map[string]any{
@@ -590,13 +591,13 @@ func TestQQAdapterMessageCreateQQPassiveReferrerElement(t *testing.T) {
 		captured = &copied
 	}
 
-	route, ok := adapter.Routes()[string(satoriserver.ApiMessageCreate)]
+	route, ok := adapter.Routes()[string(protocol.ApiMessageCreate)]
 	if !ok {
 		t.Fatal("message.create route not found")
 	}
 
-	_, err := route(satoriserver.Request[any]{
-		Action:   string(satoriserver.ApiMessageCreate),
+	_, err := route(&satoriserver.Request[any]{
+		Action:   string(protocol.ApiMessageCreate),
 		Platform: "qq",
 		SelfID:   "bot-passive",
 		Params: map[string]any{
@@ -629,13 +630,13 @@ func TestQQAdapterMessageCreateQQPassiveReferrerInvalidSeq(t *testing.T) {
 	mock := &qqMockOpenAPI{me: &botgodto.User{ID: "bot-passive-2", Username: "tester", Bot: true}}
 	adapter := newQQTestAdapter(t, mock)
 
-	route, ok := adapter.Routes()[string(satoriserver.ApiMessageCreate)]
+	route, ok := adapter.Routes()[string(protocol.ApiMessageCreate)]
 	if !ok {
 		t.Fatal("message.create route not found")
 	}
 
-	_, err := route(satoriserver.Request[any]{
-		Action:   string(satoriserver.ApiMessageCreate),
+	_, err := route(&satoriserver.Request[any]{
+		Action:   string(protocol.ApiMessageCreate),
 		Platform: "qq",
 		SelfID:   "bot-passive-2",
 		Params: map[string]any{
