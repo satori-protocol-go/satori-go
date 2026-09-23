@@ -428,6 +428,9 @@ func (s *Server) mountProtocolRoutes(router chi.Router) {
 			http.MethodGet,
 			http.MethodPost,
 			http.MethodPut,
+			http.MethodPatch,
+			http.MethodHead,
+			http.MethodOptions,
 			http.MethodDelete,
 		} {
 			r.MethodFunc(method, "/proxy/*", s.proxyURLHandler)
@@ -1698,6 +1701,10 @@ func readIdentify(connection *websocketConnection) (string, int64, error) {
 }
 
 func parseParams(action string, request *http.Request) (any, error) {
+	// Native handlers receive the original method, query and body via Origin.
+	if strings.HasPrefix(action, protocol.InternalApiPrefix) {
+		return nil, nil
+	}
 	if action == string(protocol.ApiUploadCreate) {
 		if err := request.ParseMultipartForm(defaultReadFormMemory); err != nil {
 			return nil, BadRequest(err.Error())

@@ -1047,7 +1047,7 @@ func TestJSONPayloadCompatibility(t *testing.T) {
 	}
 	defer srv.Close()
 
-	srv.RouteInternal("*", func(request *satoriserver.Request[satoriserver.InternalParam]) (any, error) {
+	srv.Route(protocol.ApiMessageCreate, func(request *satoriserver.Request[any]) (any, error) {
 		return request.Params, nil
 	})
 
@@ -1059,7 +1059,7 @@ func TestJSONPayloadCompatibility(t *testing.T) {
 	defer httpServer.Close()
 
 	payload := `{"text":"\u4f60\u597d","number":12345678901234567890,"nested":{"k":"v"},"list":[1,2,3]}`
-	req, err := http.NewRequest(http.MethodPost, httpServer.URL+"/v1/internal/json-echo", strings.NewReader(payload))
+	req, err := http.NewRequest(http.MethodPost, httpServer.URL+"/v1/message.create", strings.NewReader(payload))
 	if err != nil {
 		t.Fatalf("new request failed: %v", err)
 	}
@@ -1102,7 +1102,7 @@ func TestJSONInvalidReturnsBadRequest(t *testing.T) {
 	}
 	defer srv.Close()
 
-	srv.RouteInternal("*", func(request *satoriserver.Request[satoriserver.InternalParam]) (any, error) {
+	srv.Route(protocol.ApiMessageCreate, func(request *satoriserver.Request[any]) (any, error) {
 		return request.Params, nil
 	})
 
@@ -1113,7 +1113,7 @@ func TestJSONInvalidReturnsBadRequest(t *testing.T) {
 	httpServer := httptest.NewServer(handler)
 	defer httpServer.Close()
 
-	req, err := http.NewRequest(http.MethodPost, httpServer.URL+"/v1/internal/json-invalid", bytes.NewBufferString(`{"missing":`))
+	req, err := http.NewRequest(http.MethodPost, httpServer.URL+"/v1/message.create", bytes.NewBufferString(`{"missing":`))
 	if err != nil {
 		t.Fatalf("new request failed: %v", err)
 	}
@@ -1139,7 +1139,7 @@ func TestJSONEmptyBodyDefaultsToEmptyObject(t *testing.T) {
 	}
 	defer srv.Close()
 
-	srv.RouteInternal("*", func(request *satoriserver.Request[satoriserver.InternalParam]) (any, error) {
+	srv.Route(protocol.ApiMessageCreate, func(request *satoriserver.Request[any]) (any, error) {
 		return request.Params, nil
 	})
 
@@ -1150,7 +1150,7 @@ func TestJSONEmptyBodyDefaultsToEmptyObject(t *testing.T) {
 	httpServer := httptest.NewServer(handler)
 	defer httpServer.Close()
 
-	req, err := http.NewRequest(http.MethodPost, httpServer.URL+"/v1/internal/empty", http.NoBody)
+	req, err := http.NewRequest(http.MethodPost, httpServer.URL+"/v1/message.create", http.NoBody)
 	if err != nil {
 		t.Fatalf("new request failed: %v", err)
 	}

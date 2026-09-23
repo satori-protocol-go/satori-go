@@ -3,6 +3,7 @@ package client_test
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	satoriclient "github.com/satori-protocol-go/satori-go/pkg/satori/client"
 	clientnetwork "github.com/satori-protocol-go/satori-go/pkg/satori/client/network"
 	"github.com/satori-protocol-go/satori-go/pkg/satori/model/event"
@@ -331,8 +332,10 @@ func TestClientInternalNormalizesActionCompat(t *testing.T) {
 		if err != nil {
 			t.Fatalf("internal call failed for %q: %v", action, err)
 		}
-		resultMap, ok := result.(map[string]any)
-		if !ok || resultMap["ok"] != true {
+		var resultMap map[string]any
+		decodeErr := json.NewDecoder(result.Body).Decode(&resultMap)
+		result.Body.Close()
+		if decodeErr != nil || resultMap["ok"] != true {
 			t.Fatalf("unexpected internal result for %q: %#v", action, result)
 		}
 	}
@@ -454,7 +457,12 @@ func TestClientRequestInternalWithRawRequest(t *testing.T) {
 	if gotQuery != "raw" {
 		t.Fatalf("query mismatch: got %q want %q", gotQuery, "raw")
 	}
-	if result["ok"] != "yes" {
+	defer result.Body.Close()
+	var resultMap map[string]string
+	if err := json.NewDecoder(result.Body).Decode(&resultMap); err != nil {
+		t.Fatal(err)
+	}
+	if resultMap["ok"] != "yes" {
 		t.Fatalf("response mismatch: %#v", result)
 	}
 }
@@ -560,4 +568,57 @@ func newTestHTTPServer(t *testing.T, srv *satoriserver.Server) *httptest.Server 
 		t.Fatal(err)
 	}
 	return httptest.NewServer(handler)
+}
+
+func TestNativeHTTPResponse(t *testing.T) {
+	srv, err := satoriserver.NewServer(satoriserver.Config{Token: "api-token"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer srv.Close()
+	srv.Route(protocol.ParseApi("internal/*"), func(r *satoriserver.Request[any]) (any, error) {
+		body, err := io.ReadAll(r.Origin.Body)
+		if err != nil {
+			return nil, err
+		}
+		if r.Origin.Method != "PATCH" || r.Origin.URL.Query().Get("cursor") != " token+/== " || string(body) != "\x00\x01payload" {
+			t.Errorf("native request=%s %s %q", r.Origin.Method, r.Origin.URL, body)
+		}
+		status, _ := strconv.Atoi(r.Origin.URL.Query().Get("status"))
+		response := satoriserver.NewResponse(status, body)
+		if status == 201 {
+			response = satoriserver.NewResponse(status, []byte(`[{"id":"native"}]`))
+		}
+		if status == 204 {
+			response = satoriserver.NewResponse(status, nil)
+		}
+		response.Header.Set("Content-Type", r.Origin.Header.Get("Content-Type"))
+		response.Header.Set("X-Platform-Trace", "trace")
+		return response, nil
+	})
+	httpServer := newTestHTTPServer(t, srv)
+	defer httpServer.Close()
+	account := satoriclient.NewAccount(&login.Login{Platform: "mock", User: &user.User{Id: "bot"}}, staticAPIConfig{base: httpServer.URL + "/v1", token: "api-token"}, nil, nil)
+	for _, status := range []int{200, 201, 204, 422} {
+		endpoint := httpServer.URL + "/v1/internal/fixture?" + url.Values{"cursor": {" token+/== "}, "status": {strconv.Itoa(status)}}.Encode()
+		response, err := account.RequestInternal(context.Background(), endpoint, "PATCH", nil, satoriclient.WithRequestBody(bytes.NewReader([]byte{0, 1, 'p', 'a', 'y', 'l', 'o', 'a', 'd'}), "application/octet-stream"), satoriclient.WithRequestTimeout(time.Second))
+		if err != nil {
+			t.Fatal(err)
+		}
+		body, readErr := io.ReadAll(response.Body)
+		response.Body.Close()
+		if readErr != nil || response.StatusCode != status || response.Header.Get("X-Platform-Trace") != "trace" {
+			t.Fatalf("native response status=%d body=%q err=%v", response.StatusCode, body, readErr)
+		}
+		expected := "\x00\x01payload"
+		if status == 201 {
+			expected = `[{"id":"native"}]`
+		}
+		if status == 204 {
+			expected = ""
+		}
+		if string(body) != expected {
+			t.Fatalf("native body=%q", body)
+		}
+	}
 }
