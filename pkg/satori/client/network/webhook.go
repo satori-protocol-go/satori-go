@@ -195,7 +195,9 @@ func (n *Webhook) fetchMeta(ctx context.Context) error {
 	}
 
 	n.base.SetProxyURLs(data.ProxyUrls)
-	n.base.app.SyncLogins(n.ID(), n.base.Config(), data.ProxyUrls, data.Logins)
+	if err := n.base.app.SyncLogins(n.ID(), n.base.Config(), data.ProxyUrls, data.Logins); err != nil {
+		return err
+	}
 	return nil
 }
 
@@ -231,7 +233,7 @@ func (n *Webhook) handleRequest(w http.ResponseWriter, request *http.Request) {
 			return
 		}
 		n.base.SetProxyURLs(metaPayload.ProxyUrls)
-		n.base.app.SyncLogins(n.ID(), n.base.Config(), metaPayload.ProxyUrls, nil)
+		n.base.app.UpdateProxyURLs(n.ID(), metaPayload.ProxyUrls)
 		w.WriteHeader(http.StatusOK)
 		return
 
