@@ -27,7 +27,8 @@ type networkState struct {
 }
 
 type App struct {
-	mu sync.RWMutex
+	mu        sync.RWMutex
+	runCancel context.CancelFunc
 
 	accounts      map[string]*Account
 	networks      []clientnetwork.Runner
@@ -181,6 +182,11 @@ func (a *App) Apply(cfg Config) error {
 
 	networkIDRef := runner.ID()
 	a.mu.Lock()
+	if a.runCancel != nil {
+		a.mu.Unlock()
+		_ = runner.Close()
+		return errors.New("configure networks before Run")
+	}
 	a.networks = append(a.networks, runner)
 	state := a.ensureNetworkStateLocked(networkIDRef)
 	if apiCfg != nil {
@@ -324,55 +330,69 @@ func (a *App) RunAsync(ctx context.Context) <-chan error {
 	return result
 }
 
+// Run owns cancellation and cleanup for its configured networks.
 func (a *App) Run(ctx context.Context) error {
 	if ctx == nil {
 		ctx = context.Background()
 	}
-
-	a.mu.RLock()
+	a.mu.Lock()
+	if a.runCancel != nil {
+		a.mu.Unlock()
+		return errors.New("app is already running")
+	}
 	networks := append([]clientnetwork.Runner(nil), a.networks...)
-	a.mu.RUnlock()
 	if len(networks) == 0 {
+		a.mu.Unlock()
 		return errors.New("no network configured")
 	}
-
 	runCtx, cancel := context.WithCancel(ctx)
-	defer cancel()
+	a.runCancel = cancel
+	a.mu.Unlock()
+	defer func() { cancel(); a.mu.Lock(); a.runCancel = nil; a.mu.Unlock() }()
 
-	errCh := make(chan error, len(networks))
+	results := make(chan error, len(networks))
 	var wg sync.WaitGroup
-
 	for _, runner := range networks {
 		wg.Add(1)
-		go func(r clientnetwork.Runner) {
-			defer wg.Done()
-			if err := r.Run(runCtx); err != nil && !errors.Is(err, context.Canceled) {
-				errCh <- err
-			}
-		}(runner)
+		go func(r clientnetwork.Runner) { defer wg.Done(); results <- r.Run(runCtx) }(runner)
 	}
-
 	var runErr error
-	select {
-	case <-ctx.Done():
-	case err := <-errCh:
-		runErr = err
-		cancel()
+	remaining := len(networks)
+wait:
+	for remaining > 0 {
+		select {
+		case <-runCtx.Done():
+			break wait
+		case err := <-results:
+			remaining--
+			if err != nil && !errors.Is(err, context.Canceled) {
+				runErr = err
+				break wait
+			}
+		}
 	}
-
+	cancel()
 	for _, runner := range networks {
-		_ = runner.Close()
+		if err := runner.Close(); err != nil {
+			runErr = errors.Join(runErr, err)
+		}
 	}
 	wg.Wait()
-
 	a.cleanupAccounts()
 	return runErr
 }
 
+// Close requests the same cancellation used by Run. Run owns final cleanup;
+// a callback may request shutdown without waiting for itself to finish.
 func (a *App) Close() error {
 	a.mu.RLock()
+	cancel := a.runCancel
 	networks := append([]clientnetwork.Runner(nil), a.networks...)
 	a.mu.RUnlock()
+	if cancel != nil {
+		cancel()
+		return nil
+	}
 	for _, runner := range networks {
 		_ = runner.Close()
 	}

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	satoriclient "github.com/satori-protocol-go/satori-go/pkg/satori/client"
 	clientnetwork "github.com/satori-protocol-go/satori-go/pkg/satori/client/network"
 	"github.com/satori-protocol-go/satori-go/pkg/satori/model/event"
@@ -20,6 +21,7 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -620,5 +622,81 @@ func TestNativeHTTPResponse(t *testing.T) {
 		if string(body) != expected {
 			t.Fatalf("native body=%q", body)
 		}
+	}
+}
+
+type lifecycleRunner struct {
+	started chan struct{}
+	closed  chan struct{}
+	mode    string
+	failure error
+	once    sync.Once
+}
+
+func (r *lifecycleRunner) ID() string { return "lifecycle/fixture" }
+func (r *lifecycleRunner) Run(ctx context.Context) error {
+	close(r.started)
+	switch r.mode {
+	case "normal":
+		return nil
+	case "failure":
+		return r.failure
+	default:
+		<-ctx.Done()
+		return ctx.Err()
+	}
+}
+func (r *lifecycleRunner) Close() error { r.once.Do(func() { close(r.closed) }); return nil }
+
+func TestApplicationLifecycle(t *testing.T) {
+	for _, mode := range []string{"normal", "failure", "close", "cancel"} {
+		t.Run(mode, func(t *testing.T) {
+			failure := errors.New("fixture runner failure")
+			runner := &lifecycleRunner{started: make(chan struct{}), closed: make(chan struct{}), mode: mode, failure: failure}
+			app, err := satoriclient.NewApp()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := app.RegisterNetworkFactory("custom", func(*satoriclient.App, satoriclient.Config) (clientnetwork.Runner, satoriclient.APIConfig, error) {
+				return runner, staticAPIConfig{base: "http://127.0.0.1"}, nil
+			}); err != nil {
+				t.Fatal(err)
+			}
+			if err := app.Apply(customConfig{identity: mode}); err != nil {
+				t.Fatal(err)
+			}
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			done := app.RunAsync(ctx)
+			select {
+			case <-runner.started:
+			case <-time.After(time.Second):
+				t.Fatal("runner startup timeout")
+			}
+			if mode == "close" {
+				if err := app.Close(); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if mode == "cancel" {
+				cancel()
+			}
+			select {
+			case err := <-done:
+				if mode == "failure" && !errors.Is(err, failure) {
+					t.Fatalf("failure=%v", err)
+				}
+				if mode != "failure" && err != nil {
+					t.Fatal(err)
+				}
+			case <-time.After(2 * time.Second):
+				t.Fatal("Run completion timeout")
+			}
+			select {
+			case <-runner.closed:
+			case <-time.After(time.Second):
+				t.Fatal("runner cleanup timeout")
+			}
+		})
 	}
 }

@@ -3,6 +3,7 @@ package network
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -28,9 +29,10 @@ type Webhook struct {
 	token   string
 	timeout time.Duration
 
-	mu     sync.Mutex
-	server *http.Server
-	client *http.Client
+	mu        sync.Mutex
+	server    *http.Server
+	client    *http.Client
+	runCancel context.CancelFunc
 }
 
 func NewWebhook(app AppBridge, options WebhookOptions) *Webhook {
@@ -66,6 +68,21 @@ func (n *Webhook) ID() string {
 func (n *Webhook) Run(ctx context.Context) error {
 	if ctx == nil {
 		ctx = context.Background()
+	}
+	ctx, cancel := context.WithCancel(ctx)
+	n.mu.Lock()
+	if n.runCancel != nil {
+		n.mu.Unlock()
+		cancel()
+		return errors.New("webhook network is already running")
+	}
+	n.runCancel = cancel
+	n.mu.Unlock()
+	defer func() { cancel(); n.mu.Lock(); n.runCancel = nil; n.mu.Unlock() }()
+	select {
+	case <-n.base.CloseSignal():
+		return nil
+	default:
 	}
 
 	mux := http.NewServeMux()
@@ -116,8 +133,12 @@ func (n *Webhook) Close() error {
 
 	n.mu.Lock()
 	server := n.server
+	cancelRun := n.runCancel
 	n.server = nil
 	n.mu.Unlock()
+	if cancelRun != nil {
+		cancelRun()
+	}
 
 	if server != nil {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)

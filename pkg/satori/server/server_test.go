@@ -15,6 +15,7 @@ import (
 	satoriserver "github.com/satori-protocol-go/satori-go/pkg/satori/server"
 	"io"
 	"mime/multipart"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -1236,5 +1237,59 @@ func TestProtocolAuthorization(t *testing.T) {
 	handler.ServeHTTP(w, r)
 	if w.Code != 401 {
 		t.Fatalf("native proxy authorization=%d", w.Code)
+	}
+}
+
+type preparingFailure struct {
+	satoriserver.RouterMixin
+	mockProvider
+	started chan struct{}
+	failure error
+}
+
+func (p *preparingFailure) EnsureServer(*satoriserver.Server) {}
+func (p *preparingFailure) Prepare(ctx context.Context) error {
+	close(p.started)
+	<-ctx.Done()
+	return p.failure
+}
+
+func TestServerShutdownResult(t *testing.T) {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	port := listener.Addr().(*net.TCPAddr).Port
+	listener.Close()
+	srv, err := satoriserver.NewServer(satoriserver.Config{Port: port})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer srv.Close()
+	failure := errors.New("fixture prepare failure")
+	adapter := &preparingFailure{started: make(chan struct{}), failure: failure}
+	if err := srv.Apply(adapter); err != nil {
+		t.Fatal(err)
+	}
+	result := make(chan error, 1)
+	go func() { result <- srv.Run(context.Background()) }()
+	select {
+	case <-adapter.started:
+	case <-time.After(time.Second):
+		t.Fatal("prepare timeout")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	shutdownErr := srv.Shutdown(ctx)
+	if !errors.Is(shutdownErr, failure) {
+		t.Fatalf("Shutdown result=%v", shutdownErr)
+	}
+	select {
+	case runErr := <-result:
+		if !errors.Is(runErr, failure) {
+			t.Fatalf("Run result=%v", runErr)
+		}
+	case <-ctx.Done():
+		t.Fatal(ctx.Err())
 	}
 }

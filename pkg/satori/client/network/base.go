@@ -162,14 +162,21 @@ func (b *baseNetwork) WaitAvailable(ctx context.Context) error {
 		return ctx.Err()
 	case <-b.availableSignal:
 		return nil
+	case <-b.closeSignal:
+		return context.Canceled
 	}
 }
 
 func (b *baseNetwork) Log(ctx context.Context, level logging.Level, v ...any) {
-	if b == nil || b.logger == nil {
+	if b == nil {
 		return
 	}
-	b.logger.Log(ctx, level, v...)
+	b.mu.RLock()
+	logger := b.logger
+	b.mu.RUnlock()
+	if logger != nil {
+		logger.Log(ctx, level, v...)
+	}
 }
 
 func (b *baseNetwork) SetLogger(logger logging.Logger) {

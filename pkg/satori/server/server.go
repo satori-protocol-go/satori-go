@@ -453,7 +453,7 @@ func (s *Server) Run(ctx context.Context) error {
 	defer cancel()
 
 	var runErr error
-	defer s.finishRun(done, runErr)
+	defer func() { s.finishRun(done, runErr) }()
 
 	if err := s.runPreparing(runCtx); err != nil {
 		runErr = err
