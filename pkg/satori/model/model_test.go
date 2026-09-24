@@ -3,6 +3,8 @@ package model_test
 import (
 	"bytes"
 	"encoding/json"
+	"github.com/satori-protocol-go/satori-go/pkg/satori/internal/xhtml"
+	"github.com/satori-protocol-go/satori-go/pkg/satori/model/message/element"
 	"testing"
 
 	"github.com/satori-protocol-go/satori-go/pkg/satori/model/event"
@@ -108,5 +110,30 @@ func TestPresenceAndLoginPatch(t *testing.T) {
 	}
 	if base.User.Name != "before" || len(base.Features) != 1 {
 		t.Fatal("source login changed")
+	}
+}
+
+func TestMessageElementWire(t *testing.T) {
+	for _, source := range []string{
+		`<button id="b" type="input" text="hello">Send</button>`,
+		`<qq:custom text="literal">child &amp; &#65;</qq:custom>`,
+		`<message><quote id="q"/><image src="https://example.invalid/p.png"/>text</message>`,
+	} {
+		parsed := xhtml.Parse(source, nil)
+		values, err := element.Transform(parsed)
+		if err != nil || len(values) != 1 {
+			t.Fatalf("parse %s: %v", source, err)
+		}
+		out := values[0].MarshalXHTML(false)
+		reparsed := xhtml.Parse(out, nil)
+		if len(reparsed) != 1 || reparsed[0].Tag() != parsed[0].Tag() && !(parsed[0].Tag() == "image" && reparsed[0].Tag() == "img") {
+			t.Fatalf("element %s -> %s", source, out)
+		}
+		if parsed[0].Tag() == "button" && (reparsed[0].Attrs["text"] != "hello" || len(reparsed[0].Children) != 1 || reparsed[0].Children[0].String() != "Send") {
+			t.Fatalf("button=%s", out)
+		}
+		if parsed[0].Tag() == "qq:custom" && (reparsed[0].Attrs["text"] != "literal" || reparsed[0].Children[0].String() != "child &amp; A") {
+			t.Fatalf("extension=%s", out)
+		}
 	}
 }
