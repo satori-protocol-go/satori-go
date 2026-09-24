@@ -33,10 +33,10 @@ func (a *Adapter) ensureLogins(ctx context.Context) error {
 	var firstErr error
 	for _, appID := range a.sortedAppIDs() {
 		state := a.appStates[appID]
-		if state == nil || state.apiV1 == nil {
+		if state == nil || state.api == nil {
 			continue
 		}
-		me, err := state.apiV1.Me(withAppID(ctx, appID))
+		me, err := state.api.Me(withAppID(ctx, appID))
 		if err != nil {
 			if firstErr == nil {
 				firstErr = err
@@ -239,21 +239,27 @@ func (a *Adapter) bootstrap(ctx context.Context) {
 		if item == nil {
 			continue
 		}
-		a.pushEvent(&event.Event{
+		if err := a.pushEvent(ctx, &event.Event{
 			Type:      event.EventTypeLoginAdded,
 			Timestamp: time.Now().UnixMilli(),
 			Login:     item,
-		})
+		}); err != nil {
+			return
+		}
 	}
 }
 
-func (a *Adapter) pushEvent(evt *event.Event) {
+func (a *Adapter) pushEvent(ctx context.Context, evt *event.Event) error {
 	if evt == nil {
-		return
+		return nil
 	}
 	select {
 	case a.eventCh <- evt:
-	default:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-a.eventContext.Done():
+		return a.eventContext.Err()
 	}
 }
 
@@ -319,10 +325,10 @@ func platformByEventType(eventType string) string {
 		string(dto.EventGroupMsgReject),
 		string(dto.EventGroupMsgReceive),
 		string(dto.EventC2CMessageCreate),
-		string(dto.EventFriendAdd),
-		string(dto.EventFriendDel),
-		string(dto.EventC2CMsgReceive),
-		string(dto.EventC2CMsgReject):
+		string(dto.EventC2CFriendAdd),
+		string(dto.EventC2CFriendDel),
+		string(dto.EventType("C2C_MSG_RECEIVE")),
+		string(dto.EventType("C2C_MSG_REJECT")):
 		return "qq"
 	default:
 		return "qqguild"

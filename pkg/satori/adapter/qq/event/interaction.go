@@ -2,6 +2,7 @@ package event
 
 import (
 	"context"
+	"encoding/json"
 
 	"github.com/WindowsSov8forUs/botgo-plus/dto"
 	"github.com/satori-protocol-go/satori-go/pkg/satori/model/channel"
@@ -35,6 +36,14 @@ func (c *Converter) makeInteractionEvent(
 		}
 	}
 
+	var resolved struct {
+		UserID     string `json:"user_id"`
+		ButtonID   string `json:"button_id"`
+		ButtonData string `json:"button_data"`
+	}
+	if err := json.Unmarshal(interactionValue.Data.Resolved, &resolved); err != nil {
+		return &satorievent.Event{Type: satorievent.EventTypeInternal, Login: loginValue, Timestamp: pickEventTimestamp(data)}
+	}
 	timestamp := pickEventTimestamp(data)
 	if parsed, ok := parseTimestamp(interactionValue.Timestamp); ok {
 		timestamp = parsed
@@ -51,7 +60,7 @@ func (c *Converter) makeInteractionEvent(
 		channelValue = &channel.Channel{Id: interactionValue.ChannelID, Type: channel.ChannelTypeText}
 		guildValue = &guild.Guild{Id: interactionValue.GuildID}
 		userID := firstNonEmpty(
-			interactionValue.Data.Resolved.UserID,
+			resolved.UserID,
 			valueAsString(data["user_id"]),
 		)
 		if userID != "" {
@@ -80,7 +89,7 @@ func (c *Converter) makeInteractionEvent(
 
 	messageValue := &message.Message{
 		Id:      interactionValue.ID,
-		Content: interactionValue.Data.Resolved.ButtonData,
+		Content: resolved.ButtonData,
 		Channel: channelValue,
 		Guild:   guildValue,
 		User:    userValue,
@@ -92,8 +101,8 @@ func (c *Converter) makeInteractionEvent(
 		Timestamp: timestamp,
 		Login:     currentLogin,
 		Button: &interaction.Button{
-			Id:   interactionValue.Data.Resolved.ButtonID,
-			Data: interactionValue.Data.Resolved.ButtonData,
+			Id:   resolved.ButtonID,
+			Data: resolved.ButtonData,
 		},
 		Channel: channelValue,
 		Guild:   guildValue,

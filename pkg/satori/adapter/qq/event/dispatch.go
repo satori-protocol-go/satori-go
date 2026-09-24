@@ -15,7 +15,7 @@ func (c *Converter) Convert(
 	eventType dto.EventType,
 	rawData json.RawMessage,
 ) (*satorievent.Event, error) {
-	if op != dto.DispatchEvent {
+	if op != dto.WSDispatchEvent {
 		return nil, nil
 	}
 	data, err := decodeWebhookData(rawData)
@@ -88,9 +88,9 @@ func (c *Converter) convertDispatchEvent(
 	case dto.EventGroupDelRobot:
 		return c.makeGroupRobotEvent(loginValue, data, satorievent.EventTypeGuildRemoved)
 
-	case dto.EventFriendAdd:
+	case dto.EventC2CFriendAdd:
 		return c.makeFriendEvent(loginValue, data, eventTypeFriendAdded)
-	case dto.EventFriendDel:
+	case dto.EventC2CFriendDel:
 		return c.makeFriendEvent(loginValue, data, eventTypeFriendRemoved)
 
 	case dto.EventInteractionCreate:

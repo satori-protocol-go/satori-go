@@ -1,11 +1,11 @@
 package qq
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"net/http"
 	"regexp"
 	"strings"
 	"time"
@@ -13,9 +13,11 @@ import (
 	"github.com/WindowsSov8forUs/botgo-plus/dto"
 	"github.com/WindowsSov8forUs/botgo-plus/dto/keyboard"
 	"github.com/WindowsSov8forUs/botgo-plus/errs"
-	"github.com/WindowsSov8forUs/botgo-plus/openapi"
+	"github.com/WindowsSov8forUs/botgo-plus/media"
+	native "github.com/WindowsSov8forUs/botgo-plus/openapi/v1"
 	"github.com/satori-protocol-go/satori-go/pkg/satori/adapter/qq/convert"
 	"github.com/satori-protocol-go/satori-go/pkg/satori/model/message"
+	"github.com/satori-protocol-go/satori-go/pkg/satori/server"
 )
 
 var errUnsupportedPlatform = errors.New("unsupported platform")
@@ -23,8 +25,8 @@ var errUnsupportedPlatform = errors.New("unsupported platform")
 type messageConverter func(input *dto.Message, platform string) *message.Message
 
 type messageSender struct {
-	apiV1          openapi.OpenAPI
-	apiV2          openapi.OpenAPI
+	api            *native.Client
+	state          *appState
 	convertMessage messageConverter
 	adapter        *Adapter
 }
@@ -45,13 +47,8 @@ type messageCreateInput struct {
 
 var markdownEscapePattern = regexp.MustCompile("([\\\\`*_{}\\[\\]()#+\\-.!>~])")
 
-func newMessageSender(apiV1 openapi.OpenAPI, apiV2 openapi.OpenAPI, convert messageConverter, adapter *Adapter) *messageSender {
-	return &messageSender{
-		apiV1:          apiV1,
-		apiV2:          apiV2,
-		convertMessage: convert,
-		adapter:        adapter,
-	}
+func newMessageSender(state *appState, convert messageConverter, adapter *Adapter) *messageSender {
+	return &messageSender{api: state.api, state: state, convertMessage: convert, adapter: adapter}
 }
 
 func (s *messageSender) Send(ctx context.Context, input messageCreateInput) ([]*message.Message, error) {
@@ -66,7 +63,7 @@ func (s *messageSender) Send(ctx context.Context, input messageCreateInput) ([]*
 }
 
 func (s *messageSender) sendQQGuild(ctx context.Context, input messageCreateInput) ([]*message.Message, error) {
-	if s.apiV1 == nil {
+	if s.api == nil {
 		return []*message.Message{}, nil
 	}
 
@@ -195,9 +192,9 @@ func (s *messageSender) callQQGuildMessageAPI(
 	)
 	if strings.Contains(channelID, "_") || referrerDirect {
 		dmGuildID := convert.SplitGuildCompositeID(channelID)
-		created, err = s.apiV1.PostDirectMessage(ctx, &dto.DirectMessage{GuildID: dmGuildID}, payload)
+		created, err = s.api.PostDirectMessage(ctx, &dto.DirectMessage{GuildID: dmGuildID}, payload)
 	} else {
-		created, err = s.apiV1.PostMessage(ctx, channelID, payload)
+		created, err = s.api.PostMessage(ctx, channelID, payload)
 	}
 	if err == nil {
 		return created, nil
@@ -208,26 +205,11 @@ func (s *messageSender) callQQGuildMessageAPI(
 	return nil, err
 }
 
-func (s *messageSender) callQQGuildMultipartAPI(
-	ctx context.Context,
-	channelID string,
-	referrerDirect bool,
-	payload *dto.MessageToCreate,
-	fileImageData []byte,
-) (*dto.Message, error) {
-	if s.apiV1 == nil {
-		return s.callQQGuildMessageAPI(ctx, channelID, referrerDirect, payload)
-	}
-	var (
-		created *dto.Message
-		err     error
-	)
+func (s *messageSender) callQQGuildMultipartAPI(ctx context.Context, channelID string, referrerDirect bool, payload *dto.MessageToCreate, data []byte) (*dto.Message, error) {
 	if strings.Contains(channelID, "_") || referrerDirect {
-		dmGuildID := convert.SplitGuildCompositeID(channelID)
-		created, err = s.apiV1.PostDirectMessageMultipart(ctx, &dto.DirectMessage{GuildID: dmGuildID}, payload, fileImageData)
-	} else {
-		created, err = s.apiV1.PostMessageMultipart(ctx, channelID, payload, fileImageData)
+		return nil, server.NewActionError(501, "local-image multipart is not verified for QQ guild direct messages", nil)
 	}
+	created, err := s.api.PostMessageMultipart(ctx, channelID, payload, data)
 	if err == nil {
 		return created, nil
 	}
@@ -249,7 +231,7 @@ func makeMessageReference(messageID string) *dto.MessageReference {
 }
 
 func (s *messageSender) sendQQ(ctx context.Context, input messageCreateInput) ([]*message.Message, error) {
-	if s.apiV2 == nil {
+	if s.api == nil {
 		return []*message.Message{}, nil
 	}
 
@@ -302,7 +284,7 @@ func (s *messageSender) sendQQArk(
 		MsgType: 3,
 		Ark:     ark,
 		MsgID:   resolveQQMsgID(referrer.MsgID, segment.QuoteID),
-		MsgSeq:  seq,
+		MsgSeq:  uint32(seq),
 	}
 	return s.callQQMessageAPI(ctx, targetID, isDirect, payload)
 }
@@ -322,7 +304,7 @@ func (s *messageSender) sendQQMarkdown(
 	payload := &dto.MessageToCreate{
 		MsgType: 2,
 		MsgID:   resolveQQMsgID(referrer.MsgID, segment.QuoteID),
-		MsgSeq:  seq,
+		MsgSeq:  uint32(seq),
 		Markdown: &dto.Markdown{
 			Content: markdownContent,
 		},
@@ -348,102 +330,64 @@ func (s *messageSender) sendQQText(
 	payload := &dto.MessageToCreate{
 		Content: content,
 		MsgID:   resolveQQMsgID(referrer.MsgID, segment.QuoteID),
-		MsgSeq:  seq,
+		MsgSeq:  uint32(seq),
 	}
 	return s.callQQMessageAPI(ctx, targetID, isDirect, payload)
 }
 
-func (s *messageSender) sendQQResource(
-	ctx context.Context,
-	targetID string,
-	isDirect bool,
-	segment convert.MessageSegment,
-	referrer messageReferrer,
-	seq int,
-) (*dto.Message, error) {
+func (s *messageSender) sendQQResource(ctx context.Context, targetID string, isDirect bool, segment convert.MessageSegment, referrer messageReferrer, seq int) (*dto.Message, error) {
 	if segment.Resource == nil {
-		return nil, nil
+		return nil, errors.New("QQ resource is required")
 	}
-
-	resourcePayload, err := convert.ResolveMessageResourcePayload(segment.Resource.Src)
+	resource, err := convert.ResolveMessageResourcePayload(segment.Resource.Src)
 	if err != nil {
-		return s.sendQQText(ctx, targetID, isDirect, convert.MessageSegment{Text: segment.Resource.Src}, referrer, seq)
-	}
-	if resourcePayload.URL == "" && resourcePayload.FileData == "" {
-		return s.sendQQText(ctx, targetID, isDirect, convert.MessageSegment{Text: segment.Resource.Src}, referrer, seq)
-	}
-
-	uploadMessage := &dto.RichMediaMessage{
-		EventID:    resolveQQMsgID(referrer.MsgID, segment.QuoteID),
-		FileType:   convert.MapMessageResourceFileType(segment.Resource.Kind),
-		URL:        resourcePayload.URL,
-		FileData:   resourcePayload.FileData,
-		SrvSendMsg: false,
-	}
-
-	var mediaResponse *dto.MediaResponse
-	if isDirect {
-		response, callErr := s.apiV2.PostC2CMessage(ctx, targetID, uploadMessage)
-		if callErr != nil {
-			return nil, callErr
-		}
-		if response != nil {
-			mediaResponse = response.MediaResponse
-		}
-	} else {
-		response, callErr := s.apiV2.PostGroupMessage(ctx, targetID, uploadMessage)
-		if callErr != nil {
-			return nil, callErr
-		}
-		if response != nil {
-			mediaResponse = response.MediaResponse
-		}
-	}
-	if mediaResponse == nil || strings.TrimSpace(mediaResponse.FileInfo) == "" {
-		return s.sendQQText(ctx, targetID, isDirect, convert.MessageSegment{Text: segment.Resource.Src}, referrer, seq)
-	}
-
-	payload := &dto.MessageToCreate{
-		Content: " ",
-		MsgType: 7,
-		MsgID:   resolveQQMsgID(referrer.MsgID, segment.QuoteID),
-		MsgSeq:  seq,
-		Media:   dto.Media{FileInfo: mediaResponse.FileInfo},
-	}
-	return s.callQQMessageAPI(ctx, targetID, isDirect, payload)
-}
-
-func (s *messageSender) callQQMessageAPI(
-	ctx context.Context,
-	targetID string,
-	isDirect bool,
-	payload dto.APIMessage,
-) (*dto.Message, error) {
-	if isDirect {
-		response, err := s.apiV2.PostC2CMessage(ctx, targetID, payload)
-		if err != nil {
-			if fallback, ok := s.tryAuditFallback(ctx, err, ""); ok {
-				return fallback, nil
-			}
-			return nil, err
-		}
-		if response == nil {
-			return nil, nil
-		}
-		return response.Message, nil
-	}
-
-	response, err := s.apiV2.PostGroupMessage(ctx, targetID, payload)
-	if err != nil {
-		if fallback, ok := s.tryAuditFallback(ctx, err, ""); ok {
-			return fallback, nil
-		}
 		return nil, err
 	}
-	if response == nil {
-		return nil, nil
+	fileType := int(convert.MapMessageResourceFileType(segment.Resource.Kind))
+	var uploaded *dto.MediaUploadResult
+	if resource.FileData != "" {
+		data, decodeErr := convert.DecodeMessageBase64(resource.FileData)
+		if decodeErr != nil {
+			return nil, decodeErr
+		}
+		scope := media.GroupScope
+		if isDirect {
+			scope = media.C2CScope
+		}
+		uploaded, err = s.state.uploader.Upload(ctx, media.Target{Scope: scope, OpenID: targetID}, bytes.NewReader(data), int64(len(data)), fileType, "upload")
+	} else {
+		request := &dto.MediaUploadRequest{FileType: fileType, URL: resource.URL, FileName: "upload"}
+		if isDirect {
+			uploaded, _, err = s.api.UploadC2CFile(ctx, targetID, request)
+		} else {
+			uploaded, _, err = s.api.UploadGroupFile(ctx, targetID, request)
+		}
 	}
-	return response.Message, nil
+	if err != nil {
+		return nil, err
+	}
+	if uploaded == nil || uploaded.FileInfo == "" {
+		return nil, errors.New("QQ upload response has no file_info")
+	}
+	payload := &dto.MessageToCreate{Content: " ", MsgType: dto.RichMediaMsg, MsgID: resolveQQMsgID(referrer.MsgID, segment.QuoteID), MsgSeq: uint32(seq), Media: &dto.MediaInfo{FileInfo: uploaded.FileInfo}}
+	return s.callQQMessageAPI(ctx, targetID, isDirect, payload)
+}
+
+func (s *messageSender) callQQMessageAPI(ctx context.Context, targetID string, isDirect bool, payload dto.APIMessage) (*dto.Message, error) {
+	var created *dto.Message
+	var err error
+	if isDirect {
+		created, err = s.api.PostC2CMessage(ctx, targetID, payload)
+	} else {
+		created, err = s.api.PostGroupMessage(ctx, targetID, payload)
+	}
+	if err == nil {
+		return created, nil
+	}
+	if fallback, ok := s.tryAuditFallback(ctx, err, ""); ok {
+		return fallback, nil
+	}
+	return nil, err
 }
 
 func (s *messageSender) tryAuditFallback(ctx context.Context, err error, content string) (*dto.Message, bool) {
@@ -462,34 +406,11 @@ func (s *messageSender) tryAuditFallback(ctx context.Context, err error, content
 }
 
 func parseAuditIDFromError(err error) (string, bool) {
-	if err == nil {
-		return "", false
+	var pending *errs.PendingError
+	if errors.As(err, &pending) && pending.AuditID != "" {
+		return pending.AuditID, true
 	}
-	wrapped := errs.Error(err)
-	if wrapped == nil {
-		return "", false
-	}
-	if wrapped.Code() != http.StatusCreated && wrapped.Code() != http.StatusAccepted {
-		return "", false
-	}
-	body := struct {
-		Code int `json:"code"`
-		Data struct {
-			MessageAudit struct {
-				AuditID string `json:"audit_id"`
-			} `json:"message_audit"`
-		} `json:"data"`
-	}{}
-	if json.Unmarshal([]byte(wrapped.Text()), &body) != nil {
-		return "", false
-	}
-	if body.Code != 304023 {
-		return "", false
-	}
-	if strings.TrimSpace(body.Data.MessageAudit.AuditID) == "" {
-		return "", false
-	}
-	return strings.TrimSpace(body.Data.MessageAudit.AuditID), true
+	return "", false
 }
 
 func escapeQQMarkdown(content string) string {
