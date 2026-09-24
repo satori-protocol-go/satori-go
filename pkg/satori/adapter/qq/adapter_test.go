@@ -411,6 +411,10 @@ func TestQQMultiAppGateway(t *testing.T) {
 		if err := conn.WriteJSON(map[string]any{"op": 0, "s": 2, "t": "GROUP_AT_MESSAGE_CREATE", "d": map[string]any{"id": "message-" + id, "content": "hello", "group_openid": "group-" + id, "author": map[string]string{"member_openid": "member"}}}); err != nil {
 			return
 		}
+		interaction := map[string]any{"id": "interaction-" + id, "application_id": id, "type": 11, "scene": "group", "chat_type": 1, "group_openid": "group-" + id, "group_member_openid": "member", "data": map[string]any{"type": 11, "resolved": map[string]string{"button_id": "button", "button_data": "value"}}}
+		if err := conn.WriteJSON(map[string]any{"op": 0, "s": 3, "t": "INTERACTION_CREATE", "d": interaction}); err != nil {
+			return
+		}
 		for {
 			if _, _, err := conn.ReadMessage(); err != nil {
 				return
@@ -463,6 +467,33 @@ func TestQQMultiAppGateway(t *testing.T) {
 		case <-timer.C:
 			t.Fatal("multi-app READY/message timed out")
 		}
+	}
+	buttons := map[string]bool{}
+	for len(buttons) < 2 {
+		select {
+		case evt := <-f.adapter.eventCh:
+			if evt.Type == event.EventTypeInteractionButton {
+				if evt.Button.Id != "button" {
+					t.Fatalf("WS interaction=%+v", evt)
+				}
+				buttons[evt.Login.User.Id] = true
+			}
+		case <-timer.C:
+			t.Fatal("WS interaction timed out")
+		}
+	}
+	responses := 0
+	for _, item := range f.requests() {
+		if strings.HasPrefix(item.Path, "/interactions/interaction-") {
+			responses++
+			id := strings.TrimPrefix(item.Path, "/interactions/interaction-")
+			if item.Method != "PUT" || string(item.Fields["code"]) != "0" || item.Header.Get("X-Union-Appid") != id {
+				t.Fatalf("WS response=%+v", item)
+			}
+		}
+	}
+	if responses != 2 {
+		t.Fatalf("WS interaction response count=%d", responses)
 	}
 	mu.Lock()
 	first := connections["123"]
@@ -809,5 +840,70 @@ func TestQQAuditCorrelation(t *testing.T) {
 	var status interface{ HTTPStatus() int }
 	if !errors.As(err, &status) || status.HTTPStatus() != 403 || !strings.Contains(err.Error(), "audit rejected") {
 		t.Fatalf("audit rejection response=%v", err)
+	}
+}
+
+func TestQQInteractionResponses(t *testing.T) {
+	f := newQQFixture(t, nil)
+	for _, tc := range []struct {
+		kind     int
+		want     event.EventType
+		resolved map[string]string
+	}{
+		{11, event.EventTypeInteractionButton, map[string]string{"button_id": "confirm", "button_data": "payload"}},
+		{12, event.EventTypeInteractionCommand, map[string]string{"feature_id": "menu-action"}},
+		{13, event.EventTypeInternal, map[string]string{"feedback_opt": "LIKE"}},
+	} {
+		id := fmt.Sprintf("interaction-%d", tc.kind)
+		data := map[string]any{"id": id, "application_id": "123", "type": tc.kind, "scene": "c2c", "user_openid": "user", "data": map[string]any{"type": tc.kind, "resolved": tc.resolved}}
+		raw, _ := json.Marshal(map[string]any{"op": 0, "s": 1, "t": "INTERACTION_CREATE", "id": "INTERACTION_CREATE:" + id, "d": data})
+		response := httptest.NewRecorder()
+		f.adapter.handleWebhookRequest(response, signedQQRequest(t, raw, "123", "fixture-secret"))
+		if response.Code != 200 {
+			t.Fatalf("interaction ack=%d %s", response.Code, response.Body)
+		}
+		select {
+		case evt := <-f.adapter.eventCh:
+			if evt.Type != tc.want || evt.Login.Platform != "qq" || evt.Channel.Id != "private:user" || evt.Referrer["event_id"] != id {
+				t.Fatalf("interaction=%+v", evt)
+			}
+			if tc.kind == 11 && (evt.Button.Id != "confirm" || evt.Button.Data != "payload") {
+				t.Fatalf("button=%+v", evt.Button)
+			}
+			if tc.kind == 12 && (evt.Argv.Name != "menu-action" || evt.Argv.Arguments == nil || evt.Argv.Options == nil) {
+				t.Fatalf("command=%+v", evt.Argv)
+			}
+			if tc.kind == 11 || tc.kind == 12 {
+				calls := f.requests()
+				last := calls[len(calls)-1]
+				if last.Path != "/interactions/"+id || last.Method != "PUT" || string(last.Fields["code"]) != "0" {
+					t.Fatalf("interaction response=%+v", last)
+				}
+			}
+		case <-time.After(time.Second):
+			t.Fatal("interaction publication timed out")
+		}
+	}
+	f.mu.Lock()
+	f.extra = func(w http.ResponseWriter, r *http.Request, _ qqRequest) bool {
+		if r.URL.Path == "/interactions/failure" {
+			w.WriteHeader(403)
+			w.Write([]byte(`{"err_code":11253}`))
+			return true
+		}
+		return false
+	}
+	f.mu.Unlock()
+	raw := []byte(`{"op":0,"t":"INTERACTION_CREATE","d":{"id":"failure","type":11,"scene":"c2c","user_openid":"user","data":{"type":11,"resolved":{"button_id":"confirm"}}}}`)
+	response := httptest.NewRecorder()
+	f.adapter.handleWebhookRequest(response, signedQQRequest(t, raw, "123", "fixture-secret"))
+	if response.Code != 503 || !strings.Contains(response.Body.String(), `"d":1`) {
+		t.Fatalf("failed interaction response=%d %s", response.Code, response.Body)
+	}
+	request := httptest.NewRequest("PUT", "/v1/internal/interactions/managed", bytes.NewBufferString(`{"code":0}`))
+	_, err := f.adapter.HandleInternal(server.Request[map[string]any]{Origin: request, Platform: "qq", SelfID: "bot-123"}, "_api/interactions/managed")
+	var status interface{ HTTPStatus() int }
+	if !errors.As(err, &status) || status.HTTPStatus() != 409 {
+		t.Fatalf("interaction ownership=%v", err)
 	}
 }
