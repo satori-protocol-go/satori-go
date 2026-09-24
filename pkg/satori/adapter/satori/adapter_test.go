@@ -54,7 +54,7 @@ func (p *satoriRemoteProvider) HandleInternal(
 	return nil, satoriserver.NotFound("not found")
 }
 
-func (p *satoriRemoteProvider) HandleProxied(prefix string, rawURL string) (*satoriserver.Response, error) {
+func (p *satoriRemoteProvider) HandleProxied(ctx context.Context, prefix string, rawURL string) (*satoriserver.Response, error) {
 	_ = prefix
 	_ = rawURL
 	return nil, nil

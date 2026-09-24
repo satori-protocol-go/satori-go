@@ -109,7 +109,7 @@ func (m *clientMockProvider) HandleInternal(
 	return nil, satoriserver.NotFound("not found")
 }
 
-func (m *clientMockProvider) HandleProxied(prefix string, rawURL string) (*satoriserver.Response, error) {
+func (m *clientMockProvider) HandleProxied(ctx context.Context, prefix string, rawURL string) (*satoriserver.Response, error) {
 	_ = prefix
 	_ = rawURL
 	return nil, nil
@@ -121,6 +121,9 @@ func TestClientAPIProtocolUploadAndDownload(t *testing.T) {
 		t.Fatalf("new server failed: %v", err)
 	}
 	defer srv.Close()
+	if err := srv.Apply(&clientMockProvider{}); err != nil {
+		t.Fatal(err)
+	}
 
 	srv.Route(protocol.ApiMessageCreate, func(request *satoriserver.Request[any]) (any, error) {
 		params, ok := request.Params.(map[string]any)
