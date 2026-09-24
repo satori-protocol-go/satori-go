@@ -23,8 +23,9 @@ type WS struct {
 	wsBase string
 	dialer *websocket.Dialer
 
-	connMu sync.RWMutex
-	conn   *websocket.Conn
+	connMu    sync.RWMutex
+	conn      *websocket.Conn
+	runCancel context.CancelFunc
 
 	writeMu sync.Mutex
 }
@@ -72,7 +73,21 @@ func (n *WS) Run(ctx context.Context) error {
 	if ctx == nil {
 		ctx = context.Background()
 	}
-
+	ctx, cancel := context.WithCancel(ctx)
+	n.connMu.Lock()
+	if n.runCancel != nil {
+		n.connMu.Unlock()
+		cancel()
+		return errors.New("websocket network is already running")
+	}
+	n.runCancel = cancel
+	n.connMu.Unlock()
+	defer func() { cancel(); n.connMu.Lock(); n.runCancel = nil; n.connMu.Unlock() }()
+	select {
+	case <-n.base.CloseSignal():
+		return nil
+	default:
+	}
 	for {
 		if ctx.Err() != nil {
 			n.base.app.MarkNetworkStatus(n.ID(), login.LoginStatusOffline, true)
@@ -102,6 +117,12 @@ func (n *WS) Run(ctx context.Context) error {
 
 func (n *WS) Close() error {
 	n.base.MarkClosed()
+	n.connMu.RLock()
+	cancel := n.runCancel
+	n.connMu.RUnlock()
+	if cancel != nil {
+		cancel()
+	}
 	n.closeConnection()
 	n.base.app.MarkNetworkStatus(n.ID(), login.LoginStatusOffline, true)
 	return nil
