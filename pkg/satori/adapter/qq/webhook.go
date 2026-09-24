@@ -70,7 +70,7 @@ func (a *Adapter) acceptPayload(ctx context.Context, state *appState, payload *d
 	}
 	raw := payloadDataFromEvent(payload)
 	if strings.HasPrefix(string(payload.Type), "MESSAGE_AUDIT_") {
-		a.captureAuditResult(raw)
+		a.captureAuditResult(state.appID, string(payload.Type), raw)
 	}
 	evt, err := a.converter.Convert(withAppID(ctx, state.appID), payload.OPCode, payload.Type, raw)
 	if err != nil {

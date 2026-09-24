@@ -730,3 +730,84 @@ func TestQQOwnedMediaPipeline(t *testing.T) {
 		t.Fatalf("upload stage failure=%v", err)
 	}
 }
+
+func TestQQAuditCorrelation(t *testing.T) {
+	f := newQQFixture(t, nil)
+	a := f.adapter
+	a.captureAuditResult("123", "MESSAGE_AUDIT_PASS", []byte(`{"audit_id":"same","message_id":"first"}`))
+	a.captureAuditResult("456", "MESSAGE_AUDIT_PASS", []byte(`{"audit_id":"same","message_id":"other-app"}`))
+	a.captureAuditResult("123", "MESSAGE_AUDIT_PASS", []byte(`{"audit_id":"same","message_id":"first"}`))
+	for _, tc := range []struct{ app, want string }{{"123", "first"}, {"456", "other-app"}} {
+		result, err := a.waitAuditResult(context.Background(), tc.app, "same", time.Second)
+		if err != nil || !result.Passed || result.MessageID != tc.want {
+			t.Fatalf("early audit=%+v err=%v", result, err)
+		}
+	}
+	type outcome struct {
+		result auditResult
+		err    error
+	}
+	completed := make(chan outcome, 1)
+	go func() {
+		result, err := a.waitAuditResult(context.Background(), "123", "late", time.Second)
+		completed <- outcome{result, err}
+	}()
+	deadline := time.Now().Add(time.Second)
+	for {
+		a.auditMu.Lock()
+		entry := a.audits[auditKey{"123", "late"}]
+		waiting := entry != nil && entry.waiters == 1
+		a.auditMu.Unlock()
+		if waiting {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("audit waiter did not start")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	a.captureAuditResult("123", "MESSAGE_AUDIT_PASS", []byte(`{"audit_id":"late","message_id":"late-approved"}`))
+	result := <-completed
+	if result.err != nil || result.result.MessageID != "late-approved" {
+		t.Fatalf("late audit=%+v", result)
+	}
+	a.captureAuditResult("123", "MESSAGE_AUDIT_REJECT", []byte(`{"audit_id":"reject","reject_reason":"fixture policy"}`))
+	rejected, err := a.waitAuditResult(context.Background(), "123", "reject", time.Second)
+	if err != nil || rejected.Passed || rejected.Reason != "fixture policy" {
+		t.Fatalf("rejected=%+v err=%v", rejected, err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, err := a.waitAuditResult(ctx, "123", "cancelled", time.Second); !errors.Is(err, context.Canceled) {
+		t.Fatalf("cancelled result=%v", err)
+	}
+	if _, err := a.waitAuditResult(context.Background(), "123", "unresolved", time.Millisecond); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("pending timeout=%v", err)
+	}
+	f.mu.Lock()
+	f.extra = func(w http.ResponseWriter, r *http.Request, item qqRequest) bool {
+		if r.URL.Path != "/v2/groups/audit/messages" {
+			return false
+		}
+		kind := "MESSAGE_AUDIT_PASS"
+		id := "approved"
+		if string(item.Fields["content"]) == `"rejected"` {
+			kind = "MESSAGE_AUDIT_REJECT"
+			id = "rejected"
+		}
+		data, _ := json.Marshal(map[string]string{"audit_id": id, "message_id": id, "reject_reason": "fixture"})
+		a.captureAuditResult("123", kind, data)
+		json.NewEncoder(w).Encode(map[string]any{"err_code": 304024, "data": map[string]any{"message_audit": map[string]string{"audit_id": id}}})
+		return true
+	}
+	f.mu.Unlock()
+	sent, err := f.call("message.create", "qq", "bot-123", map[string]any{"channel_id": "audit", "content": "approved"})
+	if err != nil || sent.([]*message.Message)[0].Id != "approved" {
+		t.Fatalf("audited message=%+v err=%v", sent, err)
+	}
+	_, err = f.call("message.create", "qq", "bot-123", map[string]any{"channel_id": "audit", "content": "rejected"})
+	var status interface{ HTTPStatus() int }
+	if !errors.As(err, &status) || status.HTTPStatus() != 403 || !strings.Contains(err.Error(), "audit rejected") {
+		t.Fatalf("audit rejection response=%v", err)
+	}
+}

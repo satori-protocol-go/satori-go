@@ -78,6 +78,9 @@ func (a *Adapter) Block(ctx context.Context) error {
 
 func (a *Adapter) Cleanup(_ context.Context) error {
 	a.cancelEvents()
+	a.auditMu.Lock()
+	a.audits = map[auditKey]*auditEntry{}
+	a.auditMu.Unlock()
 	a.closeAllWSConnections()
 	a.mu.Lock()
 	for _, info := range a.logins {

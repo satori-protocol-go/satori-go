@@ -184,10 +184,7 @@ func (s *messageSender) callQQGuildMessageAPI(
 	if err == nil {
 		return created, nil
 	}
-	if fallback, ok := s.tryAuditFallback(ctx, err, payload.Content); ok {
-		return fallback, nil
-	}
-	return nil, err
+	return s.awaitAudit(ctx, err, payload.Content)
 }
 
 func (s *messageSender) callQQGuildMultipartAPI(ctx context.Context, channelID string, referrerDirect bool, payload *dto.MessageToCreate, data []byte) (*dto.Message, error) {
@@ -198,10 +195,7 @@ func (s *messageSender) callQQGuildMultipartAPI(ctx context.Context, channelID s
 	if err == nil {
 		return created, nil
 	}
-	if fallback, ok := s.tryAuditFallback(ctx, err, payload.Content); ok {
-		return fallback, nil
-	}
-	return nil, err
+	return s.awaitAudit(ctx, err, payload.Content)
 }
 
 func makeMessageReference(messageID string) *dto.MessageReference {
@@ -374,33 +368,33 @@ func (s *messageSender) callQQMessageAPI(ctx context.Context, targetID string, i
 	if err == nil {
 		return created, nil
 	}
-	if fallback, ok := s.tryAuditFallback(ctx, err, ""); ok {
-		return fallback, nil
+	content := ""
+	if message, ok := payload.(*dto.MessageToCreate); ok {
+		content = message.Content
 	}
-	return nil, err
+	return s.awaitAudit(ctx, err, content)
 }
 
-func (s *messageSender) tryAuditFallback(ctx context.Context, err error, content string) (*dto.Message, bool) {
-	if s == nil || s.adapter == nil {
-		return nil, false
-	}
-	auditID, ok := parseAuditIDFromError(err)
-	if !ok {
-		return nil, false
-	}
-	messageID, ok := s.adapter.waitAuditMessageID(ctx, auditID, defaultAuditWait)
-	if !ok {
-		return nil, false
-	}
-	return &dto.Message{ID: messageID, Content: content}, true
-}
-
-func parseAuditIDFromError(err error) (string, bool) {
+func (s *messageSender) awaitAudit(ctx context.Context, err error, content string) (*dto.Message, error) {
 	var pending *errs.PendingError
-	if errors.As(err, &pending) && pending.AuditID != "" {
-		return pending.AuditID, true
+	if !errors.As(err, &pending) || pending.AuditID == "" {
+		return nil, err
 	}
-	return "", false
+	result, waitErr := s.adapter.waitAuditResult(ctx, s.state.appID, pending.AuditID, defaultAuditWait)
+	if waitErr != nil {
+		status := 503
+		if errors.Is(waitErr, context.DeadlineExceeded) {
+			status = 504
+		}
+		return nil, server.NewActionError(status, "QQ audit outcome remains pending: "+waitErr.Error(), errors.Join(pending, waitErr))
+	}
+	if !result.Passed {
+		return nil, server.NewActionError(403, "QQ message audit rejected: "+result.Reason, pending)
+	}
+	if result.MessageID == "" {
+		return nil, server.NewActionError(502, "QQ audit passed without a message ID", pending)
+	}
+	return &dto.Message{ID: result.MessageID, Content: content, ChannelID: result.ChannelID, GuildID: result.GuildID}, nil
 }
 
 func escapeQQMarkdown(content string) string {
