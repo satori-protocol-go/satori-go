@@ -89,7 +89,7 @@ type baseNetwork struct {
 	closeOnce   sync.Once
 
 	availableSignal chan struct{}
-	availableOnce   sync.Once
+	available       bool
 }
 
 func newBaseNetwork(app AppBridge, cfg APIConfig, id string, logger logging.Logger) *baseNetwork {
@@ -143,28 +143,62 @@ func (b *baseNetwork) CloseSignal() <-chan struct{} {
 }
 
 func (b *baseNetwork) MarkClosed() {
-	b.closeOnce.Do(func() {
-		close(b.closeSignal)
-	})
+	b.closeOnce.Do(func() { close(b.closeSignal) })
+	b.MarkUnavailable()
 }
 
 func (b *baseNetwork) MarkAvailable() {
-	b.availableOnce.Do(func() {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	select {
+	case <-b.closeSignal:
+		return
+	default:
+	}
+	if !b.available {
+		b.available = true
 		close(b.availableSignal)
-	})
+	}
+}
+
+func (b *baseNetwork) MarkUnavailable() {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.available {
+		b.available = false
+		b.availableSignal = make(chan struct{})
+	}
+}
+
+func (b *baseNetwork) Available() bool {
+	b.mu.RLock()
+	defer b.mu.RUnlock()
+	return b.available
 }
 
 func (b *baseNetwork) WaitAvailable(ctx context.Context) error {
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	select {
-	case <-ctx.Done():
-		return ctx.Err()
-	case <-b.availableSignal:
-		return nil
-	case <-b.closeSignal:
-		return context.Canceled
+	for {
+		select {
+		case <-b.closeSignal:
+			return context.Canceled
+		default:
+		}
+		b.mu.RLock()
+		ready, signal := b.available, b.availableSignal
+		b.mu.RUnlock()
+		if ready {
+			return nil
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-b.closeSignal:
+			return context.Canceled
+		case <-signal:
+		}
 	}
 }
 
