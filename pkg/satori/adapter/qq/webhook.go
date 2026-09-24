@@ -2,7 +2,9 @@ package qq
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
+	"github.com/satori-protocol-go/satori-go/pkg/satori/model/event"
 	"net/http"
 	"sort"
 	"strings"
@@ -76,6 +78,20 @@ func (a *Adapter) acceptPayload(ctx context.Context, state *appState, payload *d
 	}
 	if evt == nil {
 		return nil
+	}
+	if evt.Referrer == nil {
+		evt.Referrer = map[string]any{}
+	}
+	evt.Referrer["app_id"] = state.appID
+	if payload.EventID != "" {
+		evt.Referrer["qq_event_id"] = payload.EventID
+		if evt.Type != event.EventTypeMessageCreated && evt.Type != event.EventTypeMessageDeleted {
+			evt.Referrer["event_id"] = payload.EventID
+		}
+	}
+	// _data is the complete native QQ envelope, not a reconstructed subset.
+	if len(payload.RawMessage) > 0 {
+		evt.Data_ = append(json.RawMessage(nil), payload.RawMessage...)
 	}
 	a.logEventBySource(payload.Type, evt)
 	return a.pushEvent(ctx, evt)

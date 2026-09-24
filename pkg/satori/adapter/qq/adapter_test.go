@@ -501,3 +501,62 @@ func TestQQMultiAppGateway(t *testing.T) {
 		t.Fatal("gateway shutdown timed out")
 	}
 }
+
+func TestQQNativeEvents(t *testing.T) {
+	f := newQQFixture(t, nil)
+	cases := []struct {
+		kind string
+		data map[string]any
+		want event.EventType
+	}{
+		{"GROUP_MESSAGE_CREATE", map[string]any{
+			"id": "incoming", "group_openid": "group", "content": `hello <img src="file:///literal"/> <@member>`,
+			"author":        map[string]any{"member_openid": "member", "member_role": "admin", "union_openid": "different-scope"},
+			"message_scene": map[string]any{"ext": []string{"msg_idx=REFIDX_in==", "future=abc"}},
+			"attachments":   []any{map[string]any{"content_type": "voice", "voice_wav_url": "https://example.invalid/voice.wav", "asr_refer_text": "speech"}},
+			"ark_data":      map[string]any{"prompt": "card", "fields": map[string]any{"future": []int{1, 2}}},
+			"msg_elements":  []any{map[string]any{"msg_idx": "REFIDX_child==", "content": "child", "msg_elements": []any{map[string]any{"content": "nested"}}}},
+		}, event.EventTypeMessageCreated},
+		{"GROUP_MEMBER_ADD", map[string]any{"group_openid": "group", "member_openid": "member", "member_role": "admin", "op_member_openid": "operator"}, event.EventTypeGuildMemberAdded},
+		{"GROUP_JOIN_REQUEST", map[string]any{"group_openid": "group", "member_openid": "member", "join_request_id": "join-id"}, event.EventTypeGuildMemberRequest},
+		{"FUTURE_QQ_EVENT", map[string]any{"opaque": json.Number("9007199254740993")}, event.EventTypeInternal},
+	}
+	for _, tc := range cases {
+		t.Run(tc.kind, func(t *testing.T) {
+			raw, err := json.Marshal(map[string]any{"op": 0, "s": 8, "t": tc.kind, "id": "native-event-id", "d": tc.data})
+			if err != nil {
+				t.Fatal(err)
+			}
+			response := httptest.NewRecorder()
+			f.adapter.handleWebhookRequest(response, signedQQRequest(t, raw, "123", "fixture-secret"))
+			if response.Code != 200 {
+				t.Fatalf("callback=%d %s", response.Code, response.Body)
+			}
+			select {
+			case evt := <-f.adapter.eventCh:
+				if evt.Type != tc.want || evt.Login.Platform != "qq" || evt.Login.User.Id != "bot-123" || evt.Type_ != tc.kind {
+					t.Fatalf("event=%+v", evt)
+				}
+				preserved, ok := evt.Data_.(json.RawMessage)
+				if !ok || !bytes.Equal(raw, preserved) || evt.Referrer["qq_event_id"] != "native-event-id" {
+					t.Fatalf("native context=%+v", evt.Referrer)
+				}
+				if tc.kind == "GROUP_MESSAGE_CREATE" {
+					if evt.Channel.Id != "group" || evt.User.Id != "member" || len(evt.Member.Roles) != 1 || evt.Member.Roles[0].Id != "admin" || evt.Referrer["ref_idx"] != "REFIDX_in==" {
+						t.Fatalf("group resources=%+v", evt)
+					}
+					for _, fragment := range []string{"&lt;img", `<at id="member"/>`, `<audio`, "voice.wav", "qq:ark-data", "nested", "REFIDX_child=="} {
+						if !strings.Contains(evt.Message.Content, fragment) {
+							t.Errorf("missing %q in %s", fragment, evt.Message.Content)
+						}
+					}
+				}
+				if tc.kind == "GROUP_JOIN_REQUEST" && evt.Message.Id != "join-id" {
+					t.Fatalf("request message=%+v", evt.Message)
+				}
+			case <-time.After(time.Second):
+				t.Fatal("converted event timed out")
+			}
+		})
+	}
+}

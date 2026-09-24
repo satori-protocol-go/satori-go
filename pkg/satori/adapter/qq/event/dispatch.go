@@ -3,6 +3,7 @@ package event
 import (
 	"context"
 	"encoding/json"
+	"errors"
 
 	"github.com/WindowsSov8forUs/botgo-plus/dto"
 	satorievent "github.com/satori-protocol-go/satori-go/pkg/satori/model/event"
@@ -24,9 +25,31 @@ func (c *Converter) Convert(
 	}
 
 	loginValue := c.loginForEvent(ctx, string(eventType))
+	if loginValue == nil {
+		// Unknown native events remain internal; routing uses the selected App,
+		// never another application's primary login.
+		platform := "qq"
+		if valueAsString(data["guild_id"]) != "" || valueAsString(data["channel_id"]) != "" {
+			platform = "qqguild"
+		}
+		loginValue = c.loginForPlatform(ctx, platform)
+	}
+	if loginValue == nil {
+		return nil, errors.New("QQ event login could not be resolved")
+	}
 	result := c.convertDispatchEvent(ctx, eventType, data, loginValue)
 	if result == nil {
 		return nil, nil
+	}
+	if result.Message != nil && result.Message.Referrer != nil {
+		if result.Referrer == nil {
+			result.Referrer = map[string]any{}
+		}
+		for key, value := range result.Message.Referrer {
+			if _, present := result.Referrer[key]; !present {
+				result.Referrer[key] = value
+			}
+		}
 	}
 	result.Type_ = string(eventType)
 	result.Data_ = data
@@ -47,7 +70,7 @@ func (c *Converter) convertDispatchEvent(
 		return c.makeGuildMessageCreatedEvent(loginValue, data)
 	case dto.EventDirectMessageCreate:
 		return c.makeGuildDirectMessageCreatedEvent(loginValue, data)
-	case dto.EventGroupAtMessageCreate:
+	case dto.EventGroupAtMessageCreate, dto.EventGroupMessageCreate:
 		return c.makeGroupMessageCreatedEvent(loginValue, data)
 	case dto.EventC2CMessageCreate:
 		return c.makeC2CMessageCreatedEvent(loginValue, data)
@@ -83,6 +106,12 @@ func (c *Converter) convertDispatchEvent(
 	case dto.EventGuildMemberRemove, "GUILD_MEMBER_DELETE":
 		return c.makeGuildMemberEvent(loginValue, data, satorievent.EventTypeGuildMemberRemoved)
 
+	case dto.EventGroupMemberAdd:
+		return c.makeGroupMemberEvent(loginValue, data, satorievent.EventTypeGuildMemberAdded)
+	case dto.EventGroupMemberRemove:
+		return c.makeGroupMemberEvent(loginValue, data, satorievent.EventTypeGuildMemberRemoved)
+	case dto.EventGroupJoinRequest:
+		return c.makeGroupMemberEvent(loginValue, data, satorievent.EventTypeGuildMemberRequest)
 	case dto.EventGroupAddRobot:
 		return c.makeGroupRobotEvent(loginValue, data, satorievent.EventTypeGuildAdded)
 	case dto.EventGroupDelRobot:

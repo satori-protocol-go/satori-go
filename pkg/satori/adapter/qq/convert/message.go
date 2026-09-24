@@ -7,124 +7,186 @@ import (
 	"strings"
 
 	"github.com/WindowsSov8forUs/botgo-plus/dto"
+	"github.com/satori-protocol-go/satori-go/pkg/satori/internal/xhtml"
 	"github.com/satori-protocol-go/satori-go/pkg/satori/model/channel"
 	"github.com/satori-protocol-go/satori-go/pkg/satori/model/guild"
 	"github.com/satori-protocol-go/satori-go/pkg/satori/model/message"
 )
 
-var (
-	mentionPattern = regexp.MustCompile(`<@!?(\w+)>`)
-	channelPattern = regexp.MustCompile(`<#(\w+)>`)
-	emojiPattern   = regexp.MustCompile(`<emoji:(\w+)>`)
-)
+var nativeTextToken = regexp.MustCompile(`<@!?(\w+)>|<#(\w+)>|<emoji:(\w+)>`)
 
 func MessageFromDTO(input *dto.Message, platform string) *message.Message {
 	if input == nil {
-		return &message.Message{}
+		return nil
 	}
-	result := &message.Message{
-		Id:      input.ID,
-		Content: messageContentFromDTO(input),
+	result := &message.Message{Id: input.ID, Content: messageContentFromDTO(input), Referrer: map[string]any{"msg_id": input.ID, "msg_seq": -1}}
+	if created, err := input.Timestamp.Time(); err == nil {
+		result.CreateAt = created.UnixMilli()
 	}
-
-	if createdAt, err := input.Timestamp.Time(); err == nil {
-		result.CreateAt = createdAt.UnixMilli()
+	if updated, err := input.EditedTimestamp.Time(); err == nil {
+		result.UpdateAt = updated.UnixMilli()
 	}
-	if updatedAt, err := input.EditedTimestamp.Time(); err == nil {
-		result.UpdateAt = updatedAt.UnixMilli()
-	}
-
 	result.User = UserFromDTO(input.Author)
 	result.Member = MemberFromDTO(input.Member)
-
+	groupID := input.EffectiveGroupID()
+	if result.User != nil && input.Author != nil && platform == "qq" {
+		if groupID != "" && input.Author.MemberOpenID != "" {
+			result.User.Id = input.Author.MemberOpenID
+		}
+		if groupID == "" && input.Author.UserOpenID != "" {
+			result.User.Id = input.Author.UserOpenID
+		}
+	}
 	switch {
 	case input.ChannelID != "":
-		channelType := channel.ChannelTypeText
+		kind := channel.ChannelTypeText
 		if input.DirectMessage {
-			channelType = channel.ChannelTypeDirect
+			kind = channel.ChannelTypeDirect
+			result.Referrer["direct"] = true
 		}
-		result.Channel = &channel.Channel{Id: input.ChannelID, Type: channelType}
+		result.Channel = &channel.Channel{Id: input.ChannelID, Type: kind}
 		if input.GuildID != "" {
 			result.Guild = &guild.Guild{Id: input.GuildID}
 		}
-	case input.GroupID != "":
-		result.Channel = &channel.Channel{Id: input.GroupID, Type: channel.ChannelTypeText}
-		result.Guild = &guild.Guild{Id: input.GroupID}
-	default:
-		derivedID := ""
-		if result.User != nil {
-			derivedID = result.User.Id
-		}
-		if derivedID == "" && input.Author != nil {
-			derivedID = firstNonEmpty(input.Author.UserOpenID, input.Author.MemberOpenID, input.Author.ID)
-		}
-		if derivedID != "" {
-			channelType := channel.ChannelTypeDirect
-			if platform == "qqguild" {
-				channelType = channel.ChannelTypeText
-			}
-			result.Channel = &channel.Channel{Id: derivedID, Type: channelType}
-		}
+	case groupID != "":
+		result.Channel = &channel.Channel{Id: groupID, Type: channel.ChannelTypeText}
+		result.Guild = &guild.Guild{Id: groupID}
+	case result.User != nil && result.User.Id != "":
+		result.Channel = &channel.Channel{Id: "private:" + result.User.Id, Type: channel.ChannelTypeDirect}
+		result.Referrer["direct"] = true
 	}
-
+	if len(input.MessageScene.Ext) > 0 || input.MessageScene.Source != "" || input.MessageScene.CallbackData != "" {
+		result.Referrer["msg_scene"] = input.MessageScene
+	}
+	if index, ok := input.MessageScene.GetExt("msg_idx"); ok {
+		result.Referrer["ref_idx"] = index
+	}
+	if input.ExtInfo != nil && input.ExtInfo.RefIdx != "" {
+		result.Referrer["ref_idx"] = input.ExtInfo.RefIdx
+	}
 	return result
+}
+
+// Only native mention/emoji tokens become elements. Literal user content is
+// escaped so an incoming '<img>' cannot turn into an executable resource request.
+func nativeText(content string) string {
+	var out strings.Builder
+	position := 0
+	for _, match := range nativeTextToken.FindAllStringSubmatchIndex(content, -1) {
+		out.WriteString(xhtml.Escape(content[position:match[0]], false))
+		switch {
+		case match[2] >= 0:
+			out.WriteString(xhtml.NewElement("at", map[string]any{"id": content[match[2]:match[3]]}).String())
+		case match[4] >= 0:
+			out.WriteString(xhtml.NewElement("sharp", map[string]any{"id": content[match[4]:match[5]]}).String())
+		case match[6] >= 0:
+			out.WriteString(xhtml.NewElement("qq:emoji", map[string]any{"id": content[match[6]:match[7]]}).String())
+		}
+		position = match[1]
+	}
+	out.WriteString(xhtml.Escape(content[position:], false))
+	return out.String()
 }
 
 func messageContentFromDTO(input *dto.Message) string {
 	if input == nil {
 		return ""
 	}
-	content := strings.TrimSpace(input.Content)
-	if content != "" {
-		content = mentionPattern.ReplaceAllString(content, `<at id="$1"/>`)
-		content = channelPattern.ReplaceAllString(content, `<sharp id="$1"/>`)
-		content = emojiPattern.ReplaceAllString(content, `<chronocat:emoji id="$1"/>`)
-	}
-
-	chunks := []string{}
+	var chunks []string
 	if input.MentionEveryone {
 		chunks = append(chunks, `<at type="all"/>`)
 	}
-	if content != "" {
-		chunks = append(chunks, content)
+	if input.MessageReference != nil && input.MessageReference.MessageID != "" {
+		chunks = append(chunks, xhtml.NewElement("quote", map[string]any{"id": input.MessageReference.MessageID}).String())
 	}
-	if input.MessageReference != nil && strings.TrimSpace(input.MessageReference.MessageID) != "" {
-		chunks = append(chunks, fmt.Sprintf(`<quote id="%s"/>`, input.MessageReference.MessageID))
-	}
-	for _, item := range input.Attachments {
-		if item == nil || strings.TrimSpace(item.URL) == "" {
-			continue
-		}
-		src := item.URL
-		if !strings.HasPrefix(src, "http://") && !strings.HasPrefix(src, "https://") {
-			src = "https://" + strings.TrimPrefix(src, "//")
-		}
-		switch {
-		case strings.HasPrefix(item.ContentType, "image"):
-			chunks = append(chunks, fmt.Sprintf(`<img src="%s"/>`, src))
-		case strings.HasPrefix(item.ContentType, "audio"):
-			chunks = append(chunks, fmt.Sprintf(`<audio src="%s"/>`, src))
-		case strings.HasPrefix(item.ContentType, "video"):
-			chunks = append(chunks, fmt.Sprintf(`<video src="%s"/>`, src))
-		default:
-			chunks = append(chunks, fmt.Sprintf(`<file src="%s"/>`, src))
-		}
+	chunks = append(chunks, nativeText(input.Content))
+	for _, attachment := range input.Attachments {
+		chunks = append(chunks, attachmentElement(attachment))
 	}
 	for _, embed := range input.Embeds {
 		if embed == nil {
 			continue
 		}
-		raw, err := json.Marshal(embed)
-		if err != nil {
-			continue
+		if raw, err := json.Marshal(embed); err == nil {
+			chunks = append(chunks, xhtml.NewElement("qq:embed", map[string]any{"data": string(raw)}).String())
 		}
-		chunks = append(chunks, fmt.Sprintf(`<qq:embed data='%s'/>`, strings.ReplaceAll(string(raw), `'`, "&apos;")))
 	}
 	if input.Ark != nil {
-		raw, err := json.Marshal(input.Ark)
-		if err == nil {
-			chunks = append(chunks, fmt.Sprintf(`<qq:ark>%s</qq:ark>`, string(raw)))
+		if raw, err := json.Marshal(input.Ark); err == nil {
+			chunks = append(chunks, "<qq:ark>"+xhtml.Escape(string(raw), false)+"</qq:ark>")
 		}
 	}
-	return strings.TrimSpace(strings.Join(chunks, " "))
+	if input.ArkData != nil {
+		if raw, err := json.Marshal(input.ArkData); err == nil {
+			chunks = append(chunks, xhtml.NewElement("qq:ark-data", map[string]any{"data": string(raw)}).String())
+		}
+	}
+	if len(input.MsgElements) > 0 {
+		chunks = append(chunks, nestedMessages(input.MsgElements))
+	}
+	return strings.Join(chunks, "")
+}
+
+func attachmentElement(item *dto.MessageAttachment) string {
+	if item == nil {
+		return ""
+	}
+	src := item.URL
+	if src == "" {
+		src = item.VoiceWAVURL
+	}
+	if src == "" {
+		return ""
+	}
+	if !strings.HasPrefix(src, "http://") && !strings.HasPrefix(src, "https://") {
+		src = "https://" + strings.TrimPrefix(src, "//")
+	}
+	kind := "file"
+	switch {
+	case strings.HasPrefix(item.ContentType, "image"):
+		kind = "img"
+	case strings.HasPrefix(item.ContentType, "audio") || item.ContentType == "voice":
+		kind = "audio"
+	case strings.HasPrefix(item.ContentType, "video"):
+		kind = "video"
+	}
+	attrs := map[string]any{"src": src}
+	if item.FileName != "" {
+		attrs["title"] = item.FileName
+	}
+	if item.Duration > 0 {
+		attrs["duration"] = item.Duration
+	}
+	if item.Width > 0 {
+		attrs["width"] = item.Width
+	}
+	if item.Height > 0 {
+		attrs["height"] = item.Height
+	}
+	if item.VoiceWAVURL != "" {
+		attrs["qq:voice-wav-url"] = item.VoiceWAVURL
+	}
+	if item.ASRReferText != "" {
+		attrs["qq:asr-text"] = item.ASRReferText
+	}
+	return xhtml.NewElement(kind, attrs).String()
+}
+
+func nestedMessages(items []dto.MessageElement) string {
+	var out strings.Builder
+	out.WriteString("<message forward>")
+	for _, item := range items {
+		attrs := ""
+		if item.MsgIdx != "" {
+			attrs = fmt.Sprintf(` id="%s"`, xhtml.Escape(item.MsgIdx, true))
+		}
+		out.WriteString("<message" + attrs + ">")
+		if author := UserFromDTO(item.Author); author != nil {
+			out.WriteString(xhtml.NewElement("author", map[string]any{"id": author.Id, "name": author.Name}).String())
+		}
+		out.WriteString(messageContentFromDTO(&dto.Message{Content: item.Content, Attachments: item.Attachments, ArkData: item.ArkData, MsgElements: item.MsgElements}))
+		out.WriteString("</message>")
+	}
+	out.WriteString("</message>")
+	return out.String()
 }

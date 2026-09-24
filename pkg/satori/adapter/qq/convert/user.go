@@ -3,6 +3,7 @@ package convert
 import (
 	"github.com/WindowsSov8forUs/botgo-plus/dto"
 	"github.com/satori-protocol-go/satori-go/pkg/satori/model/guildmember"
+	"github.com/satori-protocol-go/satori-go/pkg/satori/model/guildrole"
 	"github.com/satori-protocol-go/satori-go/pkg/satori/model/user"
 )
 
@@ -10,7 +11,7 @@ func UserFromDTO(input *dto.User) *user.User {
 	if input == nil {
 		return nil
 	}
-	id := firstNonEmpty(input.ID, input.MemberOpenID, input.UserOpenID, input.UnionOpenID)
+	id := input.EffectiveUserID()
 	return &user.User{Id: id, Name: input.Username, Avatar: input.Avatar, IsBot: input.Bot}
 }
 
@@ -24,6 +25,11 @@ func MemberFromDTO(input *dto.Member) *guildmember.GuildMember {
 	}
 	if joinedAt, err := input.JoinedAt.Time(); err == nil {
 		result.JoinedAt = joinedAt.UnixMilli()
+	}
+	for _, role := range input.Roles {
+		if role != "" {
+			result.Roles = append(result.Roles, &guildrole.GuildRole{Id: role})
+		}
 	}
 	return result
 }
