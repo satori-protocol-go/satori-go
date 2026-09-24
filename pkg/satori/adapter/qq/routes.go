@@ -909,6 +909,10 @@ func qqActionError(err error) error {
 	if err == nil {
 		return nil
 	}
+	var alreadyMapped interface{ HTTPStatus() int }
+	if errors.As(err, &alreadyMapped) {
+		return err
+	}
 	var apiError *errs.APIError
 	if !errors.As(err, &apiError) {
 		return err

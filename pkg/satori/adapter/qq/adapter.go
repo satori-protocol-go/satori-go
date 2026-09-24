@@ -53,8 +53,8 @@ type Adapter struct {
 	wsConnMu  sync.RWMutex
 	wsClients map[string]websocket.WebSocket
 
-	auditMu      sync.Mutex
-	auditWaiters map[string][]chan string
+	auditMu sync.Mutex
+	audits  map[auditKey]*auditEntry
 
 	loginInitMu sync.Mutex
 	mu          sync.RWMutex
@@ -133,7 +133,7 @@ func New(cfg Config) (*Adapter, error) {
 		wsReconnect:     wsReconnect,
 		selfToApp:       map[string]string{},
 		wsClients:       map[string]websocket.WebSocket{},
-		auditWaiters:    map[string][]chan string{},
+		audits:          map[auditKey]*auditEntry{},
 	}
 	adapter.converter = qqevent.New(qqevent.Dependencies{
 		MessageFromDTO: convert.MessageFromDTO,
