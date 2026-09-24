@@ -25,6 +25,11 @@ const defaultWSIntents = int64(
 )
 
 var defaultQQFeatures = []string{
+	"guild.get",
+	"guild.member.get",
+	"guild.member.list",
+	"guild.member.kick",
+	"guild.member.mute",
 	"message.create",
 	"message.delete",
 	"upload.create",

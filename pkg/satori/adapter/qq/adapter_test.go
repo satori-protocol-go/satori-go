@@ -24,6 +24,8 @@ import (
 	"github.com/satori-protocol-go/satori-go/pkg/satori/logging"
 	"github.com/satori-protocol-go/satori-go/pkg/satori/model"
 	"github.com/satori-protocol-go/satori-go/pkg/satori/model/event"
+	"github.com/satori-protocol-go/satori-go/pkg/satori/model/guild"
+	"github.com/satori-protocol-go/satori-go/pkg/satori/model/guildmember"
 	"github.com/satori-protocol-go/satori-go/pkg/satori/model/login"
 	"github.com/satori-protocol-go/satori-go/pkg/satori/model/message"
 	"github.com/satori-protocol-go/satori-go/pkg/satori/server"
@@ -905,5 +907,140 @@ func TestQQInteractionResponses(t *testing.T) {
 	var status interface{ HTTPStatus() int }
 	if !errors.As(err, &status) || status.HTTPStatus() != 409 {
 		t.Fatalf("interaction ownership=%v", err)
+	}
+}
+
+func TestQQGroupManagement(t *testing.T) {
+	f := newQQFixture(t, nil)
+	f.extra = func(w http.ResponseWriter, r *http.Request, item qqRequest) bool {
+		switch r.Method + " " + r.URL.Path {
+		case "GET /v2/groups/group/info":
+			w.Write([]byte(`{"group_openid":"group","group_name":"Group name"}`))
+		case "GET /v2/groups/group/members/member":
+			w.Write([]byte(`{"member_openid":"member","username":"Member name","member_role":"admin","joined_at":"2026-09-24T01:02:03.004Z","union_openid":"not-member-id"}`))
+		case "GET /v2/groups/group/members":
+			switch r.URL.Query().Get("cursor") {
+			case "":
+				w.Write([]byte(`{"members":[{"member_openid":"one","member_role":"owner"}],"next_cursor":" next+/== "}`))
+			case " next+/== ":
+				w.Write([]byte(`{"members":[{"member_openid":"two","member_role":"member"}],"next_cursor":""}`))
+			default:
+				t.Errorf("cursor changed: %q", r.URL.Query().Get("cursor"))
+				w.WriteHeader(400)
+			}
+		case "POST /v2/groups/group/batch_remove_members":
+			var value dto.QQGroupRemoveRequest
+			if err := json.Unmarshal(item.Raw, &value); err != nil {
+				t.Error(err)
+			}
+			if len(value.MemberOpenIDs) != 1 || value.MemberOpenIDs[0] != "member" {
+				t.Errorf("remove=%+v", value)
+			}
+			if value.AddToMemberBlacklist {
+				w.Write([]byte(`{"remove_members_result":"success","add_to_member_blacklist_fail_openids":["member"]}`))
+			} else {
+				w.Write([]byte(`{"remove_members_result":"success","add_to_member_blacklist_fail_openids":[]}`))
+			}
+		case "POST /v2/groups/group/restrict_chat_setting":
+			var value dto.QQGroupMuteRequest
+			if err := json.Unmarshal(item.Raw, &value); err != nil {
+				t.Error(err)
+			}
+			if len(value.Members) != 1 || value.Members[0].MemberOpenID != "member" {
+				t.Errorf("mute=%+v", value)
+				w.WriteHeader(400)
+				return true
+			}
+			op := value.Members[0]
+			if op.Op == "add" {
+				expiry, err := time.Parse(time.RFC3339Nano, op.MuteExpireAt)
+				if err != nil || time.Until(expiry) < 8*time.Second || time.Until(expiry) > 11*time.Second {
+					t.Errorf("mute expiry=%s error=%v", op.MuteExpireAt, err)
+				}
+			} else if op.Op != "del" {
+				t.Errorf("mute operation=%s", op.Op)
+			}
+			w.Write([]byte(`{}`))
+		case "GET /guilds/guild":
+			w.Write([]byte(`{"id":"guild","name":"Guild name"}`))
+		case "GET /guilds/guild/members/member":
+			w.Write([]byte(`{"user":{"id":"member"},"roles":["role"],"joined_at":"2026-09-24T01:02:03Z"}`))
+		case "GET /guilds/guild/members":
+			w.Write([]byte(`[{"user":{"id":"member"},"roles":["role"]}]`))
+		case "DELETE /guilds/guild/members/member":
+			w.WriteHeader(204)
+		case "PATCH /guilds/guild/members/member/mute":
+			if string(item.Fields["mute_seconds"]) != `"10"` {
+				t.Errorf("guild mute=%s", item.Raw)
+			}
+			w.WriteHeader(204)
+		case "GET /v2/groups/denied/info":
+			w.WriteHeader(403)
+			w.Write([]byte(`{"err_code":11253}`))
+		default:
+			return false
+		}
+		return true
+	}
+	result, err := f.call("guild.get", "qq", "bot-123", map[string]any{"guild_id": "group"})
+	if err != nil || result.(*guild.Guild).Name != "Group name" {
+		t.Fatalf("group=%+v error=%v", result, err)
+	}
+	result, err = f.call("guild.member.get", "qq", "bot-123", map[string]any{"guild_id": "group", "user_id": "member"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	member := result.(*guildmember.GuildMember)
+	expected, _ := time.Parse(time.RFC3339Nano, "2026-09-24T01:02:03.004Z")
+	if member.User.Id != "member" || member.JoinedAt != expected.UnixMilli() || len(member.Roles) != 1 || member.Roles[0].Id != "admin" {
+		t.Fatalf("member=%+v", member)
+	}
+	cursor := ""
+	for _, id := range []string{"one", "two"} {
+		result, err = f.call("guild.member.list", "qq", "bot-123", map[string]any{"guild_id": "group", "next": cursor})
+		if err != nil {
+			t.Fatal(err)
+		}
+		page := result.(*model.Paginated[*guildmember.GuildMember])
+		if len(page.Data) != 1 || page.Data[0].User.Id != id || len(page.Data[0].Roles) != 1 {
+			t.Fatalf("members=%+v", page)
+		}
+		cursor = page.Next
+	}
+	if cursor != "" {
+		t.Fatalf("terminal cursor=%q", cursor)
+	}
+	for _, permanent := range []bool{false, true} {
+		result, err = f.call("guild.member.kick", "qq", "bot-123", map[string]any{"guild_id": "group", "user_id": "member", "permanent": permanent})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if permanent {
+			partial := result.(*server.Response)
+			if partial.StatusCode != 502 || !bytes.Contains(partial.Body, []byte(`"add_to_member_blacklist_fail_openids":["member"]`)) {
+				t.Fatalf("partial removal=%+v", partial)
+			}
+		}
+	}
+	for _, duration := range []int64{10000, 0} {
+		if _, err := f.call("guild.member.mute", "qq", "bot-123", map[string]any{"guild_id": "group", "user_id": "member", "duration": duration}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, action := range []string{"guild.get", "guild.member.get", "guild.member.list", "guild.member.kick", "guild.member.mute"} {
+		before := len(f.requests())
+		_, err := f.call(action, "qqguild", "bot-123", map[string]any{"guild_id": "guild", "user_id": "member", "duration": 10000})
+		if err != nil {
+			t.Fatalf("guild action %s: %v", action, err)
+		}
+		calls := f.requests()[before:]
+		if len(calls) != 1 || !strings.HasPrefix(calls[0].Path, "/guilds/") {
+			t.Fatalf("guild request path=%+v", calls)
+		}
+	}
+	_, err = f.call("guild.get", "qq", "bot-123", map[string]any{"guild_id": "denied"})
+	var status interface{ HTTPStatus() int }
+	if !errors.As(err, &status) || status.HTTPStatus() != 403 || !strings.Contains(err.Error(), "11253") {
+		t.Fatalf("permissions=%v", err)
 	}
 }
