@@ -266,7 +266,7 @@ func (p *APIProtocol) RequestInternal(
 	method string,
 	params map[string]any,
 	requestOptions ...RequestOption,
-) (map[string]any, error) {
+) (*http.Response, error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -282,11 +282,6 @@ func (p *APIProtocol) RequestInternal(
 			continue
 		}
 		option(options)
-	}
-	if options.timeoutSet && options.timeout > 0 {
-		var cancel context.CancelFunc
-		ctx, cancel = context.WithTimeout(ctx, options.timeout)
-		defer cancel()
 	}
 
 	var (
@@ -352,11 +347,21 @@ func (p *APIProtocol) RequestInternal(
 	if err != nil {
 		return nil, err
 	}
-	payload, err := p.doRequestWithClient(request, client)
-	if err != nil {
-		return nil, err
+	// Native responses are consumed and closed by the caller. Only the configured
+	// SDK origin receives automatic credentials; redirects remain visible.
+	if p.isAPIURL(request.URL) {
+		for name, values := range p.apiHeaders() {
+			if name == "Content-Type" {
+				continue
+			}
+			if request.Header.Get(name) == "" {
+				request.Header[name] = append([]string(nil), values...)
+			}
+		}
 	}
-	return decodeObject(payload)
+	rawClient := *client
+	rawClient.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
+	return rawClient.Do(request)
 }
 
 func (p *APIProtocol) CallAPI(
@@ -964,20 +969,23 @@ func (p *APIProtocol) FriendApprove(ctx context.Context, requestID string, appro
 	return err
 }
 
-func (p *APIProtocol) Internal(ctx context.Context, action string, method string, params map[string]any) (any, error) {
-	internalAction := protocol.NormalizeInternalApi(action)
-	if internalAction == "" {
+// Internal performs a native request. The caller consumes and closes Response.Body.
+func (p *APIProtocol) Internal(ctx context.Context, action string, method string, params map[string]any) (*http.Response, error) {
+	action = protocol.NormalizeInternalApi(action)
+	if action == "" {
 		return nil, errors.New("internal action cannot be empty")
 	}
-	resp, err := p.CallAPI(ctx, internalAction, params, false, method)
-	if err != nil {
-		return nil, err
+	return p.RequestInternal(ctx, joinURLPath(p.account.Config.APIBase(), action), normalizeAPIMethod(method), params)
+}
+
+func (p *APIProtocol) isAPIURL(target *url.URL) bool {
+	base, err := url.Parse(p.account.Config.APIBase())
+	if err != nil || target == nil {
+		return false
 	}
-	var result any
-	if err := decodeJSON(resp, &result); err != nil {
-		return nil, err
-	}
-	return result, nil
+	prefix := strings.TrimRight(base.Path, "/")
+	return target.Scheme == base.Scheme && strings.EqualFold(target.Host, base.Host) &&
+		(target.Path == prefix || strings.HasPrefix(target.Path, prefix+"/"))
 }
 
 func (p *APIProtocol) MetaGet(ctx context.Context) (*meta.Meta, error) {
@@ -1117,7 +1125,7 @@ func (p *APIProtocol) resolveInternalRequestClient(options *InternalRequestOptio
 		return p.client, nil
 	}
 	requiresTransportClone := options.proxySet || options.tlsConfig != nil
-	if !requiresTransportClone {
+	if !requiresTransportClone && !options.timeoutSet {
 		return p.client, nil
 	}
 
@@ -1126,6 +1134,15 @@ func (p *APIProtocol) resolveInternalRequestClient(options *InternalRequestOptio
 		baseClient = &http.Client{Timeout: p.timeout}
 	}
 	clonedClient := *baseClient
+	if options.timeoutSet {
+		if options.timeout < 0 {
+			return nil, errors.New("request timeout must be nonnegative")
+		}
+		clonedClient.Timeout = options.timeout
+	}
+	if !requiresTransportClone {
+		return &clonedClient, nil
+	}
 
 	clonedTransport, err := cloneHTTPTransport(baseClient.Transport)
 	if err != nil {
@@ -1594,17 +1611,6 @@ func stringValue(value any) string {
 	default:
 		return strings.TrimSpace(fmt.Sprint(typed))
 	}
-}
-
-func decodeObject(payload []byte) (map[string]any, error) {
-	if len(bytes.TrimSpace(payload)) == 0 {
-		return map[string]any{}, nil
-	}
-	result := map[string]any{}
-	if err := json.Unmarshal(payload, &result); err != nil {
-		return nil, err
-	}
-	return result, nil
 }
 
 func decodeJSON(payload []byte, target any) error {

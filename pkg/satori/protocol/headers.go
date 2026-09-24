@@ -36,17 +36,17 @@ func SetIdentityHeaders(header http.Header, platform string, selfID string) {
 }
 
 func ExtractIdentityHeaders(header http.Header) (string, string, error) {
-	platform := strings.TrimSpace(header.Get(HeaderPlatform))
+	platform := header.Get(HeaderSatoriPlatform)
 	if platform == "" {
-		platform = strings.TrimSpace(header.Get(HeaderSatoriPlatform))
+		platform = header.Get(HeaderPlatform)
 	}
 	if platform == "" {
 		return "", "", ErrMissingPlatformHeader
 	}
 
-	selfID := strings.TrimSpace(header.Get(HeaderSelfID))
+	selfID := header.Get(HeaderSatoriUserID)
 	if selfID == "" {
-		selfID = strings.TrimSpace(header.Get(HeaderSatoriUserID))
+		selfID = header.Get(HeaderSelfID)
 	}
 	if selfID == "" {
 		return "", "", ErrMissingSelfIDHeader
