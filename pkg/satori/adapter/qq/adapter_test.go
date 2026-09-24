@@ -315,7 +315,7 @@ func TestQQErrorAndNativeResponse(t *testing.T) {
 			return true
 		}
 		if r.URL.Path == "/raw" {
-			if r.Method != "PATCH" || r.URL.Query().Get("cursor") != " +/=" || r.Header.Get("Content-Type") != "application/octet-stream" {
+			if r.Method != "PATCH" || len(r.URL.Query()["cursor"]) != 1 || r.URL.Query().Get("cursor") != " +/=" || r.Header.Get("Content-Type") != "application/octet-stream" {
 				t.Errorf("native request=%s %s type=%s", r.Method, r.URL.RawQuery, r.Header.Get("Content-Type"))
 			}
 			w.Header().Set("Content-Type", "application/octet-stream")
@@ -345,6 +345,27 @@ func TestQQErrorAndNativeResponse(t *testing.T) {
 	response, err := f.adapter.HandleInternal(server.Request[map[string]any]{Origin: r, Platform: "qq", SelfID: "bot-123"}, "_api/raw")
 	if err != nil || response.StatusCode != 200 || string(response.Body) != "binary-content" || response.Header.Get("Content-Type") != "application/octet-stream" {
 		t.Fatalf("native response=%+v error=%v", response, err)
+	}
+	owner, err := server.NewServer(server.Config{Token: "fixture-token"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer owner.Close()
+	if err := owner.Apply(f.adapter); err != nil {
+		t.Fatal(err)
+	}
+	handler, err := owner.Handler()
+	if err != nil {
+		t.Fatal(err)
+	}
+	target := "/v1/proxy/" + url.PathEscape("internal:qq/bot-123/_api/raw") + "?cursor=%20%2B%2F%3D"
+	req := httptest.NewRequest("PATCH", target, strings.NewReader("binary-content"))
+	req.Header.Set("Content-Type", "application/octet-stream")
+	req.Header.Set("Authorization", "Bearer fixture-token")
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+	if rec.Code != 200 || rec.Body.String() != "binary-content" {
+		t.Fatalf("proxied native response=%d %q", rec.Code, rec.Body.String())
 	}
 }
 
