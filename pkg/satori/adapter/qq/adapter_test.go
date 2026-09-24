@@ -122,6 +122,16 @@ func newQQFixture(t *testing.T, configure func(*Config)) *qqFixture {
 			w.WriteHeader(401)
 			return
 		}
+		if r.Method == "GET" && strings.HasPrefix(r.URL.Path, "/channels/channel/messages/") {
+			id := strings.TrimPrefix(r.URL.Path, "/channels/channel/messages/")
+			value := map[string]any{"id": id, "channel_id": "channel", "content": "retrieved"}
+			if id == "wrapped" {
+				json.NewEncoder(w).Encode(map[string]any{"message": value})
+			} else {
+				json.NewEncoder(w).Encode(value)
+			}
+			return
+		}
 		if r.URL.Path == "/users/@me" {
 			json.NewEncoder(w).Encode(map[string]any{"id": "bot-" + r.Header.Get("X-Union-Appid"), "username": "fixture", "bot": true})
 			return
@@ -208,6 +218,18 @@ func TestQQNativeRequests(t *testing.T) {
 	logins, err := f.adapter.GetLogins(context.Background())
 	if err != nil || len(logins) != 2 || logins[0].Sn == logins[1].Sn {
 		t.Fatalf("logins=%+v error=%v", logins, err)
+	}
+	for _, id := range []string{"wrapped", "direct"} {
+		t.Run("message-get-"+id, func(t *testing.T) {
+			result, err := f.call("message.get", "qqguild", "bot-123", map[string]any{"channel_id": "channel", "message_id": id})
+			if err != nil {
+				t.Fatal(err)
+			}
+			value := result.(*message.Message)
+			if value.Id != id || value.Content != "retrieved" {
+				t.Fatalf("retrieved=%+v", value)
+			}
+		})
 	}
 	for _, tc := range []struct{ name, platform, target, content, path string }{
 		{"group", "qq", "group", "hello", "/v2/groups/group/messages"},

@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"math"
 	"net/http"
+	"net/url"
 	"sort"
 	"strconv"
 	"strings"
@@ -586,14 +587,26 @@ func (a *Adapter) handleMessageGet(request *server.Request[server.MessageOpParam
 	if err != nil {
 		return nil, err
 	}
-	fetched, err := state.api.Message(requestContext(request.Origin), channelID, messageID)
+	// Use the existing native request boundary: the pinned SDK's Message helper
+	// targets the message-list URI, rather than the single-message URI.
+	path := "/channels/" + url.PathEscape(channelID) + "/messages/" + url.PathEscape(messageID)
+	var envelope map[string]json.RawMessage
+	meta, err := state.api.Do(requestContext(request.Origin), http.MethodGet, path, nil, &envelope)
 	if err != nil {
 		return nil, err
 	}
-	if fetched == nil {
-		return nil, server.NotFound("message not found")
+	raw := meta.Raw
+	if wrapped := envelope["message"]; len(wrapped) > 0 {
+		raw = wrapped
 	}
-	return convert.MessageFromDTO(fetched, request.Platform), nil
+	var fetched dto.Message
+	if err := json.Unmarshal(raw, &fetched); err != nil {
+		return nil, err
+	}
+	if fetched.ID == "" {
+		return nil, server.NewActionError(502, "QQ response has no message ID", nil)
+	}
+	return convert.MessageFromDTO(&fetched, request.Platform), nil
 }
 
 func (a *Adapter) handleMessageList(request *server.Request[server.MessageListParam]) (any, error) {
