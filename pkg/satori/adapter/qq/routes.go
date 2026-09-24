@@ -234,6 +234,9 @@ func (a *Adapter) HandleInternal(request server.Request[map[string]any], path st
 			action += separator + request.Origin.URL.RawQuery
 		}
 	}
+	if strings.EqualFold(method, http.MethodPut) && strings.HasPrefix(strings.TrimLeft(strings.SplitN(action, "?", 2)[0], "/"), "interactions/") {
+		return nil, server.NewActionError(409, "QQ interaction responses are owned by the adapter", nil)
+	}
 	meta, err := state.api.Do(ctx, method, action, body, nil)
 	if meta == nil {
 		return nil, err

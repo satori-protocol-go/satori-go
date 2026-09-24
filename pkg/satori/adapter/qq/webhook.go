@@ -11,6 +11,7 @@ import (
 
 	"github.com/WindowsSov8forUs/botgo-plus/dto"
 	"github.com/go-chi/chi/v5"
+	"github.com/satori-protocol-go/satori-go/pkg/satori/adapter/qq/convert"
 	"github.com/satori-protocol-go/satori-go/pkg/satori/logging"
 )
 
@@ -79,13 +80,28 @@ func (a *Adapter) acceptPayload(ctx context.Context, state *appState, payload *d
 	if evt == nil {
 		return nil
 	}
+	if payload.Type == dto.EventInteractionCreate {
+		var interaction dto.Interaction
+		if err := json.Unmarshal(raw, &interaction); err != nil {
+			return err
+		}
+		if interaction.ApplicationID != "" && interaction.ApplicationID != state.appID {
+			return errors.New("QQ interaction application does not match the connection")
+		}
+		kind := convert.InteractionKind(&interaction)
+		if kind == 11 || kind == 12 {
+			if _, err := state.api.AcknowledgeInteraction(ctx, interaction.ID, 0); err != nil {
+				return err
+			}
+		}
+	}
 	if evt.Referrer == nil {
 		evt.Referrer = map[string]any{}
 	}
 	evt.Referrer["app_id"] = state.appID
 	if payload.EventID != "" {
 		evt.Referrer["qq_event_id"] = payload.EventID
-		if evt.Type != event.EventTypeMessageCreated && evt.Type != event.EventTypeMessageDeleted {
+		if _, present := evt.Referrer["event_id"]; !present && evt.Type != event.EventTypeMessageCreated && evt.Type != event.EventTypeMessageDeleted {
 			evt.Referrer["event_id"] = payload.EventID
 		}
 	}
