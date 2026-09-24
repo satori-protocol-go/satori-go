@@ -589,12 +589,13 @@ func (s *Server) postFrom(source int, evt *event.Event) error {
 			s.removeConnection(connection)
 		}
 	}
+	var deliveryErr error
 	for _, webhook := range webhooks {
 		if err := s.sendWebhook(webhook, operation.OpcodeEvent, frozen.body); err != nil {
-			s.log(context.Background(), LogLevelError, fmt.Sprintf("webhook event delivery failed url=%s error=%v", webhook.URL, err))
+			deliveryErr = errors.Join(deliveryErr, err)
 		}
 	}
-	return nil
+	return deliveryErr
 }
 
 // bindLoginLocked assigns a runtime-local downstream number. Source keys remain
@@ -1291,7 +1292,9 @@ func (s *Server) sendWebhook(webhook WebhookEndpoint, opcode operation.Opcode, b
 		return err
 	}
 	req.Header.Set("Content-Type", "application/json")
-	protocol.SetBearer(req.Header, webhook.Token)
+	if webhook.Token != "" {
+		protocol.SetBearer(req.Header, webhook.Token)
+	}
 	protocol.SetOpcode(req.Header, int(opcode))
 
 	resp, err := s.httpClient.Do(req)
@@ -1299,7 +1302,7 @@ func (s *Server) sendWebhook(webhook WebhookEndpoint, opcode operation.Opcode, b
 		return err
 	}
 	defer resp.Body.Close()
-	if resp.StatusCode >= 400 {
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		bodyData, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
 		return fmt.Errorf("webhook response status %d: %s", resp.StatusCode, string(bodyData))
 	}

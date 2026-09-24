@@ -805,3 +805,19 @@ func TestAccountSnapshotConsistency(t *testing.T) {
 		t.Fatalf("final login=%+v", account.SelfInfo())
 	}
 }
+
+func TestEventCallbackResult(t *testing.T) {
+	app, err := satoriclient.NewApp()
+	if err != nil {
+		t.Fatal(err)
+	}
+	info := &login.Login{Sn: 1, Platform: "p", User: &user.User{Id: "u"}, Status: login.LoginStatusOnline}
+	if err := app.SyncLogins("source", satoriclient.APIInfo{}, nil, []*login.Login{info}); err != nil {
+		t.Fatal(err)
+	}
+	app.Register(func(*satoriclient.Account, *event.Event) error { return errors.New("fixture callback failed") })
+	err = app.PostEvent("source", &event.Event{Sn: 1, Type: event.EventTypeMessageCreated, Login: info})
+	if err == nil || err.Error() != "fixture callback failed" {
+		t.Fatalf("callback result=%v", err)
+	}
+}

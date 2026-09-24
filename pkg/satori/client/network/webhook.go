@@ -101,7 +101,6 @@ func (n *Webhook) Run(ctx context.Context) error {
 	n.mu.Lock()
 	n.server = server
 	n.mu.Unlock()
-	n.base.MarkAvailable()
 
 	errCh := make(chan error, 1)
 	go func() {
@@ -117,6 +116,8 @@ func (n *Webhook) Run(ctx context.Context) error {
 		_ = n.Close()
 		return err
 	}
+	n.base.MarkAvailable()
+	defer n.base.MarkUnavailable()
 
 	select {
 	case <-ctx.Done():
@@ -153,7 +154,7 @@ func (n *Webhook) Close() error {
 func (n *Webhook) Alive() bool {
 	n.mu.Lock()
 	defer n.mu.Unlock()
-	return n.server != nil
+	return n.server != nil && n.base.Available()
 }
 
 func (n *Webhook) WaitForAvailable(ctx context.Context) error {
@@ -176,6 +177,9 @@ func (n *Webhook) fetchMeta(ctx context.Context) error {
 		return err
 	}
 	request.Header.Set("Content-Type", "application/json")
+	if token := n.base.Config().TokenValue(); token != "" {
+		protocol.SetBearer(request.Header, token)
+	}
 
 	response, err := n.client.Do(request)
 	if err != nil {
@@ -203,57 +207,60 @@ func (n *Webhook) fetchMeta(ctx context.Context) error {
 
 func (n *Webhook) handleRequest(w http.ResponseWriter, request *http.Request) {
 	if request.Method != http.MethodPost {
+		w.Header().Set("Allow", http.MethodPost)
 		w.WriteHeader(http.StatusMethodNotAllowed)
 		return
 	}
-
-	token, ok := protocol.ParseBearer(request.Header.Get(protocol.HeaderAuthorization))
-	if !ok {
-		w.WriteHeader(http.StatusUnauthorized)
-		return
+	if n.token != "" {
+		token, ok := protocol.ParseBearer(request.Header.Get(protocol.HeaderAuthorization))
+		if !ok || token != n.token {
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
 	}
-	if n.token != "" && token != n.token {
-		w.WriteHeader(http.StatusUnauthorized)
-		return
-	}
-
+	request.Body = http.MaxBytesReader(w, request.Body, 32<<20)
+	defer request.Body.Close()
 	payload, err := io.ReadAll(request.Body)
 	if err != nil {
-		w.WriteHeader(http.StatusInternalServerError)
+		var tooLarge *http.MaxBytesError
+		if errors.As(err, &tooLarge) {
+			w.WriteHeader(http.StatusRequestEntityTooLarge)
+		} else {
+			w.WriteHeader(http.StatusBadRequest)
+		}
 		return
 	}
-
-	opcode, _ := protocol.ParseOpcode(request.Header.Get(protocol.HeaderOpcode))
-
-	switch operation.Opcode(opcode) {
-	case operation.OpcodeMeta:
-		var metaPayload operation.MetaBody
-		if err := decodeJSON(payload, &metaPayload); err != nil {
+	opcode, err := protocol.ParseOpcode(request.Header.Get(protocol.HeaderOpcode))
+	if err != nil {
+		w.WriteHeader(http.StatusBadRequest)
+		return
+	}
+	switch opcode {
+	case int(operation.OpcodeMeta):
+		var value operation.MetaBody
+		if err := decodeJSON(payload, &value); err != nil {
 			w.WriteHeader(http.StatusBadRequest)
 			return
 		}
-		n.base.SetProxyURLs(metaPayload.ProxyUrls)
-		n.base.app.UpdateProxyURLs(n.ID(), metaPayload.ProxyUrls)
-		w.WriteHeader(http.StatusOK)
-		return
-
-	case operation.OpcodeEvent:
+		n.base.SetProxyURLs(value.ProxyUrls)
+		n.base.app.UpdateProxyURLs(n.ID(), value.ProxyUrls)
+	case int(operation.OpcodeEvent):
 		var evt event.Event
-		if err := decodeJSON(payload, &evt); err != nil {
-			n.base.Log(request.Context(), logging.LevelWarn, fmt.Sprintf("failed to parse webhook event network_id=%s error=%v", n.ID(), err))
-			w.WriteHeader(http.StatusInternalServerError)
+		if err := decodeJSON(payload, &evt); err != nil || evt.Type == "" || evt.Login == nil || evt.Sn < 0 {
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		if err := n.base.app.PostEvent(n.ID(), &evt); err != nil {
+			n.base.Log(request.Context(), logging.LevelError, fmt.Sprintf("webhook event handling failed network_id=%s event_sn=%d error=%v", n.ID(), evt.Sn, err))
+			w.WriteHeader(http.StatusServiceUnavailable)
 			return
 		}
 		n.base.SetSequence(evt.Sn)
-		// Keep webhook request path fast; callbacks run asynchronously.
-		go n.base.app.PostEvent(n.ID(), &evt)
-		w.WriteHeader(http.StatusOK)
-		return
-
 	default:
-		w.WriteHeader(http.StatusAccepted)
+		w.WriteHeader(http.StatusBadRequest)
 		return
 	}
+	w.WriteHeader(http.StatusOK)
 }
 
 var _ Runner = (*Webhook)(nil)

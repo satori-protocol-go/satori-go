@@ -115,16 +115,17 @@ func (c WebSocketConfig) TimeoutValue() time.Duration {
 }
 
 type WebhookConfig struct {
-	Host       string
-	Port       int
-	Path       string
-	Token      string
-	Secure     bool
-	ServerHost string
-	ServerPort int
-	ServerPath string
-	Version    string
-	Timeout    time.Duration
+	Host        string
+	Port        int
+	Path        string
+	Token       string // Reverse token required on incoming Webhook requests.
+	ServerToken string // Token used to call the remote Satori API.
+	Secure      bool
+	ServerHost  string
+	ServerPort  int
+	ServerPath  string
+	Version     string
+	Timeout     time.Duration
 }
 
 // WebhookInfo keeps naming parity with satori-python.
@@ -210,7 +211,7 @@ func (c WebhookConfig) CallbackURL() string {
 }
 
 func (c WebhookConfig) TokenValue() string {
-	return c.Token
+	return c.ServerToken
 }
 
 func (c WebhookConfig) TimeoutValue() time.Duration {

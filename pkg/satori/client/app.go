@@ -564,8 +564,7 @@ func (a *App) PostEvent(networkID string, evt *event.Event) error {
 	if added || updated || removed {
 		a.accountUpdate(account, info.Status)
 	}
-	a.dispatchEvent(account, &value)
-	return nil
+	return a.dispatchEvent(account, &value)
 }
 
 func (a *App) MarkNetworkStatus(networkID string, status login.LoginStatus, remove bool) {
@@ -611,7 +610,7 @@ func (a *App) log(ctx context.Context, level logging.Level, v ...any) {
 	logger.Log(ctx, level, v...)
 }
 
-func (a *App) dispatchEvent(account *Account, evt *event.Event) {
+func (a *App) dispatchEvent(account *Account, evt *event.Event) error {
 	a.mu.RLock()
 	callbacks := append([]EventCallback(nil), a.eventCallbacks...)
 	a.mu.RUnlock()
@@ -638,9 +637,11 @@ func (a *App) dispatchEvent(account *Account, evt *event.Event) {
 	wg.Wait()
 	close(errCh)
 
+	var result error
 	for err := range errCh {
-		a.log(context.Background(), logging.LevelError, fmt.Sprintf("event callback error error=%v", err))
+		result = errors.Join(result, err)
 	}
+	return result
 }
 
 func (a *App) accountUpdate(account *Account, status login.LoginStatus) {
