@@ -98,99 +98,71 @@ func (s *messageSender) sendQQGuild(ctx context.Context, input messageCreateInpu
 	return result, nil
 }
 
-func (s *messageSender) sendQQGuildSegment(
-	ctx context.Context,
-	input messageCreateInput,
-	segment convert.MessageSegment,
-) (*message.Message, error) {
-	payload := &dto.MessageToCreate{
-		MsgID:            input.Referrer.MsgID,
-		EventID:          input.Referrer.EventID,
-		MsgSeq:           uint32(input.Referrer.MsgSeq),
-		MessageReference: makeMessageReference(segment.QuoteID),
-	}
-
+func (s *messageSender) sendQQGuildSegment(ctx context.Context, input messageCreateInput, segment convert.MessageSegment) (*message.Message, error) {
+	payload := &dto.MessageToCreate{MsgID: input.Referrer.MsgID, EventID: input.Referrer.EventID, MsgSeq: uint32(input.Referrer.MsgSeq), MessageReference: makeMessageReference(segment.QuoteID)}
+	var created *dto.Message
+	var err error
 	if segment.Resource == nil {
 		payload.Content = segment.Text
 		if strings.TrimSpace(payload.Content) == "" {
 			return nil, nil
 		}
-		created, err := s.callQQGuildMessageAPI(ctx, input.ChannelID, input.Referrer.Direct, payload)
-		if err != nil {
-			return nil, err
+		created, err = s.callQQGuildMessageAPI(ctx, input.ChannelID, input.Referrer.Direct, payload)
+	} else {
+		resource, resolveErr := s.resolveResource(ctx, "qqguild", segment.Resource)
+		if resolveErr != nil {
+			return nil, resolveErr
 		}
-		if created == nil || s.convertMessage == nil {
-			return nil, nil
+		if segment.Resource.Kind != convert.MessageResourceImage {
+			if resource.URL == "" {
+				return nil, server.NewActionError(501, "QQ guild local resource type is not supported", nil)
+			}
+			payload.Content = resource.URL
+			created, err = s.callQQGuildMessageAPI(ctx, input.ChannelID, input.Referrer.Direct, payload)
+		} else if resource.URL != "" {
+			payload.Image = resource.URL
+			created, err = s.callQQGuildMessageAPI(ctx, input.ChannelID, input.Referrer.Direct, payload)
+		} else {
+			created, err = s.callQQGuildMultipartAPI(ctx, input.ChannelID, input.Referrer.Direct, payload, resource.Data)
 		}
-		return s.convertMessage(created, "qqguild"), nil
 	}
-
-	if segment.Resource.Kind != convert.MessageResourceImage {
-		payload.Content = segment.Resource.Src
-		if strings.TrimSpace(payload.Content) == "" {
-			return nil, nil
-		}
-		created, err := s.callQQGuildMessageAPI(ctx, input.ChannelID, input.Referrer.Direct, payload)
-		if err != nil {
-			return nil, err
-		}
-		if created == nil || s.convertMessage == nil {
-			return nil, nil
-		}
-		return s.convertMessage(created, "qqguild"), nil
-	}
-
-	resourcePayload, err := convert.ResolveMessageResourcePayload(segment.Resource.Src)
 	if err != nil {
-		payload.Content = segment.Resource.Src
-		created, callErr := s.callQQGuildMessageAPI(ctx, input.ChannelID, input.Referrer.Direct, payload)
-		if callErr != nil {
-			return nil, callErr
-		}
-		if created == nil || s.convertMessage == nil {
-			return nil, nil
-		}
-		return s.convertMessage(created, "qqguild"), nil
+		return nil, err
 	}
+	if created == nil || created.ID == "" {
+		return nil, errors.New("QQ send response has no message ID")
+	}
+	return s.convertMessage(created, "qqguild"), nil
+}
 
-	switch {
-	case resourcePayload.URL != "":
-		payload.Image = resourcePayload.URL
-		created, callErr := s.callQQGuildMessageAPI(ctx, input.ChannelID, input.Referrer.Direct, payload)
-		if callErr != nil {
-			return nil, callErr
-		}
-		if created == nil || s.convertMessage == nil {
-			return nil, nil
-		}
-		return s.convertMessage(created, "qqguild"), nil
-	case resourcePayload.FileData != "":
-		data, decodeErr := convert.DecodeMessageBase64(resourcePayload.FileData)
-		if decodeErr != nil {
-			return nil, decodeErr
-		}
-		created, callErr := s.callQQGuildMultipartAPI(ctx, input.ChannelID, input.Referrer.Direct, payload, data)
-		if callErr != nil {
-			return nil, callErr
-		}
-		if created == nil || s.convertMessage == nil {
-			return nil, nil
-		}
-		return s.convertMessage(created, "qqguild"), nil
-	default:
-		payload.Content = segment.Resource.Src
-		if strings.TrimSpace(payload.Content) == "" {
-			return nil, nil
-		}
-		created, callErr := s.callQQGuildMessageAPI(ctx, input.ChannelID, input.Referrer.Direct, payload)
-		if callErr != nil {
-			return nil, callErr
-		}
-		if created == nil || s.convertMessage == nil {
-			return nil, nil
-		}
-		return s.convertMessage(created, "qqguild"), nil
+func (s *messageSender) resolveResource(ctx context.Context, platform string, resource *convert.MessageResource) (convert.MessageResourcePayload, error) {
+	if err := ctx.Err(); err != nil {
+		return convert.MessageResourcePayload{}, err
 	}
+	payload, err := convert.ResolveMessageResourcePayload(resource.Src)
+	if err != nil {
+		return payload, server.BadRequest("invalid resource: " + err.Error())
+	}
+	if payload.Internal != "" {
+		parts := strings.SplitN(strings.TrimPrefix(payload.Internal, "internal:"), "/", 3)
+		if len(parts) != 3 || parts[0] != platform || parts[1] != s.state.selfID {
+			return payload, server.Forbidden("resource belongs to a different login")
+		}
+		s.adapter.mu.RLock()
+		owner := s.adapter.srv
+		s.adapter.mu.RUnlock()
+		if owner == nil {
+			return payload, server.NewActionError(503, "the resource owner is not attached", nil)
+		}
+		payload.Data, err = owner.GetLocalFile(payload.Internal)
+		if err != nil {
+			return payload, err
+		}
+	}
+	if resource.Title != "" {
+		payload.FileName = resource.Title
+	}
+	return payload, nil
 }
 
 func (s *messageSender) callQQGuildMessageAPI(
@@ -360,24 +332,21 @@ func (s *messageSender) sendQQResource(ctx context.Context, targetID string, isD
 	if segment.Resource == nil {
 		return nil, errors.New("QQ resource is required")
 	}
-	resource, err := convert.ResolveMessageResourcePayload(segment.Resource.Src)
+	resource, err := s.resolveResource(ctx, "qq", segment.Resource)
 	if err != nil {
 		return nil, err
 	}
 	fileType := int(convert.MapMessageResourceFileType(segment.Resource.Kind))
 	var uploaded *dto.MediaUploadResult
-	if resource.FileData != "" {
-		data, decodeErr := convert.DecodeMessageBase64(resource.FileData)
-		if decodeErr != nil {
-			return nil, decodeErr
-		}
+	if resource.Data != nil {
+		data := resource.Data
 		scope := media.GroupScope
 		if isDirect {
 			scope = media.C2CScope
 		}
-		uploaded, err = s.state.uploader.Upload(ctx, media.Target{Scope: scope, OpenID: targetID}, bytes.NewReader(data), int64(len(data)), fileType, "upload")
+		uploaded, err = s.state.uploader.Upload(ctx, media.Target{Scope: scope, OpenID: targetID}, bytes.NewReader(data), int64(len(data)), fileType, resource.FileName)
 	} else {
-		request := &dto.MediaUploadRequest{FileType: fileType, URL: resource.URL, FileName: "upload"}
+		request := &dto.MediaUploadRequest{FileType: fileType, URL: resource.URL, FileName: resource.FileName}
 		if isDirect {
 			uploaded, _, err = s.api.UploadC2CFile(ctx, targetID, request)
 		} else {

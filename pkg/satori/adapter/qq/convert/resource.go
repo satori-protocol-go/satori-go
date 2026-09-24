@@ -3,66 +3,74 @@ package convert
 import (
 	"encoding/base64"
 	"errors"
-	"os"
-	"path/filepath"
-	"regexp"
+	"mime"
+	"net/url"
+	"path"
 	"strings"
 )
 
-var dataURIBase64Pattern = regexp.MustCompile(`^data:([\w/.+-]+);base64,`)
-
+// MessageResourcePayload describes a resource without performing filesystem I/O.
+// Internal URLs must be resolved by the owning Satori server, not by the parser.
 type MessageResourcePayload struct {
-	URL      string
-	FileData string
+	URL         string
+	Internal    string
+	Data        []byte
+	FileName    string
+	ContentType string
 }
 
 func ResolveMessageResourcePayload(src string) (MessageResourcePayload, error) {
-	src = strings.TrimSpace(src)
-	if src == "" {
-		return MessageResourcePayload{}, errors.New("resource src is empty")
-	}
-
-	if match := dataURIBase64Pattern.FindStringSubmatch(src); len(match) >= 2 {
-		encoded := strings.TrimPrefix(src, match[0])
-		data, err := base64.StdEncoding.DecodeString(encoded)
-		if err != nil {
-			if decoded, rawErr := base64.RawStdEncoding.DecodeString(encoded); rawErr == nil {
-				data = decoded
-			} else {
-				return MessageResourcePayload{}, err
-			}
+	result := MessageResourcePayload{FileName: "upload"}
+	if strings.HasPrefix(src, "data:") {
+		metadata, data, ok := strings.Cut(strings.TrimPrefix(src, "data:"), ",")
+		if !ok {
+			return result, errors.New("invalid data URI")
 		}
-		return MessageResourcePayload{FileData: base64.StdEncoding.EncodeToString(data)}, nil
+		encoded := strings.HasSuffix(metadata, ";base64")
+		metadata = strings.TrimSuffix(metadata, ";base64")
+		if metadata == "" {
+			metadata = "text/plain"
+		}
+		contentType, _, err := mime.ParseMediaType(metadata)
+		if err != nil {
+			return result, err
+		}
+		result.ContentType = contentType
+		if encoded {
+			result.Data, err = base64.StdEncoding.DecodeString(data)
+			if err != nil {
+				result.Data, err = base64.RawStdEncoding.DecodeString(data)
+			}
+		} else {
+			var decoded string
+			decoded, err = url.PathUnescape(data)
+			result.Data = []byte(decoded)
+		}
+		if err != nil {
+			return result, err
+		}
+		if len(result.Data) == 0 {
+			return result, errors.New("resource data is empty")
+		}
+		if extensions, _ := mime.ExtensionsByType(contentType); len(extensions) > 0 {
+			result.FileName += extensions[0]
+		}
+		return result, nil
 	}
-
-	if strings.HasPrefix(src, "file://") {
-		path := strings.TrimPrefix(src, "file://")
-		return loadMessageResourceFile(path)
+	if strings.HasPrefix(src, "internal:") {
+		result.Internal = src
+		result.FileName = path.Base(src)
+		return result, nil
 	}
-
-	if strings.HasPrefix(src, "http://") || strings.HasPrefix(src, "https://") || strings.Contains(src, "://") {
-		return MessageResourcePayload{URL: src}, nil
+	parsed, err := url.Parse(src)
+	if err != nil || parsed.Host == "" || parsed.User != nil || (parsed.Scheme != "http" && parsed.Scheme != "https") {
+		return result, errors.New("resource must be an HTTP URL, data URI, or an owned internal URL")
 	}
-
-	if _, err := os.Stat(src); err == nil {
-		return loadMessageResourceFile(src)
+	result.URL = src
+	if name := path.Base(parsed.Path); name != "" && name != "." && name != "/" {
+		result.FileName = name
 	}
-
-	return MessageResourcePayload{URL: src}, nil
-}
-
-func DecodeMessageBase64(raw string) ([]byte, error) {
-	raw = strings.TrimSpace(raw)
-	if raw == "" {
-		return nil, errors.New("empty base64 payload")
-	}
-	if data, err := base64.StdEncoding.DecodeString(raw); err == nil {
-		return data, nil
-	}
-	if data, err := base64.RawStdEncoding.DecodeString(raw); err == nil {
-		return data, nil
-	}
-	return base64.URLEncoding.DecodeString(raw)
+	return result, nil
 }
 
 func MapMessageResourceFileType(kind MessageResourceKind) uint64 {
@@ -76,13 +84,4 @@ func MapMessageResourceFileType(kind MessageResourceKind) uint64 {
 	default:
 		return 4
 	}
-}
-
-func loadMessageResourceFile(path string) (MessageResourcePayload, error) {
-	path = filepath.Clean(path)
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return MessageResourcePayload{}, err
-	}
-	return MessageResourcePayload{FileData: base64.StdEncoding.EncodeToString(data)}, nil
 }
