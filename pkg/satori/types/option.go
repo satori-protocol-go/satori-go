@@ -74,31 +74,10 @@ func (o *Option[T]) UnmarshalJSON(data []byte) error {
 }
 
 func normalizeOptionValue[T any](value T) (T, error) {
-	normalized, err := trimStringLikeValue(value)
-	if err != nil {
+	if err := validateOptionInteger(value); err != nil {
 		return value, err
 	}
-
-	if err := validateOptionInteger(normalized); err != nil {
-		return value, err
-	}
-	return normalized, nil
-}
-
-func trimStringLikeValue[T any](value T) (T, error) {
-	ref := reflect.ValueOf(value)
-	if !ref.IsValid() || ref.Kind() != reflect.String {
-		return value, nil
-	}
-
-	trimmed := strings.TrimSpace(ref.String())
-	holder := reflect.New(ref.Type()).Elem()
-	holder.SetString(trimmed)
-	converted, ok := holder.Interface().(T)
-	if !ok {
-		return value, fmt.Errorf("failed to normalize option string value")
-	}
-	return converted, nil
+	return value, nil
 }
 
 func validateOptionInteger[T any](value T) error {

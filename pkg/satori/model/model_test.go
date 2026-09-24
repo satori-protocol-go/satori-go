@@ -2,9 +2,11 @@ package model_test
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"github.com/satori-protocol-go/satori-go/pkg/satori/internal/xhtml"
 	"github.com/satori-protocol-go/satori-go/pkg/satori/model/message/element"
+	"github.com/satori-protocol-go/satori-go/pkg/satori/model/paginated"
 	"testing"
 
 	"github.com/satori-protocol-go/satori-go/pkg/satori/model/event"
@@ -135,5 +137,37 @@ func TestMessageElementWire(t *testing.T) {
 		if parsed[0].Tag() == "qq:custom" && (reparsed[0].Attrs["text"] != "literal" || reparsed[0].Children[0].String() != "child &amp; A") {
 			t.Fatalf("extension=%s", out)
 		}
+	}
+}
+
+func TestOpaquePagination(t *testing.T) {
+	var cursor types.Option[string]
+	if err := json.Unmarshal([]byte(`" token+/== "`), &cursor); err != nil {
+		t.Fatal(err)
+	}
+	value, ok := cursor.Get()
+	if !ok || value != " token+/== " {
+		t.Fatalf("cursor=%q", value)
+	}
+	pages := paginated.NewPaginatedSeq(context.Background(), value, func(ctx context.Context, next string) (*paginated.Paginated[int], error) {
+		switch next {
+		case " token+/== ":
+			return &paginated.Paginated[int]{Data: []int{1}, Next: " next+/== "}, nil
+		case " next+/== ":
+			return &paginated.Paginated[int]{Data: []int{2}}, nil
+		default:
+			t.Fatalf("altered cursor=%q", next)
+			return nil, nil
+		}
+	})
+	var items []int
+	for item, err := range pages.Iter() {
+		if err != nil {
+			t.Fatal(err)
+		}
+		items = append(items, item)
+	}
+	if len(items) != 2 || items[0] != 1 || items[1] != 2 || pages.NextToken() != "" {
+		t.Fatalf("page values=%v next=%q", items, pages.NextToken())
 	}
 }

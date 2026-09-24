@@ -18,6 +18,7 @@ import (
 	botgoopenapi "github.com/WindowsSov8forUs/botgo-plus/openapi"
 	"github.com/go-chi/chi/v5"
 	adapterqq "github.com/satori-protocol-go/satori-go/pkg/satori/adapter/qq"
+	"github.com/satori-protocol-go/satori-go/pkg/satori/model"
 	"github.com/satori-protocol-go/satori-go/pkg/satori/model/event"
 	"github.com/satori-protocol-go/satori-go/pkg/satori/model/message"
 	satoriserver "github.com/satori-protocol-go/satori-go/pkg/satori/server"
@@ -663,6 +664,48 @@ func TestQQCapabilityResponses(t *testing.T) {
 		var result interface{ HTTPStatus() int }
 		if !errors.As(err, &result) || result.HTTPStatus() != tc.status {
 			t.Errorf("%s status=%v", tc.action, err)
+		}
+	}
+}
+
+func (m *qqMockOpenAPI) Messages(ctx context.Context, channel string, pager *botgodto.MessagesPager) ([]*botgodto.Message, error) {
+	if pager.ID != " opaque+/== " {
+		return []*botgodto.Message{}, nil
+	}
+	return []*botgodto.Message{{ID: "new", SeqInChannel: "2"}, {ID: "old", SeqInChannel: "1"}}, nil
+}
+
+func TestQQMessagePagination(t *testing.T) {
+	adapter := newQQTestAdapter(t, &qqMockOpenAPI{})
+	route := adapter.Routes()["message.list"]
+	for _, direction := range []string{"before", "after"} {
+		for _, order := range []string{"asc", "desc"} {
+			input := map[string]any{"channel_id": "channel", "next": " opaque+/== ", "direction": direction, "order": order, "limit": 100}
+			result, err := route(&satoriserver.Request[any]{Platform: "qqguild", SelfID: "bot", Action: "message.list", Params: input})
+			if err != nil {
+				t.Fatal(err)
+			}
+			page := result.(*model.BidiPaginated[*message.Message])
+			cursor := "old"
+			if direction == "after" {
+				cursor = "new"
+			}
+			first := "old"
+			if order == "desc" {
+				first = "new"
+			}
+			if len(page.Data) != 2 || page.Data[0].Id != first || page.Prev != cursor || page.Next != cursor {
+				t.Fatalf("%s %s page=%+v", direction, order, page)
+			}
+			input["next"] = page.Next
+			result, err = route(&satoriserver.Request[any]{Platform: "qqguild", SelfID: "bot", Action: "message.list", Params: input})
+			if err != nil {
+				t.Fatal(err)
+			}
+			page = result.(*model.BidiPaginated[*message.Message])
+			if len(page.Data) != 0 || page.Prev != "" || page.Next != "" {
+				t.Fatalf("last page=%+v", page)
+			}
 		}
 	}
 }
