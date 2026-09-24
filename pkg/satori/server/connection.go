@@ -110,6 +110,9 @@ func (c *websocketConnection) Close() error {
 func (c *websocketConnection) Send(payload any) error {
 	c.writeMu.Lock()
 	defer c.writeMu.Unlock()
+	if err := c.connection.SetWriteDeadline(time.Now().Add(10 * time.Second)); err != nil {
+		return err
+	}
 	if err := c.connection.WriteJSON(payload); err != nil {
 		c.setCloseInfo("write failed", err)
 		return err
@@ -178,7 +181,7 @@ func (c *websocketConnection) Heartbeat(timeout time.Duration) {
 			return
 		}
 		c.log(LogLevelDebug, fmt.Sprintf(
-			"websocket heartbeat pong connection_id=%s remote_addr=%s latency_ms=%d",
+			"websocket heartbeat pong connection_id=%s remote_addr=%s read_wait_ms=%d",
 			c.id,
 			c.remoteAddr,
 			latency.Milliseconds(),

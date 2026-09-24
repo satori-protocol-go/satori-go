@@ -159,7 +159,7 @@ func (n *WS) connectAndServe(ctx context.Context) error {
 func (n *WS) authenticate(connection *websocket.Conn) error {
 	identify := operation.IdentifyBody{Token: n.token}
 	if sequence := n.base.Sequence(); sequence > -1 {
-		identify.Sn = sequence
+		identify.Sn = &sequence
 	}
 	if err := n.sendJSON(map[string]any{
 		"op":   operation.OpcodeIdentify,
