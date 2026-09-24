@@ -83,6 +83,10 @@ func (a *Adapter) ensureLogins(ctx context.Context) error {
 	if len(a.logins) > 0 {
 		return nil
 	}
+	for _, item := range nextLogins {
+		item.Sn = a.nextLoginSN
+		a.nextLoginSN++
+	}
 	a.logins = nextLogins
 	a.selfToApp = nextSelfToApp
 	a.selfID = fallbackSelfID
