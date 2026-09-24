@@ -6,8 +6,6 @@ import (
 	"strings"
 )
 
-const MaxJSSafeInteger int64 = 9007199254740991
-
 type Option[T any] struct {
 	value T
 	ok    bool
