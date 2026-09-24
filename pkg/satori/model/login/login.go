@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 
 	"github.com/satori-protocol-go/satori-go/pkg/satori/model/user"
+	"github.com/satori-protocol-go/satori-go/pkg/satori/types"
 )
 
 type LoginStatus uint8
@@ -16,8 +17,9 @@ const (
 	LoginStatusReconnect
 )
 
-// Login is the Satori login payload.
+// Login identifies a login within the current source connection. Sn is not a platform ID.
 type Login struct {
+	fields   types.FieldPresence
 	Sn       int64       `json:"sn"`
 	Platform string      `json:"platform,omitempty"`
 	User     *user.User  `json:"user,omitempty"`
@@ -27,40 +29,125 @@ type Login struct {
 }
 
 func (l *Login) UnmarshalJSON(data []byte) error {
-	type loginWire struct {
-		Sn       *int64       `json:"sn"`
-		Platform string       `json:"platform"`
-		User     *user.User   `json:"user"`
-		Status   *LoginStatus `json:"status"`
-		Adapter  *string      `json:"adapter"`
-		Features []string     `json:"features"`
-		SelfID   string       `json:"self_id"`
-	}
-
-	var wire loginWire
-	if err := json.Unmarshal(data, &wire); err != nil {
+	type plain Login
+	var value plain
+	fields, err := types.DecodeFields(data, &value)
+	if err != nil {
 		return err
 	}
-
-	l.Sn = 0
-	if wire.Sn != nil {
-		l.Sn = *wire.Sn
-	}
-	l.Platform = wire.Platform
-	l.User = wire.User
-	if l.User == nil && wire.SelfID != "" {
-		l.User = &user.User{Id: wire.SelfID}
-	}
-	if wire.Status != nil {
-		l.Status = *wire.Status
-	} else {
+	*l = Login(value)
+	l.fields = fields
+	if !fields.Has("status") {
 		l.Status = LoginStatusOnline
 	}
-	if wire.Adapter != nil {
-		l.Adapter = *wire.Adapter
-	} else {
+	if !fields.Has("adapter") {
 		l.Adapter = "satori"
 	}
-	l.Features = append([]string(nil), wire.Features...)
+	// Existing, inexpensive input compatibility; output always uses user.id.
+	if !fields.Has("user") {
+		var legacy struct {
+			SelfID string `json:"self_id"`
+		}
+		if err := json.Unmarshal(data, &legacy); err != nil {
+			return err
+		}
+		if legacy.SelfID != "" {
+			l.User = &user.User{Id: legacy.SelfID}
+		}
+	}
 	return nil
+}
+
+func (l Login) MarshalJSON() ([]byte, error) {
+	out := map[string]any{"sn": l.Sn, "status": l.Status, "adapter": l.Adapter}
+	l.fields.Put(out, "platform", l.Platform, l.Platform != "")
+	l.fields.Put(out, "user", l.User, l.User != nil)
+	l.fields.Put(out, "features", l.Features, l.Features != nil)
+	return json.Marshal(out)
+}
+
+// HasField is used when applying a partial wire login update. Programmatically
+// constructed logins always supply Sn/Status and any nonempty optional fields.
+func (l *Login) HasField(name string) bool {
+	if l == nil {
+		return false
+	}
+	if l.fields != nil {
+		return l.fields.Has(name)
+	}
+	switch name {
+	case "sn", "status":
+		return true
+	case "platform":
+		return l.Platform != ""
+	case "user":
+		return l.User != nil
+	case "adapter":
+		return l.Adapter != ""
+	case "features":
+		return l.Features != nil
+	}
+	return false
+}
+
+func (l *Login) Clone() *Login {
+	if l == nil {
+		return nil
+	}
+	copy := *l
+	if l.User != nil {
+		value := *l.User
+		copy.User = &value
+	}
+	if l.Features != nil {
+		copy.Features = append([]string{}, l.Features...)
+	}
+	copy.fields = l.fields.Without()
+	if l.fields == nil {
+		copy.fields = nil
+	}
+	return &copy
+}
+
+// Merge applies only fields supplied by a partial update, including explicit null.
+func (l *Login) Merge(update *Login) *Login {
+	if l == nil {
+		return update.Clone()
+	}
+	result := l.Clone()
+	if update == nil {
+		return result
+	}
+	if update.HasField("sn") {
+		result.Sn = update.Sn
+	}
+	if update.HasField("status") {
+		result.Status = update.Status
+	}
+	if update.HasField("platform") {
+		result.Platform = update.Platform
+	}
+	if update.HasField("user") {
+		result.User = nil
+		if update.User != nil {
+			copy := *update.User
+			result.User = &copy
+		}
+	}
+	if update.HasField("adapter") {
+		result.Adapter = update.Adapter
+	}
+	if update.HasField("features") {
+		result.Features = nil
+		if update.Features != nil {
+			result.Features = append([]string{}, update.Features...)
+		}
+	}
+	if result.fields == nil {
+		result.fields = types.FieldPresence{}
+	}
+	for name, value := range update.fields {
+		result.fields[name] = value
+	}
+	return result
 }
