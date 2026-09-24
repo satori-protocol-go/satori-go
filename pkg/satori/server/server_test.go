@@ -1385,6 +1385,12 @@ func TestProviderEventsAndSnapshots(t *testing.T) {
 	if err := srv.Apply(two); err != nil {
 		t.Fatal(err)
 	}
+	srv.Route(protocol.ApiLoginGet, func(r *satoriserver.Request[any]) (any, error) {
+		if r.SelfID == "alpha" {
+			return alpha.Clone(), nil
+		}
+		return beta.Clone(), nil
+	})
 	ctx, cancel := context.WithCancel(context.Background())
 	finished := make(chan error, 1)
 	go func() { finished <- srv.Run(ctx) }()
@@ -1438,6 +1444,24 @@ func TestProviderEventsAndSnapshots(t *testing.T) {
 	numbers := map[string]int64{}
 	for _, info := range logins {
 		numbers[info.User.Id] = info.Sn
+	}
+	for id, sn := range numbers {
+		req, err := http.NewRequest("POST", fmt.Sprintf("http://127.0.0.1:%d/v1/login.get", port), strings.NewReader("{}"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		req.Header.Set("Authorization", "Bearer fixture")
+		protocol.SetIdentityHeaders(req.Header, "mock", id)
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var info login.Login
+		err = json.NewDecoder(resp.Body).Decode(&info)
+		resp.Body.Close()
+		if err != nil || resp.StatusCode != 200 || info.Sn != sn {
+			t.Errorf("login.get %s sn=%d, READY sn=%d status=%d err=%v", id, info.Sn, sn, resp.StatusCode, err)
+		}
 	}
 	readEvent := func(connection *websocket.Conn) *event.Event {
 		t.Helper()

@@ -927,6 +927,28 @@ func (s *Server) httpServerHandler(w http.ResponseWriter, request *http.Request)
 		return
 	}
 
+	if action == string(protocol.ApiLoginGet) {
+		// The Login resource uses the same downstream numbering as READY/meta.
+		logins, err := s.collectLogins(request.Context())
+		if err != nil {
+			writeError(w, err)
+			return
+		}
+		var selected *login.Login
+		for _, info := range logins {
+			if info.User == nil || info.Platform != platform || info.User.Id != selfID {
+				continue
+			}
+			if selected != nil {
+				writeError(w, NewActionError(409, "ambiguous platform account route", nil))
+				return
+			}
+			selected = info
+		}
+		if selected != nil {
+			handler = func(*Request[any]) (any, error) { return selected, nil }
+		}
+	}
 	s.executeRoute(w, request, action, platform, selfID, handler)
 }
 
