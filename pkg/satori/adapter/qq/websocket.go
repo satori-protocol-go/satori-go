@@ -6,8 +6,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"golang.org/x/sync/errgroup"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/WindowsSov8forUs/botgo-plus/dto"
@@ -28,91 +28,93 @@ type wsShardTarget struct {
 }
 
 func (a *Adapter) Block(ctx context.Context) error {
-	if !a.wsEnabled {
-		<-ctx.Done()
-		return nil
-	}
-	state := a.primaryState()
-	if state == nil || state.api == nil {
-		return errors.New("qq websocket requires a valid app state")
-	}
-
-	gatewayURL, targets, startupInterval, err := a.resolveWebSocketTargets(ctx, state)
-	if err != nil {
-		a.log(ctx, logging.LevelError, fmt.Sprintf("start websocket failed error=%v", err))
+	if err := a.Prepare(ctx); err != nil {
 		return err
 	}
-
-	var wg sync.WaitGroup
-	for index, target := range targets {
-		if index > 0 && startupInterval > 0 {
-			timer := time.NewTimer(startupInterval)
-			select {
-			case <-ctx.Done():
-				timer.Stop()
-				wg.Wait()
-				return nil
-			case <-timer.C:
-			}
-		}
-		wg.Add(1)
-		go func(target wsShardTarget) {
-			defer wg.Done()
-			a.runShardLoop(ctx, state, gatewayURL, target)
-		}(target)
+	runCtx, cancel := context.WithCancel(ctx)
+	stop := context.AfterFunc(a.eventContext, cancel)
+	defer stop()
+	defer cancel()
+	if !a.wsEnabled {
+		<-runCtx.Done()
+		return nil
 	}
-
-	<-ctx.Done()
-	a.closeAllWSConnections()
-	wg.Wait()
-	return nil
+	group, groupCtx := errgroup.WithContext(runCtx)
+	defer a.closeAllWSConnections()
+	for _, id := range a.sortedAppIDs() {
+		state := a.appStates[id]
+		gateway, targets, interval, err := a.resolveWebSocketTargets(groupCtx, state)
+		if err != nil {
+			cancel()
+			a.closeAllWSConnections()
+			_ = group.Wait()
+			return err
+		}
+		a.mu.Lock()
+		state.expectedShards = len(targets)
+		state.readyShards = map[uint32]bool{}
+		a.mu.Unlock()
+		for index, target := range targets {
+			if index > 0 && interval > 0 {
+				timer := time.NewTimer(interval)
+				select {
+				case <-groupCtx.Done():
+					timer.Stop()
+					cancel()
+					a.closeAllWSConnections()
+					return group.Wait()
+				case <-timer.C:
+				}
+			}
+			group.Go(func() error { return a.runShardLoop(groupCtx, state, gateway, target) })
+		}
+	}
+	err := group.Wait()
+	if runCtx.Err() != nil {
+		return nil
+	}
+	return err
 }
 
 func (a *Adapter) Cleanup(_ context.Context) error {
 	a.cancelEvents()
 	a.closeAllWSConnections()
-	for _, appID := range a.sortedAppIDs() {
-		a.publishLoginLifecycleByApp(appID, login.LoginStatusOffline, event.EventTypeLoginRemoved, true)
+	a.mu.Lock()
+	for _, info := range a.logins {
+		info.Status = login.LoginStatusOffline
 	}
+	a.mu.Unlock()
 	return nil
 }
 
-func (a *Adapter) runShardLoop(ctx context.Context, state *appState, gatewayURL string, target wsShardTarget) {
+func (a *Adapter) runShardLoop(ctx context.Context, state *appState, gatewayURL string, target wsShardTarget) error {
 	session := &dto.Session{}
 	for {
 		if ctx.Err() != nil {
-			return
+			return nil
 		}
-
 		err := a.runWebSocketSession(ctx, state, gatewayURL, target, session)
 		if ctx.Err() != nil {
-			return
+			return nil
+		}
+		if statusErr := a.updateShardStatus(ctx, state, target.ID, false); statusErr != nil {
+			return statusErr
 		}
 		if err != nil {
-			a.log(ctx, logging.LevelError, fmt.Sprintf("qq websocket connection failed error=%v", err))
-			a.log(
-				ctx,
-				logging.LevelWarn,
-				fmt.Sprintf("websocket disconnected shard_id=%d shard_count=%d error=%v", target.ID, target.Count, err),
-			)
+			a.log(ctx, logging.LevelWarn, fmt.Sprintf("QQ gateway disconnected app_id=%s shard_id=%d error=%v", state.appID, target.ID, err))
 			if manager.CanNotResume(err) {
 				session.ID = ""
 				session.LastSeq = 0
 			}
 			if manager.CanNotIdentify(err) {
-				a.log(ctx, logging.LevelError, fmt.Sprintf("websocket shard halted because identify is not allowed shard_id=%d shard_count=%d", target.ID, target.Count))
-				return
+				return err
 			}
 		}
-
-		a.log(ctx, logging.LevelInfo, "reconnecting qq websocket gateway")
-		a.publishLoginLifecycleByApp(state.appID, login.LoginStatusReconnect, event.EventTypeLoginUpdated, false)
-
 		timer := time.NewTimer(a.wsReconnect)
 		select {
 		case <-ctx.Done():
 			timer.Stop()
-			return
+			return nil
 		case <-timer.C:
 		}
 	}
@@ -127,8 +129,7 @@ func (a *Adapter) runWebSocketSession(ctx context.Context, state *appState, gate
 	initial.Shards = dto.ShardConfig{ShardID: target.ID, ShardCount: target.Count}
 	initial.EventHandler = func(callbackCtx context.Context, payload *dto.WSPayload) error {
 		if payload.Type == "READY" || payload.Type == "RESUMED" {
-			a.publishLoginLifecycleByApp(state.appID, login.LoginStatusOnline, event.EventTypeLoginUpdated, false)
-			return nil
+			return a.updateShardStatus(callbackCtx, state, target.ID, true)
 		}
 		return a.acceptPayload(withAppID(callbackCtx, state.appID), state, payload)
 	}
@@ -310,45 +311,34 @@ func (a *Adapter) closeAllWSConnections() {
 	}
 }
 
-func (a *Adapter) publishLoginLifecycleByApp(
-	appID string,
-	status login.LoginStatus,
-	eventType event.EventType,
-	remove bool,
-) {
-	appID = strings.TrimSpace(appID)
+// An application's login is fully online once each configured shard is ready.
+func (a *Adapter) updateShardStatus(ctx context.Context, state *appState, shard uint32, ready bool) error {
 	a.mu.Lock()
-	events := make([]*event.Event, 0, 4)
-	filtered := make([]*login.Login, 0, len(a.logins))
-	for _, item := range a.logins {
-		if item == nil || item.User == nil {
-			continue
-		}
-		owner := a.selfToApp[item.User.Id]
-		if owner != appID {
-			filtered = append(filtered, item)
-			continue
-		}
-		item.Status = status
-		events = append(events, &event.Event{
-			Type:      eventType,
-			Timestamp: time.Now().UnixMilli(),
-			Login:     cloneLogin(item),
-		})
-		if !remove {
-			filtered = append(filtered, item)
-		}
+	if state.readyShards == nil {
+		state.readyShards = map[uint32]bool{}
 	}
-	if remove {
-		a.logins = filtered
-		for selfID, owner := range a.selfToApp {
-			if owner == appID {
-				delete(a.selfToApp, selfID)
-			}
+	if ready {
+		state.readyShards[shard] = true
+	} else {
+		delete(state.readyShards, shard)
+	}
+	status := login.LoginStatusReconnect
+	if len(state.readyShards) == state.expectedShards {
+		status = login.LoginStatusOnline
+	}
+	events := make([]*event.Event, 0, 2)
+	for _, info := range a.logins {
+		if info.User == nil || a.selfToApp[info.User.Id] != state.appID || info.Status == status {
+			continue
 		}
+		info.Status = status
+		events = append(events, &event.Event{Type: event.EventTypeLoginUpdated, Timestamp: time.Now().UnixMilli(), Login: cloneLogin(info)})
 	}
 	a.mu.Unlock()
-	for _, item := range events {
-		_ = a.pushEvent(a.eventContext, item)
+	for _, evt := range events {
+		if err := a.pushEvent(ctx, evt); err != nil {
+			return err
+		}
 	}
+	return nil
 }

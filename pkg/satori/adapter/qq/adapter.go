@@ -39,17 +39,16 @@ type Adapter struct {
 	qqFeatures      []string
 	qqGuildFeatures []string
 
-	eventContext  context.Context
-	cancelEvents  context.CancelFunc
-	eventCh       chan *event.Event
-	publisherOnce sync.Once
-	converter     *qqevent.Converter
-	wsEnabled     bool
-	wsGatewayURL  string
-	wsIntents     int64
-	wsShardID     uint32
-	wsShardCount  uint32
-	wsReconnect   time.Duration
+	eventContext context.Context
+	cancelEvents context.CancelFunc
+	eventCh      chan *event.Event
+	converter    *qqevent.Converter
+	wsEnabled    bool
+	wsGatewayURL string
+	wsIntents    int64
+	wsShardID    uint32
+	wsShardCount uint32
+	wsReconnect  time.Duration
 
 	wsConnMu  sync.RWMutex
 	wsClients map[string]websocket.WebSocket
@@ -57,10 +56,10 @@ type Adapter struct {
 	auditMu      sync.Mutex
 	auditWaiters map[string][]chan string
 
+	loginInitMu sync.Mutex
 	mu          sync.RWMutex
 	logins      []*login.Login
 	nextLoginSN int64
-	selfID      string
 	selfToApp   map[string]string
 }
 
@@ -165,12 +164,9 @@ func New(cfg Config) (*Adapter, error) {
 	return adapter, nil
 }
 
-func (a *Adapter) Publisher(ctx context.Context) <-chan *event.Event {
-	a.publisherOnce.Do(func() {
-		go a.bootstrap(ctx)
-	})
-	return a.eventCh
-}
+func (a *Adapter) Publisher(_ context.Context) <-chan *event.Event { return a.eventCh }
+
+func (a *Adapter) Prepare(ctx context.Context) error { return a.ensureLogins(ctx) }
 
 func (a *Adapter) GetLogins(ctx context.Context) ([]*login.Login, error) {
 	if err := a.ensureLogins(ctx); err != nil {
@@ -227,6 +223,7 @@ func (a *Adapter) EnsureServer(server *server.Server) {
 }
 
 var _ server.Adapter = (*Adapter)(nil)
+var _ server.Preparable = (*Adapter)(nil)
 var _ server.EventPublisher = (*Adapter)(nil)
 var _ server.RootRouteRegistrar = (*Adapter)(nil)
 var _ server.Blockable = (*Adapter)(nil)
