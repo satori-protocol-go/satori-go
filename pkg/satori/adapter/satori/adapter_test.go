@@ -84,13 +84,41 @@ func TestSatoriAdapterRouteForward(t *testing.T) {
 	if err := remoteServer.Apply(&satoriRemoteProvider{login: remoteLogin}); err != nil {
 		t.Fatalf("apply remote provider failed: %v", err)
 	}
+	if err := remoteServer.Apply(&satoriRemoteProvider{login: &login.Login{Sn: 1, Platform: "satori", User: &user.User{Id: "second"}, Status: login.LoginStatusOnline, Adapter: "fixture"}}); err != nil {
+		t.Fatal(err)
+	}
+	remoteServer.Route(protocol.ParseApi("internal/*"), func(r *satoriserver.Request[any]) (any, error) {
+		body, err := io.ReadAll(r.Origin.Body)
+		if err != nil {
+			return nil, err
+		}
+		if r.Origin.URL.Query().Get("cursor") != " +/=" || r.SelfID != "second" {
+			t.Errorf("native identity/query=%s %s", r.SelfID, r.Origin.URL.RawQuery)
+		}
+		switch r.Action {
+		case "internal/binary":
+			if r.Origin.Method != "PATCH" || r.Origin.Header.Get("Content-Type") != "application/octet-stream" {
+				t.Errorf("native method/type=%s %s", r.Origin.Method, r.Origin.Header.Get("Content-Type"))
+			}
+			out := satoriserver.NewResponse(206, body)
+			out.Header.Set("Content-Type", "application/octet-stream")
+			out.Header.Set("X-Fixture", "native")
+			return out, nil
+		case "internal/empty":
+			return satoriserver.NewResponse(204, nil), nil
+		case "internal/array":
+			return satoriserver.NewResponse(200, []byte(`[{"id":9007199254740993}]`)), nil
+		default:
+			return satoriserver.NewResponse(403, []byte(`{"reason":"fixture"}`)), nil
+		}
+	})
 	remoteServer.Route(protocol.ApiMessageCreate, func(request *satoriserver.Request[any]) (any, error) {
 		params, ok := request.Params.(map[string]any)
 		if !ok {
 			return nil, satoriserver.BadRequest("invalid params")
 		}
 		content, _ := params["content"].(string)
-		return []*message.Message{{Id: "1", Content: content}}, nil
+		return []*message.Message{{Id: request.SelfID, Content: content}}, nil
 	})
 
 	remoteCtx, remoteCancel := context.WithCancel(context.Background())
@@ -162,6 +190,53 @@ func TestSatoriAdapterRouteForward(t *testing.T) {
 	}
 	if len(payload) != 1 || payload[0]["content"] != "hello" {
 		t.Fatalf("unexpected payload: %#v", payload)
+	}
+
+	logins, err := adapter.GetLogins(context.Background())
+	if err != nil || len(logins) != 2 || logins[0].Sn == logins[1].Sn {
+		t.Fatalf("bridge logins=%+v err=%v", logins, err)
+	}
+	for _, id := range []string{"bot", "second"} {
+		req, _ := http.NewRequest("POST", fmt.Sprintf("http://127.0.0.1:%d/v1/message.create", localPort), bytes.NewBufferString(`{"channel_id":"c","content":"hi"}`))
+		req.Header.Set("Authorization", "Bearer local-secret")
+		req.Header.Set("Satori-Platform", "satori")
+		req.Header.Set("Satori-User-ID", id)
+		req.Header.Set("Content-Type", "application/json")
+		response, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var result []message.Message
+		err = json.NewDecoder(response.Body).Decode(&result)
+		response.Body.Close()
+		if err != nil || response.StatusCode != 200 || len(result) != 1 || result[0].Id != id {
+			t.Fatalf("route %s => %+v %d err=%v", id, result, response.StatusCode, err)
+		}
+	}
+	for _, tc := range []struct {
+		action, method string
+		status         int
+		body           string
+	}{
+		{"binary", "PATCH", 206, "binary-bytes"},
+		{"empty", "DELETE", 204, ""},
+		{"array", "GET", 200, `[{"id":9007199254740993}]`},
+		{"failure", "POST", 403, `{"reason":"fixture"}`},
+	} {
+		req, _ := http.NewRequest(tc.method, fmt.Sprintf("http://127.0.0.1:%d/v1/internal/%s?cursor=%%20%%2B%%2F%%3D", localPort, tc.action), bytes.NewBufferString(tc.body))
+		req.Header.Set("Content-Type", "application/octet-stream")
+		req.Header.Set("Authorization", "Bearer local-secret")
+		req.Header.Set("Satori-Platform", "satori")
+		req.Header.Set("Satori-User-ID", "second")
+		response, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		raw, err := io.ReadAll(response.Body)
+		response.Body.Close()
+		if err != nil || response.StatusCode != tc.status || string(raw) != tc.body {
+			t.Fatalf("native %s status=%d body=%q err=%v", tc.action, response.StatusCode, raw, err)
+		}
 	}
 
 	localCancel()
