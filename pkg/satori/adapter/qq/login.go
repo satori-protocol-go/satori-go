@@ -180,11 +180,14 @@ func cloneLogin(item *login.Login) *login.Login {
 
 func platformByEventType(eventType string) string {
 	switch eventType {
-	case string(dto.EventGroupAtMessageCreate), string(dto.EventGroupAddRobot), string(dto.EventGroupDelRobot),
+	case string(dto.EventGroupMessageCreate), string(dto.EventGroupAtMessageCreate), string(dto.EventGroupMemberAdd), string(dto.EventGroupMemberRemove), string(dto.EventGroupJoinRequest), string(dto.EventGroupAddRobot), string(dto.EventGroupDelRobot),
 		string(dto.EventGroupMsgReject), string(dto.EventGroupMsgReceive), string(dto.EventC2CMessageCreate),
 		string(dto.EventC2CFriendAdd), string(dto.EventC2CFriendDel), "C2C_MSG_RECEIVE", "C2C_MSG_REJECT":
 		return "qq"
 	default:
-		return "qqguild"
+		if dto.EventToIntent(dto.EventType(eventType)) != 0 {
+			return "qqguild"
+		}
+		return ""
 	}
 }

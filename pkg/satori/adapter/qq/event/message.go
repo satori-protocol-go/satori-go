@@ -5,6 +5,7 @@ import (
 	satorievent "github.com/satori-protocol-go/satori-go/pkg/satori/model/event"
 	"github.com/satori-protocol-go/satori-go/pkg/satori/model/guild"
 	"github.com/satori-protocol-go/satori-go/pkg/satori/model/guildmember"
+	"github.com/satori-protocol-go/satori-go/pkg/satori/model/guildrole"
 	"github.com/satori-protocol-go/satori-go/pkg/satori/model/login"
 	"github.com/satori-protocol-go/satori-go/pkg/satori/model/message"
 )
@@ -90,6 +91,9 @@ func (c *Converter) makeGroupMessageCreatedEvent(loginValue *login.Login, data m
 			User:   satoriMessage.User,
 			Avatar: satoriMessage.User.Avatar,
 		}
+	}
+	if msg.Author != nil && msg.Author.MemberRole != "" && satoriMessage.Member != nil && len(satoriMessage.Member.Roles) == 0 {
+		satoriMessage.Member.Roles = []*guildrole.GuildRole{{Id: msg.Author.MemberRole}}
 	}
 	if satoriMessage.Id == "" {
 		satoriMessage.Id = valueAsString(data["id"])
