@@ -1,4 +1,4 @@
-package testsuite
+package xhtml
 
 import (
 	"fmt"
@@ -8,75 +8,19 @@ import (
 	"sort"
 	"strings"
 	"testing"
-	_ "unsafe"
 
-	xhtml "github.com/satori-protocol-go/satori-go/pkg/satori/internal/xhtml"
 	"golang.org/x/net/html"
 )
 
-//go:linkname unescape github.com/satori-protocol-go/satori-go/pkg/satori/internal/xhtml.unescape
-func unescape(text string) string
-
-//go:linkname uncapitalize github.com/satori-protocol-go/satori-go/pkg/satori/internal/xhtml.uncapitalize
-func uncapitalize(source string) string
-
-//go:linkname camelCase github.com/satori-protocol-go/satori-go/pkg/satori/internal/xhtml.camelCase
-func camelCase(source string) string
-
-//go:linkname ensureList github.com/satori-protocol-go/satori-go/pkg/satori/internal/xhtml.ensureList
-func ensureList(value any) []any
-
-//go:linkname makeElement github.com/satori-protocol-go/satori-go/pkg/satori/internal/xhtml.makeElement
-func makeElement(content any) *xhtml.Element
-
-//go:linkname makeElements github.com/satori-protocol-go/satori-go/pkg/satori/internal/xhtml.makeElements
-func makeElements(content any) []*xhtml.Element
-
-func elementTag(e *xhtml.Element) string {
+func elementTag(e *Element) string {
 	if e == nil {
 		return ""
 	}
 	return e.Tag()
 }
 
-//go:linkname evaluate github.com/satori-protocol-go/satori-go/pkg/satori/internal/xhtml.evaluate
-func evaluate(expr string, context map[string]any) any
-
-//go:linkname interpolate github.com/satori-protocol-go/satori-go/pkg/satori/internal/xhtml.interpolate
-func interpolate(expr string, context map[string]any) any
-
-//go:linkname ensureContext github.com/satori-protocol-go/satori-go/pkg/satori/internal/xhtml.ensureContext
-func ensureContext(context map[string]any) map[string]any
-
-//go:linkname lookupValue github.com/satori-protocol-go/satori-go/pkg/satori/internal/xhtml.lookupValue
-func lookupValue(value any, part string) (any, bool)
-
-//go:linkname evalExpress github.com/satori-protocol-go/satori-go/pkg/satori/internal/xhtml.evalExpress
-func evalExpress(expr string, context map[string]any) (any, bool)
-
-//go:linkname compare github.com/satori-protocol-go/satori-go/pkg/satori/internal/xhtml.compare
-func compare(left, right any) (int, bool)
-
-//go:linkname indexValue github.com/satori-protocol-go/satori-go/pkg/satori/internal/xhtml.indexValue
-func indexValue(base, index any) (any, bool)
-
-//go:linkname truthy github.com/satori-protocol-go/satori-go/pkg/satori/internal/xhtml.truthy
-func truthy(value any) bool
-
-//go:linkname isIterable github.com/satori-protocol-go/satori-go/pkg/satori/internal/xhtml.isIterable
-func isIterable(value any) bool
-
-//go:linkname iterate github.com/satori-protocol-go/satori-go/pkg/satori/internal/xhtml.iterate
-func iterate(value any) []any
-
-//go:linkname foldToken github.com/satori-protocol-go/satori-go/pkg/satori/internal/xhtml.foldToken
-func foldToken(tokens []any) []any
-
-//go:linkname parseTokens github.com/satori-protocol-go/satori-go/pkg/satori/internal/xhtml.parseTokens
-func parseTokens(tokens []any, context map[string]any) []*xhtml.Element
-
-func parseElements(source string, context map[string]any) []*xhtml.Element {
-	return xhtml.Parse(source, context)
+func parseElements(source string, context map[string]any) []*Element {
+	return Parse(source, context)
 }
 
 func parseWithContext(source string, context map[string]any) *html.Node {
@@ -97,7 +41,7 @@ func readFixture(t *testing.T, name string) string {
 	return strings.TrimSpace(string(data))
 }
 
-func extractAttrIDs(elements []*xhtml.Element) []string {
+func extractAttrIDs(elements []*Element) []string {
 	result := make([]string, 0, len(elements))
 	for _, e := range elements {
 		if e == nil || e.Attrs == nil {
@@ -110,7 +54,7 @@ func extractAttrIDs(elements []*xhtml.Element) []string {
 	return result
 }
 
-func joinElementStrings(elements []*xhtml.Element) string {
+func joinElementStrings(elements []*Element) string {
 	var b strings.Builder
 	for _, e := range elements {
 		b.WriteString(e.String())
@@ -126,7 +70,7 @@ func nodeChildren(n *html.Node) []*html.Node {
 	return children
 }
 
-func elementToNode(e *xhtml.Element) *html.Node {
+func elementToNode(e *Element) *html.Node {
 	if e == nil {
 		return nil
 	}
@@ -156,7 +100,7 @@ func elementToNode(e *xhtml.Element) *html.Node {
 		if value == nil {
 			continue
 		}
-		attrKey := xhtml.ParamCase(key)
+		attrKey := ParamCase(key)
 		switch v := value.(type) {
 		case bool:
 			if v {
@@ -178,7 +122,7 @@ func elementToNode(e *xhtml.Element) *html.Node {
 	return node
 }
 
-func buildDocument(elements []*xhtml.Element) *html.Node {
+func buildDocument(elements []*Element) *html.Node {
 	root := &html.Node{Type: html.DocumentNode, Data: "body"}
 	for _, element := range elements {
 		node := elementToNode(element)
@@ -191,10 +135,10 @@ func buildDocument(elements []*xhtml.Element) *html.Node {
 
 func TestEscapeAndUnescape(t *testing.T) {
 	input := `<a&"b">`
-	if got := xhtml.Escape(input, false); got != `&lt;a&amp;"b"&gt;` {
+	if got := Escape(input, false); got != `&lt;a&amp;"b"&gt;` {
 		t.Fatalf("Escape inline=false mismatch: %s", got)
 	}
-	if got := xhtml.Escape(input, true); got != `&lt;a&amp;&quot;b&quot;&gt;` {
+	if got := Escape(input, true); got != `&lt;a&amp;&quot;b&quot;&gt;` {
 		t.Fatalf("Escape inline=true mismatch: %s", got)
 	}
 
@@ -205,16 +149,16 @@ func TestEscapeAndUnescape(t *testing.T) {
 }
 
 func TestCaseHelpers(t *testing.T) {
-	if got := xhtml.ParamCase("FooBar"); got != "foo-bar" {
+	if got := ParamCase("FooBar"); got != "foo-bar" {
 		t.Fatalf("ParamCase mismatch: %s", got)
 	}
-	if got := xhtml.ParamCase("foo_bar"); got != "foo-bar" {
+	if got := ParamCase("foo_bar"); got != "foo-bar" {
 		t.Fatalf("ParamCase underscore mismatch: %s", got)
 	}
-	if got := xhtml.SnakeCase("FooBar"); got != "foo_bar" {
+	if got := SnakeCase("FooBar"); got != "foo_bar" {
 		t.Fatalf("SnakeCase mismatch: %s", got)
 	}
-	if got := xhtml.SnakeCase("foo-bar"); got != "foo_bar" {
+	if got := SnakeCase("foo-bar"); got != "foo_bar" {
 		t.Fatalf("SnakeCase hyphen mismatch: %s", got)
 	}
 }
@@ -244,7 +188,7 @@ func TestEnsureListAndMakeElements(t *testing.T) {
 }
 
 func TestNewElementAndStringify(t *testing.T) {
-	e := xhtml.NewElement("div", map[string]any{
+	e := NewElement("div", map[string]any{
 		"title":   "a&b",
 		"enabled": true,
 		"visible": false,
@@ -254,13 +198,13 @@ func TestNewElementAndStringify(t *testing.T) {
 		t.Fatalf("element stringify mismatch: %s", got)
 	}
 
-	text := xhtml.NewElement("text", map[string]any{"content": "a<b>"})
+	text := NewElement("text", map[string]any{"content": "a<b>"})
 	if got := text.String(); got != "a&lt;b&gt;" {
 		t.Fatalf("text content remap mismatch: %s", got)
 	}
 
 	type widget struct{}
-	component := xhtml.NewElement(widget{}, nil)
+	component := NewElement(widget{}, nil)
 	if got := elementTag(component); got != "widget" {
 		t.Fatalf("component tag mismatch: %s", got)
 	}
@@ -282,17 +226,17 @@ func TestSelect(t *testing.T) {
 	for _, tc := range tests {
 		tc := tc
 		t.Run(tc.query, func(t *testing.T) {
-			got := extractAttrIDs(xhtml.Select(source, tc.query))
+			got := extractAttrIDs(Select(source, tc.query))
 			if !reflect.DeepEqual(got, tc.want) {
 				t.Fatalf("Select(%q) mismatch: got=%v want=%v", tc.query, got, tc.want)
 			}
 		})
 	}
 
-	if got := xhtml.Select(nil, "a"); got != nil {
+	if got := Select(nil, "a"); got != nil {
 		t.Fatalf("Select(nil, ...) should be nil")
 	}
-	if got := xhtml.Select(source, 123); got != nil {
+	if got := Select(source, 123); got != nil {
 		t.Fatalf("Select(invalid query) should be nil")
 	}
 }
@@ -345,11 +289,11 @@ func TestEvaluateInterpolateAndHelpers(t *testing.T) {
 
 func TestFoldTokenAndParseTokens(t *testing.T) {
 	ifElseTokens := []any{
-		&xhtml.Token{Kind: "curly", Name: "if", Position: xhtml.PositionOpen, Extra: "ok"},
+		&Token{Kind: "curly", Name: "if", Position: PositionOpen, Extra: "ok"},
 		"YES",
-		&xhtml.Token{Kind: "curly", Name: "else", Position: xhtml.PositionContinue},
+		&Token{Kind: "curly", Name: "else", Position: PositionContinue},
 		"NO",
-		&xhtml.Token{Kind: "curly", Name: "if", Position: xhtml.PositionClose},
+		&Token{Kind: "curly", Name: "if", Position: PositionClose},
 	}
 
 	folded := foldToken(ifElseTokens)
@@ -358,9 +302,9 @@ func TestFoldTokenAndParseTokens(t *testing.T) {
 	}
 
 	eachTokens := []any{
-		&xhtml.Token{Kind: "curly", Name: "each", Position: xhtml.PositionOpen, Extra: "items as item"},
-		&xhtml.Token{Kind: "curly", Name: "", Position: xhtml.PositionEmpty, Extra: "item"},
-		&xhtml.Token{Kind: "curly", Name: "each", Position: xhtml.PositionClose},
+		&Token{Kind: "curly", Name: "each", Position: PositionOpen, Extra: "items as item"},
+		&Token{Kind: "curly", Name: "", Position: PositionEmpty, Extra: "item"},
+		&Token{Kind: "curly", Name: "each", Position: PositionClose},
 	}
 	eachFolded := foldToken(eachTokens)
 	if got := joinElementStrings(parseTokens(eachFolded, map[string]any{"items": []int{1, 2}})); got != "12" {
@@ -407,7 +351,7 @@ func TestParseElements(t *testing.T) {
 }
 
 func TestParseAndParseWithContext(t *testing.T) {
-	elements := xhtml.Parse(`<a id="1"/>text<b/>`, nil)
+	elements := Parse(`<a id="1"/>text<b/>`, nil)
 	if len(elements) != 3 {
 		t.Fatalf("Parse elements len mismatch: %d", len(elements))
 	}
@@ -452,25 +396,25 @@ func TestHelperBranches(t *testing.T) {
 	})
 
 	t.Run("tag function branches", func(t *testing.T) {
-		var nilElem *xhtml.Element
+		var nilElem *Element
 		if got := elementTag(nilElem); got != "" {
 			t.Fatalf("nil tag mismatch: %q", got)
 		}
 
-		componentWithoutIs := &xhtml.Element{Type: "component", Attrs: map[string]any{}}
+		componentWithoutIs := &Element{Type: "component", Attrs: map[string]any{}}
 		if got := elementTag(componentWithoutIs); got != "component" {
 			t.Fatalf("component fallback tag mismatch: %q", got)
 		}
 
-		demoFn := func(map[string]any, []*xhtml.Element, any) any { return nil }
-		componentWithFn := &xhtml.Element{Type: "component", Attrs: map[string]any{"is": demoFn}}
+		demoFn := func(map[string]any, []*Element, any) any { return nil }
+		componentWithFn := &Element{Type: "component", Attrs: map[string]any{"is": demoFn}}
 		if got := elementTag(componentWithFn); got != "component" {
 			t.Fatalf("function tag should fallback to component, got: %q", got)
 		}
 	})
 
 	t.Run("Select extra branches", func(t *testing.T) {
-		if got := xhtml.Select(123, "a"); got != nil {
+		if got := Select(123, "a"); got != nil {
 			t.Fatalf("Select invalid source should be nil")
 		}
 	})

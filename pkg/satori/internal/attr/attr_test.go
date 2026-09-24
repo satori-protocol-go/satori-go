@@ -1,4 +1,4 @@
-package testsuite
+package attr_test
 
 import (
 	"testing"
