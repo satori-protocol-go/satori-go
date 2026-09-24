@@ -19,9 +19,11 @@ import (
 	"github.com/WindowsSov8forUs/botgo-plus/dto"
 	"github.com/WindowsSov8forUs/botgo-plus/interaction/signature"
 	"github.com/go-chi/chi/v5"
+	"github.com/gorilla/websocket"
 	"github.com/satori-protocol-go/satori-go/pkg/satori/logging"
 	"github.com/satori-protocol-go/satori-go/pkg/satori/model"
 	"github.com/satori-protocol-go/satori-go/pkg/satori/model/event"
+	"github.com/satori-protocol-go/satori-go/pkg/satori/model/login"
 	"github.com/satori-protocol-go/satori-go/pkg/satori/model/message"
 	"github.com/satori-protocol-go/satori-go/pkg/satori/server"
 )
@@ -374,5 +376,128 @@ func TestQQMessagePagination(t *testing.T) {
 				t.Fatalf("terminal page=%+v", page)
 			}
 		}
+	}
+}
+
+func TestQQMultiAppGateway(t *testing.T) {
+	var mu sync.Mutex
+	connections := map[string]*websocket.Conn{}
+	gateway := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := (&websocket.Upgrader{}).Upgrade(w, r, nil)
+		if err != nil {
+			t.Error(err)
+			return
+		}
+		defer conn.Close()
+		id := strings.TrimPrefix(r.URL.Path, "/")
+		mu.Lock()
+		connections[id] = conn
+		mu.Unlock()
+		if err := conn.WriteJSON(map[string]any{"op": 10, "d": map[string]int{"heartbeat_interval": 60000}}); err != nil {
+			return
+		}
+		var identify dto.WSPayload
+		if err := conn.ReadJSON(&identify); err != nil {
+			t.Error(err)
+			return
+		}
+		if identify.OPCode != dto.WSIdentity {
+			t.Errorf("identify op=%d", identify.OPCode)
+		}
+		if err := conn.WriteJSON(map[string]any{"op": 0, "s": 1, "t": "READY", "d": map[string]any{"session_id": "session-" + id, "shard": []int{0, 1}, "user": map[string]any{"id": "bot-" + id}}}); err != nil {
+			return
+		}
+		if err := conn.WriteJSON(map[string]any{"op": 0, "s": 2, "t": "GROUP_AT_MESSAGE_CREATE", "d": map[string]any{"id": "message-" + id, "content": "hello", "group_openid": "group-" + id, "author": map[string]string{"member_openid": "member"}}}); err != nil {
+			return
+		}
+		for {
+			if _, _, err := conn.ReadMessage(); err != nil {
+				return
+			}
+		}
+	}))
+	defer gateway.Close()
+	f := newQQFixture(t, func(cfg *Config) {
+		cfg.Apps = []AppConfig{{AppID: 123, Secret: "fixture-secret"}, {AppID: 456, Secret: "second-secret"}}
+		cfg.UseWebSocket = true
+		cfg.WSReconnectDelay = time.Hour
+	})
+	f.extra = func(w http.ResponseWriter, r *http.Request, _ qqRequest) bool {
+		if r.URL.Path != "/gateway/bot" {
+			return false
+		}
+		id := r.Header.Get("X-Union-Appid")
+		json.NewEncoder(w).Encode(dto.WebsocketAP{URL: "ws" + strings.TrimPrefix(gateway.URL, "http") + "/" + id, Shards: 1, SessionStartLimit: dto.SessionStartLimit{Total: 10, Remaining: 10, MaxConcurrency: 1}})
+		return true
+	}
+	if err := f.adapter.Prepare(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	initial, err := f.adapter.GetLogins(context.Background())
+	if err != nil || len(initial) != 4 {
+		t.Fatalf("initial logins=%+v error=%v", initial, err)
+	}
+	for _, info := range initial {
+		if info.Status != login.LoginStatusConnect {
+			t.Fatalf("initial state=%+v", info)
+		}
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- f.adapter.Block(ctx) }()
+	received := map[string]bool{}
+	timer := time.NewTimer(3 * time.Second)
+	defer timer.Stop()
+	for len(received) < 2 {
+		select {
+		case evt := <-f.adapter.Publisher(ctx):
+			if evt.Type == event.EventTypeMessageCreated {
+				id := strings.TrimPrefix(evt.Message.Id, "message-")
+				if evt.Login.User.Id != "bot-"+id || evt.Login.Status != login.LoginStatusOnline {
+					t.Fatalf("event ownership=%+v", evt)
+				}
+				received[id] = true
+			}
+		case <-timer.C:
+			t.Fatal("multi-app READY/message timed out")
+		}
+	}
+	mu.Lock()
+	first := connections["123"]
+	mu.Unlock()
+	if err := first.WriteControl(websocket.CloseMessage, websocket.FormatCloseMessage(websocket.CloseGoingAway, "fixture close"), time.Now().Add(time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		logins, err := f.adapter.GetLogins(context.Background())
+		if err != nil {
+			t.Fatal(err)
+		}
+		ready := true
+		for _, info := range logins {
+			expected := login.LoginStatusOnline
+			if info.User.Id == "bot-123" {
+				expected = login.LoginStatusReconnect
+			}
+			ready = ready && info.Status == expected
+		}
+		if ready {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("per-app disconnect state did not converge")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	cancel()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("gateway shutdown timed out")
 	}
 }

@@ -18,13 +18,15 @@ import (
 )
 
 type appState struct {
-	appID       string
-	credentials token.QQBotCredentials
-	token       oauth2.TokenSource
-	api         *native.Client
-	uploader    *media.Uploader
-	webhook     http.Handler
-	selfID      string
+	appID          string
+	credentials    token.QQBotCredentials
+	token          oauth2.TokenSource
+	api            *native.Client
+	uploader       *media.Uploader
+	webhook        http.Handler
+	selfID         string
+	readyShards    map[uint32]bool // Protected by Adapter.mu.
+	expectedShards int
 }
 
 type appContextKey struct{}
