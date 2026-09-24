@@ -1,4 +1,4 @@
-package qq_test
+package qq
 
 import (
 	"bytes"
@@ -6,682 +6,349 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"github.com/satori-protocol-go/satori-go/pkg/satori/protocol"
+	"io"
 	"net/http"
 	"net/http/httptest"
-	"os"
-	"path/filepath"
+	"net/url"
+	"strconv"
+	"strings"
+	"sync"
 	"testing"
 	"time"
 
-	botgodto "github.com/WindowsSov8forUs/botgo-plus/dto"
-	botgoopenapi "github.com/WindowsSov8forUs/botgo-plus/openapi"
+	"github.com/WindowsSov8forUs/botgo-plus/dto"
+	"github.com/WindowsSov8forUs/botgo-plus/interaction/signature"
 	"github.com/go-chi/chi/v5"
-	adapterqq "github.com/satori-protocol-go/satori-go/pkg/satori/adapter/qq"
+	"github.com/satori-protocol-go/satori-go/pkg/satori/logging"
 	"github.com/satori-protocol-go/satori-go/pkg/satori/model"
 	"github.com/satori-protocol-go/satori-go/pkg/satori/model/event"
 	"github.com/satori-protocol-go/satori-go/pkg/satori/model/message"
-	satoriserver "github.com/satori-protocol-go/satori-go/pkg/satori/server"
+	"github.com/satori-protocol-go/satori-go/pkg/satori/server"
 )
 
-type qqMockOpenAPI struct {
-	botgoopenapi.OpenAPI
-	me *botgodto.User
-
-	postMessageHook      func(channelID string, msg *botgodto.MessageToCreate)
-	postMessageMultipart func(channelID string, msg *botgodto.MessageToCreate, fileImageData []byte)
-	postDMMultipart      func(dm *botgodto.DirectMessage, msg *botgodto.MessageToCreate, fileImageData []byte)
-	postGroupMessageHook func(groupID string, msg botgodto.APIMessage)
-	postC2CMessageHook   func(userID string, msg botgodto.APIMessage)
+type qqRequest struct {
+	Method, Path, Auth string
+	Query              url.Values
+	Fields             map[string]json.RawMessage
+	Raw, Image         []byte
+	Header             http.Header
 }
 
-func (m *qqMockOpenAPI) Me(ctx context.Context) (*botgodto.User, error) {
-	_ = ctx
-	if m.me != nil {
-		return m.me, nil
-	}
-	return &botgodto.User{ID: "bot", Username: "bot", Bot: true}, nil
+type qqFixture struct {
+	server  *httptest.Server
+	adapter *Adapter
+	mu      sync.Mutex
+	calls   []qqRequest
+	extra   func(http.ResponseWriter, *http.Request, qqRequest) bool
 }
 
-func (m *qqMockOpenAPI) Message(ctx context.Context, channelID string, messageID string) (*botgodto.Message, error) {
-	_ = ctx
-	return &botgodto.Message{ID: messageID, ChannelID: channelID, Content: "content"}, nil
+func (f *qqFixture) requests() []qqRequest {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]qqRequest(nil), f.calls...)
 }
 
-func (m *qqMockOpenAPI) PostMessage(ctx context.Context, channelID string, msg *botgodto.MessageToCreate) (*botgodto.Message, error) {
-	_ = ctx
-	if m.postMessageHook != nil {
-		m.postMessageHook(channelID, msg)
-	}
-	return &botgodto.Message{ID: "m1", ChannelID: channelID, Content: msg.Content}, nil
-}
-
-func (m *qqMockOpenAPI) PostMessageMultipart(
-	ctx context.Context,
-	channelID string,
-	msg *botgodto.MessageToCreate,
-	fileImageData []byte,
-) (*botgodto.Message, error) {
-	_ = ctx
-	if m.postMessageMultipart != nil {
-		m.postMessageMultipart(channelID, msg, fileImageData)
-	}
-	return &botgodto.Message{
-		ID:        "mm1",
-		ChannelID: channelID,
-		Content:   msg.Content,
-		Attachments: []*botgodto.MessageAttachment{
-			{URL: "https://cdn.example/mm1.png", ContentType: "image/png"},
-		},
-	}, nil
-}
-
-func (m *qqMockOpenAPI) PostDirectMessage(
-	ctx context.Context,
-	dm *botgodto.DirectMessage,
-	msg *botgodto.MessageToCreate,
-) (*botgodto.Message, error) {
-	_ = ctx
-	return &botgodto.Message{
-		ID:            "dm1",
-		ChannelID:     dm.ChannelID,
-		GuildID:       dm.GuildID,
-		Content:       msg.Content,
-		DirectMessage: true,
-	}, nil
-}
-
-func (m *qqMockOpenAPI) PostDirectMessageMultipart(
-	ctx context.Context,
-	dm *botgodto.DirectMessage,
-	msg *botgodto.MessageToCreate,
-	fileImageData []byte,
-) (*botgodto.Message, error) {
-	_ = ctx
-	if m.postDMMultipart != nil {
-		m.postDMMultipart(dm, msg, fileImageData)
-	}
-	return &botgodto.Message{
-		ID:            "dmm1",
-		ChannelID:     dm.ChannelID,
-		GuildID:       dm.GuildID,
-		Content:       msg.Content,
-		DirectMessage: true,
-		Attachments: []*botgodto.MessageAttachment{
-			{URL: "https://cdn.example/dmm1.png", ContentType: "image/png"},
-		},
-	}, nil
-}
-
-func (m *qqMockOpenAPI) RetractMessage(
-	ctx context.Context,
-	channelID string,
-	msgID string,
-	options ...botgoopenapi.RetractMessageOption,
-) error {
-	_ = ctx
-	_ = channelID
-	_ = msgID
-	_ = options
-	return nil
-}
-
-func (m *qqMockOpenAPI) RetractDMMessage(
-	ctx context.Context,
-	guildID string,
-	msgID string,
-	options ...botgoopenapi.RetractMessageOption,
-) error {
-	_ = ctx
-	_ = guildID
-	_ = msgID
-	_ = options
-	return nil
-}
-
-func (m *qqMockOpenAPI) CreateDirectMessage(
-	ctx context.Context,
-	dm *botgodto.DirectMessageToCreate,
-) (*botgodto.DirectMessage, error) {
-	_ = ctx
-	_ = dm
-	return &botgodto.DirectMessage{GuildID: "dmGuild", ChannelID: "dmChannel"}, nil
-}
-
-func (m *qqMockOpenAPI) PostGroupMessage(
-	ctx context.Context,
-	groupID string,
-	msg botgodto.APIMessage,
-) (*botgodto.GroupMessageResponse, error) {
-	_ = ctx
-	if m.postGroupMessageHook != nil {
-		m.postGroupMessageHook(groupID, msg)
-	}
-	if media, ok := msg.(*botgodto.RichMediaMessage); ok {
-		return &botgodto.GroupMessageResponse{
-			MediaResponse: &botgodto.MediaResponse{
-				FileInfo: fmt.Sprintf("group-file-info-%d", media.FileType),
-			},
-		}, nil
-	}
-	text := ""
-	if typed, ok := msg.(*botgodto.MessageToCreate); ok {
-		text = typed.Content
-	}
-	return &botgodto.GroupMessageResponse{
-		Message: &botgodto.Message{ID: "gm1", GroupID: groupID, Content: text},
-	}, nil
-}
-
-func (m *qqMockOpenAPI) PostC2CMessage(
-	ctx context.Context,
-	userID string,
-	msg botgodto.APIMessage,
-) (*botgodto.C2CMessageResponse, error) {
-	_ = ctx
-	if m.postC2CMessageHook != nil {
-		m.postC2CMessageHook(userID, msg)
-	}
-	if media, ok := msg.(*botgodto.RichMediaMessage); ok {
-		return &botgodto.C2CMessageResponse{
-			MediaResponse: &botgodto.MediaResponse{
-				FileInfo: fmt.Sprintf("c2c-file-info-%d", media.FileType),
-			},
-		}, nil
-	}
-	text := ""
-	if typed, ok := msg.(*botgodto.MessageToCreate); ok {
-		text = typed.Content
-	}
-	return &botgodto.C2CMessageResponse{
-		Message: &botgodto.Message{ID: "cm1", Content: text, Author: &botgodto.User{UserOpenID: userID}},
-	}, nil
-}
-
-func (m *qqMockOpenAPI) RetractGroupMessage(
-	ctx context.Context,
-	groupID string,
-	msgID string,
-	options ...botgoopenapi.RetractMessageOption,
-) error {
-	_ = ctx
-	_ = groupID
-	_ = msgID
-	_ = options
-	return nil
-}
-
-func (m *qqMockOpenAPI) RetractC2CMessage(
-	ctx context.Context,
-	userID string,
-	msgID string,
-	options ...botgoopenapi.RetractMessageOption,
-) error {
-	_ = ctx
-	_ = userID
-	_ = msgID
-	_ = options
-	return nil
-}
-
-func newQQTestAdapter(t *testing.T, mock *qqMockOpenAPI) *adapterqq.Adapter {
+func newQQFixture(t *testing.T, configure func(*Config)) *qqFixture {
 	t.Helper()
-	adapter, err := adapterqq.New(adapterqq.Config{
-		AppID:              123,
-		Secret:             "secret",
-		SkipTokenInit:      true,
-		SkipSignatureCheck: true,
-		APIV1:              mock,
-		APIV2:              mock,
-	})
-	if err != nil {
-		t.Fatalf("new adapter failed: %v", err)
+	f := &qqFixture{}
+	f.server = httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		raw, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Error(err)
+			w.WriteHeader(400)
+			return
+		}
+		item := qqRequest{Method: r.Method, Path: r.URL.Path, Auth: r.Header.Get("Authorization"), Query: r.URL.Query(), Header: r.Header.Clone(), Raw: raw, Fields: map[string]json.RawMessage{}}
+		if strings.HasPrefix(r.Header.Get("Content-Type"), "multipart/form-data") {
+			r.Body = io.NopCloser(bytes.NewReader(raw))
+			if err := r.ParseMultipartForm(1 << 20); err != nil {
+				t.Error(err)
+				w.WriteHeader(400)
+				return
+			}
+			defer r.MultipartForm.RemoveAll()
+			for key, values := range r.MultipartForm.Value {
+				value := values[0]
+				if json.Valid([]byte(value)) {
+					item.Fields[key] = json.RawMessage(value)
+				} else {
+					item.Fields[key], _ = json.Marshal(value)
+				}
+			}
+			file, _, err := r.FormFile("file_image")
+			if err != nil {
+				t.Error(err)
+				w.WriteHeader(400)
+				return
+			}
+			item.Image, err = io.ReadAll(file)
+			file.Close()
+			if err != nil {
+				t.Error(err)
+				w.WriteHeader(400)
+				return
+			}
+		} else if len(raw) > 0 && json.Valid(raw) {
+			_ = json.Unmarshal(raw, &item.Fields)
+		}
+		f.mu.Lock()
+		f.calls = append(f.calls, item)
+		number := len(f.calls)
+		extra := f.extra
+		f.mu.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("X-Tps-trace-ID", "fixture-trace")
+		if extra != nil && extra(w, r, item) {
+			return
+		}
+		if r.URL.Path == "/token" {
+			w.Write([]byte(`{"access_token":"fixture","expires_in":7200}`))
+			return
+		}
+		if strings.HasPrefix(r.URL.Path, "/object/") {
+			if r.Method != "PUT" || r.Header.Get("Authorization") != "" {
+				t.Errorf("object request=%s auth=%q", r.Method, r.Header.Get("Authorization"))
+			}
+			w.WriteHeader(204)
+			return
+		}
+		if item.Auth != "QQBot fixture" {
+			t.Errorf("QQ auth=%q path=%s", item.Auth, item.Path)
+			w.WriteHeader(401)
+			return
+		}
+		if r.URL.Path == "/users/@me" {
+			json.NewEncoder(w).Encode(map[string]any{"id": "bot-" + r.Header.Get("X-Union-Appid"), "username": "fixture", "bot": true})
+			return
+		}
+		if r.Method == "GET" && strings.HasSuffix(r.URL.Path, "/messages") {
+			cursor := firstNonEmpty(r.URL.Query().Get("before"), r.URL.Query().Get("after"))
+			if cursor == " opaque+/== " {
+				w.Write([]byte(`[{"id":"new","seq_in_channel":"2"},{"id":"old","seq_in_channel":"1"}]`))
+			} else {
+				w.Write([]byte(`[]`))
+			}
+			return
+		}
+		if strings.HasSuffix(r.URL.Path, "/upload_prepare") {
+			var prepare dto.UploadPrepareRequest
+			if err := json.Unmarshal(raw, &prepare); err != nil {
+				t.Error(err)
+				w.WriteHeader(400)
+				return
+			}
+			json.NewEncoder(w).Encode(dto.UploadPrepareResult{UploadID: "upload-id", BlockSize: prepare.FileSize, Parts: []dto.UploadPart{{Index: 0, BlockSize: prepare.FileSize, PresignedURL: f.server.URL + "/object/" + url.PathEscape(prepare.FileName)}}, UploadConfig: dto.UploadConfig{Concurrency: 1}})
+			return
+		}
+		if strings.HasSuffix(r.URL.Path, "/upload_part_finish") {
+			w.Write([]byte(`{}`))
+			return
+		}
+		if strings.HasSuffix(r.URL.Path, "/files") {
+			w.Write([]byte(`{"file_info":"opaque!file-info","file_uuid":"fixture-file","ttl":300}`))
+			return
+		}
+		if r.Method == "POST" && strings.HasSuffix(r.URL.Path, "/messages") {
+			var content string
+			_ = json.Unmarshal(item.Fields["content"], &content)
+			result := map[string]any{"id": fmt.Sprintf("sent-%d", number), "content": content, "ext_info": map[string]string{"ref_idx": "REFIDX_sent=="}}
+			parts := strings.Split(strings.Trim(r.URL.Path, "/"), "/")
+			if len(parts) == 4 && parts[1] == "groups" {
+				result["group_openid"] = parts[2]
+			}
+			if len(parts) == 4 && parts[1] == "users" {
+				result["author"] = map[string]string{"user_openid": parts[2]}
+			}
+			if len(parts) == 3 {
+				result["channel_id"] = parts[1]
+			}
+			json.NewEncoder(w).Encode(result)
+			return
+		}
+		if r.Method == "PUT" && strings.HasPrefix(r.URL.Path, "/interactions/") {
+			w.WriteHeader(204)
+			return
+		}
+		if r.Method == "DELETE" {
+			w.WriteHeader(204)
+			return
+		}
+		w.WriteHeader(404)
+		w.Write([]byte(`{"code":11234,"message":"fixture endpoint not found"}`))
+	}))
+	cfg := Config{AppID: 123, Secret: "fixture-secret", TokenURL: f.server.URL + "/token", APIBaseURL: f.server.URL, HTTPClient: f.server.Client(), Logger: logging.NopLogger{}}
+	if configure != nil {
+		configure(&cfg)
 	}
-	return adapter
+	adapter, err := New(cfg)
+	if err != nil {
+		f.server.Close()
+		t.Fatal(err)
+	}
+	f.adapter = adapter
+	t.Cleanup(func() { adapter.Cleanup(context.Background()); f.server.Close() })
+	return f
 }
 
-func TestQQAdapterGetLoginsAndEnsure(t *testing.T) {
-	mock := &qqMockOpenAPI{me: &botgodto.User{ID: "bot-1", Username: "tester", Bot: true}}
-	adapter := newQQTestAdapter(t, mock)
+func (f *qqFixture) call(action, platform, selfID string, params map[string]any) (any, error) {
+	handler := f.adapter.Routes()[action]
+	if handler == nil {
+		return nil, fmt.Errorf("route %s missing", action)
+	}
+	return handler(&server.Request[any]{Action: action, Platform: platform, SelfID: selfID, Params: params})
+}
 
-	logins, err := adapter.GetLogins(context.Background())
-	if err != nil {
-		t.Fatalf("get logins failed: %v", err)
+func TestQQNativeRequests(t *testing.T) {
+	f := newQQFixture(t, nil)
+	logins, err := f.adapter.GetLogins(context.Background())
+	if err != nil || len(logins) != 2 || logins[0].Sn == logins[1].Sn {
+		t.Fatalf("logins=%+v error=%v", logins, err)
 	}
-	if len(logins) != 2 {
-		t.Fatalf("unexpected login count: %d", len(logins))
-	}
-	if !adapter.Ensure("qq", "bot-1") {
-		t.Fatal("qq login ensure failed")
-	}
-	if !adapter.Ensure("qqguild", "bot-1") {
-		t.Fatal("qqguild login ensure failed")
+	for _, tc := range []struct{ name, platform, target, content, path string }{
+		{"group", "qq", "group", "hello", "/v2/groups/group/messages"},
+		{"c2c", "qq", "private:user", "hello", "/v2/users/user/messages"},
+		{"channel", "qqguild", "channel", "hello", "/channels/channel/messages"},
+		{"channel-image", "qqguild", "channel", `<quote id="original"/><img src="data:image/png;base64,aW1hZ2U="/>`, "/channels/channel/messages"},
+		{"group-image", "qq", "group", `<img src="https://example.invalid/image.png"/>`, "/v2/groups/group/messages"},
+		{"c2c-audio", "qq", "private:user", `<audio src="https://example.invalid/audio.silk"/>`, "/v2/users/user/messages"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			result, err := f.call("message.create", tc.platform, "bot-123", map[string]any{"channel_id": tc.target, "content": tc.content, "referrer": map[string]any{"msg_id": "incoming", "msg_seq": 1}})
+			if err != nil {
+				t.Fatal(err)
+			}
+			messages := result.([]*message.Message)
+			if len(messages) != 1 || messages[0].Id == "" {
+				t.Fatalf("messages=%+v", messages)
+			}
+			calls := f.requests()
+			last := calls[len(calls)-1]
+			if last.Method != "POST" || last.Path != tc.path {
+				t.Fatalf("request=%s %s", last.Method, last.Path)
+			}
+			if tc.name == "channel-image" {
+				if string(last.Image) != "image" || !bytes.Contains(last.Fields["message_reference"], []byte("original")) {
+					t.Fatalf("image=%q reference=%s", last.Image, last.Fields["message_reference"])
+				}
+			}
+			if strings.Contains(tc.name, "group-image") || tc.name == "c2c-audio" {
+				if !bytes.Contains(last.Fields["media"], []byte("opaque!file-info")) || string(last.Fields["msg_type"]) != "7" {
+					t.Fatalf("media=%s", last.Raw)
+				}
+			}
+		})
 	}
 }
 
-func TestQQAdapterMessageCreate(t *testing.T) {
-	mock := &qqMockOpenAPI{me: &botgodto.User{ID: "bot-2", Username: "tester", Bot: true}}
-	adapter := newQQTestAdapter(t, mock)
-
-	var groupCalls int
-	var privateCalls int
-	mock.postGroupMessageHook = func(groupID string, msg botgodto.APIMessage) {
-		_ = groupID
-		_ = msg
-		groupCalls++
-	}
-	mock.postC2CMessageHook = func(userID string, msg botgodto.APIMessage) {
-		_ = userID
-		_ = msg
-		privateCalls++
-	}
-
-	route, ok := adapter.Routes()[string(protocol.ApiMessageCreate)]
-	if !ok {
-		t.Fatal("message.create route not found")
-	}
-
-	_, err := route(&satoriserver.Request[any]{
-		Action:   string(protocol.ApiMessageCreate),
-		Platform: "qq",
-		SelfID:   "bot-2",
-		Params: map[string]any{
-			"channel_id": "group-1",
-			"content":    "hello group",
-		},
-	})
+func signedQQRequest(t *testing.T, raw []byte, appID, secret string) *http.Request {
+	t.Helper()
+	r := httptest.NewRequest("POST", "/qqbot", bytes.NewReader(raw))
+	r.Header.Set("X-Bot-Appid", appID)
+	r.Header.Set(signature.HeaderTimestamp, strconv.FormatInt(time.Now().Unix(), 10))
+	signed, err := signature.Generate(secret, r.Header, raw)
 	if err != nil {
-		t.Fatalf("group message.create failed: %v", err)
+		t.Fatal(err)
 	}
-
-	_, err = route(&satoriserver.Request[any]{
-		Action:   string(protocol.ApiMessageCreate),
-		Platform: "qq",
-		SelfID:   "bot-2",
-		Params: map[string]any{
-			"channel_id": "private:user-1",
-			"content":    "hello private",
-		},
-	})
-	if err != nil {
-		t.Fatalf("private message.create failed: %v", err)
-	}
-
-	if groupCalls != 1 {
-		t.Fatalf("unexpected group calls: %d", groupCalls)
-	}
-	if privateCalls != 1 {
-		t.Fatalf("unexpected private calls: %d", privateCalls)
-	}
+	r.Header.Set("X-Signature-Ed25519", signed)
+	return r
 }
 
-func TestQQAdapterWebhookValidationAndDispatch(t *testing.T) {
-	mock := &qqMockOpenAPI{me: &botgodto.User{ID: "bot-3", Username: "tester", Bot: true}}
-	adapter := newQQTestAdapter(t, mock)
-
+func TestQQWebhook(t *testing.T) {
+	f := newQQFixture(t, nil)
 	router := chi.NewRouter()
-	adapter.RegisterRootRoutes(router)
-	handler := router
-
-	validationBody := map[string]any{
-		"op": int(botgodto.HTTPCallbackValidation),
-		"d": map[string]any{
-			"plain_token": "plain",
-			"event_ts":    "123",
-		},
+	f.adapter.RegisterRootRoutes(router)
+	raw := []byte(`{"op":13,"d":{"plain_token":"plain","event_ts":"123"}}`)
+	r := httptest.NewRequest("POST", "/qqbot", bytes.NewReader(raw))
+	r.Header.Set("X-Bot-Appid", "123")
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, r)
+	var challenge struct {
+		Plain     string `json:"plain_token"`
+		Signature string `json:"signature"`
 	}
-	validationRaw, _ := json.Marshal(validationBody)
-	validationReq := httptest.NewRequest(http.MethodPost, "/qqbot", bytes.NewReader(validationRaw))
-	validationReq.Header.Set("X-Bot-Appid", "123")
-	validationResp := httptest.NewRecorder()
-	handler.ServeHTTP(validationResp, validationReq)
-	if validationResp.Code != http.StatusOK {
-		t.Fatalf("validation status mismatch: %d", validationResp.Code)
+	if err := json.Unmarshal(w.Body.Bytes(), &challenge); err != nil {
+		t.Fatalf("challenge status=%d body=%s err=%v", w.Code, w.Body, err)
 	}
-
-	var validationResult map[string]string
-	if err := json.Unmarshal(validationResp.Body.Bytes(), &validationResult); err != nil {
-		t.Fatalf("decode validation result failed: %v", err)
+	header := http.Header{}
+	header.Set(signature.HeaderTimestamp, "123")
+	expected, err := signature.Generate("fixture-secret", header, []byte("plain"))
+	if err != nil || w.Code != 200 || challenge.Plain != "plain" || challenge.Signature != expected {
+		t.Fatalf("challenge=%+v status=%d err=%v", challenge, w.Code, err)
 	}
-	if validationResult["plain_token"] != "plain" {
-		t.Fatalf("unexpected plain token: %#v", validationResult)
-	}
-	if validationResult["signature"] == "" {
-		t.Fatalf("signature is empty: %#v", validationResult)
-	}
-
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	stream := adapter.Publisher(ctx)
-
-	dispatchBody := map[string]any{
-		"op": 0,
-		"t":  string(botgodto.EventGroupAtMessageCreate),
-		"d": map[string]any{
-			"id":       "m-1",
-			"content":  "hello",
-			"group_id": "group-1",
-			"author": map[string]any{
-				"member_openid": "user-1",
-				"username":      "alice",
-			},
-		},
+	stream := f.adapter.Publisher(ctx)
+	raw = []byte(`{"op":0,"s":1,"t":"GROUP_AT_MESSAGE_CREATE","id":"event-id","d":{"id":"incoming","content":"hello","group_openid":"group","author":{"member_openid":"member"}}}`)
+	w = httptest.NewRecorder()
+	router.ServeHTTP(w, signedQQRequest(t, raw, "123", "fixture-secret"))
+	if w.Code != 200 || !strings.Contains(w.Body.String(), `"d":0`) {
+		t.Fatalf("event ack=%d %s", w.Code, w.Body)
 	}
-	dispatchRaw, _ := json.Marshal(dispatchBody)
-	dispatchReq := httptest.NewRequest(http.MethodPost, "/qqbot", bytes.NewReader(dispatchRaw))
-	dispatchReq.Header.Set("X-Bot-Appid", "123")
-	dispatchResp := httptest.NewRecorder()
-	handler.ServeHTTP(dispatchResp, dispatchReq)
-	if dispatchResp.Code != http.StatusOK {
-		t.Fatalf("dispatch status mismatch: %d", dispatchResp.Code)
-	}
-
-	deadline := time.After(2 * time.Second)
+	timer := time.NewTimer(2 * time.Second)
+	defer timer.Stop()
 	for {
 		select {
 		case evt := <-stream:
-			if evt != nil && evt.Type == event.EventTypeMessageCreated {
-				if evt.Login == nil || evt.Login.Platform != "qq" {
-					t.Fatalf("unexpected login platform: %#v", evt.Login)
-				}
-				if evt.Message == nil || evt.Message.Id != "m-1" {
-					t.Fatalf("unexpected message payload: %#v", evt.Message)
+			if evt.Type == event.EventTypeMessageCreated {
+				if evt.Login.Platform != "qq" || evt.Message.Id != "incoming" {
+					t.Fatalf("event=%+v", evt)
 				}
 				return
 			}
-		case <-deadline:
-			t.Fatal("timeout waiting message-created event")
+		case <-timer.C:
+			t.Fatal("message event timed out")
 		}
 	}
 }
 
-func TestQQAdapterMessageCreateQQResourceSegments(t *testing.T) {
-	mock := &qqMockOpenAPI{me: &botgodto.User{ID: "bot-4", Username: "tester", Bot: true}}
-	adapter := newQQTestAdapter(t, mock)
-
-	type sendRecord struct {
-		kind string
-		seq  int
-	}
-	records := make([]sendRecord, 0, 8)
-	mock.postGroupMessageHook = func(groupID string, msg botgodto.APIMessage) {
-		if groupID != "group-2" {
-			t.Fatalf("unexpected group id: %s", groupID)
+func TestQQErrorAndNativeResponse(t *testing.T) {
+	f := newQQFixture(t, nil)
+	f.extra = func(w http.ResponseWriter, r *http.Request, item qqRequest) bool {
+		if strings.Contains(r.URL.Path, "/denied/") {
+			w.WriteHeader(403)
+			w.Write([]byte(`{"err_code":11253}`))
+			return true
 		}
-		switch typed := msg.(type) {
-		case *botgodto.RichMediaMessage:
-			records = append(records, sendRecord{kind: fmt.Sprintf("upload-%d", typed.FileType)})
-			if typed.SrvSendMsg {
-				t.Fatalf("rich media upload should use srv_send_msg=false")
+		if r.URL.Path == "/raw" {
+			if r.Method != "PATCH" || r.URL.Query().Get("cursor") != " +/=" || r.Header.Get("Content-Type") != "application/octet-stream" {
+				t.Errorf("native request=%s %s type=%s", r.Method, r.URL.RawQuery, r.Header.Get("Content-Type"))
 			}
-		case *botgodto.MessageToCreate:
-			records = append(records, sendRecord{kind: fmt.Sprintf("message-%d", typed.MsgType), seq: typed.MsgSeq})
-		default:
-			t.Fatalf("unexpected api message type: %T", msg)
+			w.Header().Set("Content-Type", "application/octet-stream")
+			w.Write(item.Raw)
+			return true
 		}
+		return false
 	}
-
-	route, ok := adapter.Routes()[string(protocol.ApiMessageCreate)]
-	if !ok {
-		t.Fatal("message.create route not found")
-	}
-
-	result, err := route(&satoriserver.Request[any]{
-		Action:   string(protocol.ApiMessageCreate),
-		Platform: "qq",
-		SelfID:   "bot-4",
-		Params: map[string]any{
-			"channel_id": "group-2",
-			"content":    `hello<img src="https://example.com/a.png"/><audio src="https://example.com/a.silk"/>`,
-			"referrer": map[string]any{
-				"msg_id":  "passive-msg",
-				"msg_seq": -1,
-			},
-		},
-	})
-	if err != nil {
-		t.Fatalf("message.create with resource failed: %v", err)
-	}
-
-	items, ok := result.([]*message.Message)
-	if !ok {
-		t.Fatalf("unexpected result type: %T", result)
-	}
-	if len(items) != 3 {
-		t.Fatalf("unexpected message count: %d", len(items))
-	}
-	if len(records) != 5 {
-		t.Fatalf("unexpected send call count: %d", len(records))
-	}
-	if records[0].kind != "message-0" || records[0].seq != 0 {
-		t.Fatalf("unexpected first record: %+v", records[0])
-	}
-	if records[1].kind != "upload-1" {
-		t.Fatalf("unexpected second record: %+v", records[1])
-	}
-	if records[2].kind != "message-7" || records[2].seq != 1 {
-		t.Fatalf("unexpected third record: %+v", records[2])
-	}
-	if records[3].kind != "upload-3" {
-		t.Fatalf("unexpected fourth record: %+v", records[3])
-	}
-	if records[4].kind != "message-7" || records[4].seq != 2 {
-		t.Fatalf("unexpected fifth record: %+v", records[4])
-	}
-}
-
-func TestQQAdapterMessageCreateQQGuildQuoteAndImage(t *testing.T) {
-	mock := &qqMockOpenAPI{me: &botgodto.User{ID: "bot-5", Username: "tester", Bot: true}}
-	adapter := newQQTestAdapter(t, mock)
-
-	var called bool
-	mock.postMessageHook = func(channelID string, msg *botgodto.MessageToCreate) {
-		called = true
-		if channelID != "guild-channel" {
-			t.Fatalf("unexpected channel id: %s", channelID)
-		}
-		if msg.Image != "https://example.com/image.png" {
-			t.Fatalf("unexpected image url: %s", msg.Image)
-		}
-		if msg.MessageReference == nil || msg.MessageReference.MessageID != "origin-msg" {
-			t.Fatalf("unexpected message reference: %#v", msg.MessageReference)
-		}
-		if msg.MsgID != "passive-id" {
-			t.Fatalf("unexpected passive msg_id: %s", msg.MsgID)
-		}
-	}
-
-	route, ok := adapter.Routes()[string(protocol.ApiMessageCreate)]
-	if !ok {
-		t.Fatal("message.create route not found")
-	}
-
-	result, err := route(&satoriserver.Request[any]{
-		Action:   string(protocol.ApiMessageCreate),
-		Platform: "qqguild",
-		SelfID:   "bot-5",
-		Params: map[string]any{
-			"channel_id": "guild-channel",
-			"content":    `<quote id="origin-msg"/><img src="https://example.com/image.png"/>`,
-			"referrer": map[string]any{
-				"msg_id": "passive-id",
-			},
-		},
-	})
-	if err != nil {
-		t.Fatalf("message.create quote+image failed: %v", err)
-	}
-	if !called {
-		t.Fatal("expected postMessageHook to be called")
-	}
-	items, ok := result.([]*message.Message)
-	if !ok {
-		t.Fatalf("unexpected result type: %T", result)
-	}
-	if len(items) != 1 {
-		t.Fatalf("unexpected message count: %d", len(items))
-	}
-}
-
-func TestQQAdapterMessageCreateQQGuildMultipartImage(t *testing.T) {
-	mock := &qqMockOpenAPI{me: &botgodto.User{ID: "bot-6", Username: "tester", Bot: true}}
-	adapter := newQQTestAdapter(t, mock)
-
-	tempDir := t.TempDir()
-	filePath := filepath.Join(tempDir, "image.png")
-	if err := os.WriteFile(filePath, []byte("png-data"), 0o600); err != nil {
-		t.Fatalf("write temp image failed: %v", err)
-	}
-
-	var multipartCalled bool
-	mock.postMessageMultipart = func(channelID string, msg *botgodto.MessageToCreate, fileImageData []byte) {
-		multipartCalled = true
-		if channelID != "guild-channel-2" {
-			t.Fatalf("unexpected channel id: %s", channelID)
-		}
-		if len(fileImageData) == 0 {
-			t.Fatal("multipart image data is empty")
-		}
-		if msg.Image != "" {
-			t.Fatalf("expected image url empty in multipart mode, got %s", msg.Image)
-		}
-	}
-
-	route, ok := adapter.Routes()[string(protocol.ApiMessageCreate)]
-	if !ok {
-		t.Fatal("message.create route not found")
-	}
-
-	result, err := route(&satoriserver.Request[any]{
-		Action:   string(protocol.ApiMessageCreate),
-		Platform: "qqguild",
-		SelfID:   "bot-6",
-		Params: map[string]any{
-			"channel_id": "guild-channel-2",
-			"content":    `<img src="file://` + filePath + `"/>`,
-		},
-	})
-	if err != nil {
-		t.Fatalf("message.create multipart image failed: %v", err)
-	}
-	if !multipartCalled {
-		t.Fatal("expected multipart api to be called")
-	}
-	items, ok := result.([]*message.Message)
-	if !ok {
-		t.Fatalf("unexpected result type: %T", result)
-	}
-	if len(items) != 1 {
-		t.Fatalf("unexpected message count: %d", len(items))
-	}
-}
-
-func TestQQAdapterMessageCreateQQPassiveReferrerElement(t *testing.T) {
-	mock := &qqMockOpenAPI{me: &botgodto.User{ID: "bot-passive", Username: "tester", Bot: true}}
-	adapter := newQQTestAdapter(t, mock)
-
-	var captured *botgodto.MessageToCreate
-	mock.postGroupMessageHook = func(groupID string, msg botgodto.APIMessage) {
-		if groupID != "group-passive" {
-			t.Fatalf("unexpected group id: %s", groupID)
-		}
-		typed, ok := msg.(*botgodto.MessageToCreate)
-		if !ok {
-			t.Fatalf("unexpected api message type: %T", msg)
-		}
-		copied := *typed
-		captured = &copied
-	}
-
-	route, ok := adapter.Routes()[string(protocol.ApiMessageCreate)]
-	if !ok {
-		t.Fatal("message.create route not found")
-	}
-
-	_, err := route(&satoriserver.Request[any]{
-		Action:   string(protocol.ApiMessageCreate),
-		Platform: "qq",
-		SelfID:   "bot-passive",
-		Params: map[string]any{
-			"channel_id": "group-passive",
-			"content":    `hello<qq:passive id="passive-msg" seq="-1"/>`,
-			"referrer": map[string]any{
-				"msg_id":  "legacy-msg",
-				"msg_seq": 8,
-			},
-		},
-	})
-	if err != nil {
-		t.Fatalf("message.create with qq:passive failed: %v", err)
-	}
-	if captured == nil {
-		t.Fatal("group message payload was not captured")
-	}
-	if captured.Content != "hello" {
-		t.Fatalf("unexpected content: %q", captured.Content)
-	}
-	if captured.MsgID != "passive-msg" {
-		t.Fatalf("unexpected msg_id: %q", captured.MsgID)
-	}
-	if captured.MsgSeq != 0 {
-		t.Fatalf("unexpected msg_seq: %d", captured.MsgSeq)
-	}
-}
-
-func TestQQAdapterMessageCreateQQPassiveReferrerInvalidSeq(t *testing.T) {
-	mock := &qqMockOpenAPI{me: &botgodto.User{ID: "bot-passive-2", Username: "tester", Bot: true}}
-	adapter := newQQTestAdapter(t, mock)
-
-	route, ok := adapter.Routes()[string(protocol.ApiMessageCreate)]
-	if !ok {
-		t.Fatal("message.create route not found")
-	}
-
-	_, err := route(&satoriserver.Request[any]{
-		Action:   string(protocol.ApiMessageCreate),
-		Platform: "qq",
-		SelfID:   "bot-passive-2",
-		Params: map[string]any{
-			"channel_id": "group-passive",
-			"content":    `<qq:passive id="passive-msg" seq="invalid-seq"/>hello`,
-		},
-	})
-	if err == nil {
-		t.Fatal("expected message.create to fail when qq:passive seq is invalid")
-	}
-}
-
-func TestQQCapabilityResponses(t *testing.T) {
-	adapter := newQQTestAdapter(t, &qqMockOpenAPI{})
 	for _, tc := range []struct {
-		action string
-		status int
+		action, platform string
+		params           map[string]any
+		status           int
 	}{
-		{"channel.mute", 404}, {"guild.get", 501}, {"guild.member.approve", 501},
+		{"channel.mute", "qq", map[string]any{"channel_id": "group"}, 404},
+		{"guild.member.approve", "qq", map[string]any{"message_id": "request", "approve": true}, 501},
+		{"message.create", "qq", map[string]any{"channel_id": "denied", "content": "hello"}, 403},
+		{"message.create", "qqguild", map[string]any{"channel_id": "dm_user", "content": `<img src="data:image/png;base64,aW1hZ2U="/>`}, 501},
 	} {
-		route := adapter.Routes()[tc.action]
-		_, err := route(&satoriserver.Request[any]{Action: tc.action, Platform: "qq", Params: map[string]any{"guild_id": "g", "channel_id": "c", "message_id": "m"}})
-		var result interface{ HTTPStatus() int }
-		if !errors.As(err, &result) || result.HTTPStatus() != tc.status {
-			t.Errorf("%s status=%v", tc.action, err)
+		_, err := f.call(tc.action, tc.platform, "bot-123", tc.params)
+		var status interface{ HTTPStatus() int }
+		if !errors.As(err, &status) || status.HTTPStatus() != tc.status {
+			t.Errorf("%s status=%v wanted=%d", tc.action, err, tc.status)
 		}
 	}
-}
-
-func (m *qqMockOpenAPI) Messages(ctx context.Context, channel string, pager *botgodto.MessagesPager) ([]*botgodto.Message, error) {
-	if pager.ID != " opaque+/== " {
-		return []*botgodto.Message{}, nil
+	r := httptest.NewRequest("PATCH", "/v1/internal/raw?cursor=%20%2B%2F%3D", bytes.NewBufferString("binary-content"))
+	r.Header.Set("Content-Type", "application/octet-stream")
+	response, err := f.adapter.HandleInternal(server.Request[map[string]any]{Origin: r, Platform: "qq", SelfID: "bot-123"}, "_api/raw")
+	if err != nil || response.StatusCode != 200 || string(response.Body) != "binary-content" || response.Header.Get("Content-Type") != "application/octet-stream" {
+		t.Fatalf("native response=%+v error=%v", response, err)
 	}
-	return []*botgodto.Message{{ID: "new", SeqInChannel: "2"}, {ID: "old", SeqInChannel: "1"}}, nil
 }
 
 func TestQQMessagePagination(t *testing.T) {
-	adapter := newQQTestAdapter(t, &qqMockOpenAPI{})
-	route := adapter.Routes()["message.list"]
+	f := newQQFixture(t, nil)
 	for _, direction := range []string{"before", "after"} {
 		for _, order := range []string{"asc", "desc"} {
-			input := map[string]any{"channel_id": "channel", "next": " opaque+/== ", "direction": direction, "order": order, "limit": 100}
-			result, err := route(&satoriserver.Request[any]{Platform: "qqguild", SelfID: "bot", Action: "message.list", Params: input})
+			params := map[string]any{"channel_id": "channel", "next": " opaque+/== ", "direction": direction, "order": order, "limit": 100}
+			result, err := f.call("message.list", "qqguild", "bot-123", params)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -697,14 +364,14 @@ func TestQQMessagePagination(t *testing.T) {
 			if len(page.Data) != 2 || page.Data[0].Id != first || page.Prev != cursor || page.Next != cursor {
 				t.Fatalf("%s %s page=%+v", direction, order, page)
 			}
-			input["next"] = page.Next
-			result, err = route(&satoriserver.Request[any]{Platform: "qqguild", SelfID: "bot", Action: "message.list", Params: input})
+			params["next"] = page.Next
+			result, err = f.call("message.list", "qqguild", "bot-123", params)
 			if err != nil {
 				t.Fatal(err)
 			}
 			page = result.(*model.BidiPaginated[*message.Message])
 			if len(page.Data) != 0 || page.Prev != "" || page.Next != "" {
-				t.Fatalf("last page=%+v", page)
+				t.Fatalf("terminal page=%+v", page)
 			}
 		}
 	}
