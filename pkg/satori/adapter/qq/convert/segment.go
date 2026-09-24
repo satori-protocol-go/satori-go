@@ -46,24 +46,13 @@ type MessageButton struct {
 	Label string
 }
 
-func ParseMessageSegments(content string, platform string) []MessageSegment {
+// ParseMessage parses message content and QQ passive context in one pass.
+func ParseMessage(content, platform string) ([]MessageSegment, QQPassiveReferrer, error) {
 	state, err := parseQQMessage(content, platform)
 	if err != nil {
-		return []MessageSegment{{Text: content}}
+		return nil, QQPassiveReferrer{}, err
 	}
-	segments := state.segments
-	if len(segments) == 0 && strings.TrimSpace(content) != "" {
-		return []MessageSegment{{Text: content}}
-	}
-	return segments
-}
-
-func ParseQQPassiveReferrer(content string) QQPassiveReferrer {
-	state, err := parseQQMessage(content, "qq")
-	if err != nil || state == nil {
-		return QQPassiveReferrer{}
-	}
-	return state.passive
+	return state.segments, state.passive, nil
 }
 
 type qqMessageParser struct {
@@ -72,6 +61,7 @@ type qqMessageParser struct {
 	currentText  strings.Builder
 	segments     []MessageSegment
 	passive      QQPassiveReferrer
+	err          error
 }
 
 func parseQQMessage(content string, platform string) (*qqMessageParser, error) {
@@ -87,7 +77,9 @@ func parseQQMessage(content string, platform string) (*qqMessageParser, error) {
 	}
 	state.walk(elements)
 	state.flushText()
-
+	if state.err != nil {
+		return nil, state.err
+	}
 	return state, nil
 }
 
@@ -240,10 +232,18 @@ func (p *qqMessageParser) tryAppendExtendedSegment(input *element.Extension) boo
 	switch input.Tag() {
 	case "qq:passive":
 		if raw, ok := input.Get("id"); ok {
-			p.passive.MsgID = strings.TrimSpace(fmt.Sprint(raw))
+			value := fmt.Sprint(raw)
+			if p.passive.MsgID != "" && p.passive.MsgID != value {
+				p.err = fmt.Errorf("conflicting qq:passive ids")
+			}
+			p.passive.MsgID = value
 		}
 		if raw, ok := input.Get("seq"); ok {
-			p.passive.MsgSeq = strings.TrimSpace(fmt.Sprint(raw))
+			value := strings.TrimSpace(fmt.Sprint(raw))
+			if p.passive.HasMsgSeq && p.passive.MsgSeq != value {
+				p.err = fmt.Errorf("conflicting qq:passive sequences")
+			}
+			p.passive.MsgSeq = value
 			p.passive.HasMsgSeq = true
 		}
 		return true

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"net/http"
 	"sort"
 	"strconv"
@@ -402,34 +403,44 @@ func (a *Adapter) handleGuildMemberRoleChange(
 }
 
 func (a *Adapter) handleMessageCreate(request *server.Request[server.MessageCreateParam]) (any, error) {
-	channelID := request.Params.ChannelID
-
-	referrerRaw, _ := request.Params.Referrer.Get()
-	referrer, err := parseMessageReferrer(referrerRaw)
+	segments, passive, err := convert.ParseMessage(request.Params.Content, request.Platform)
+	if err != nil {
+		return nil, server.BadRequest(err.Error())
+	}
+	raw, _ := request.Params.Referrer.Get()
+	referrer, err := parseMessageReferrer(raw)
 	if err != nil {
 		return nil, err
 	}
-	if err := mergePassiveReferrer(&referrer, convert.ParseQQPassiveReferrer(request.Params.Content)); err != nil {
+	if err := mergePassiveReferrer(&referrer, passive); err != nil {
 		return nil, err
 	}
 	state, err := a.resolveRequestState(request.Origin, request.SelfID)
 	if err != nil {
 		return nil, err
 	}
-	sender := newMessageSender(state, convert.MessageFromDTO, a)
-	if sender == nil {
-		return []*message.Message{}, nil
+	if referrer.AppID != "" && referrer.AppID != state.appID {
+		return nil, server.BadRequest("reply context belongs to a different QQ application")
 	}
-
-	result, err := sender.Send(requestContext(request.Origin), messageCreateInput{
-		Platform:  request.Platform,
-		ChannelID: channelID,
-		Content:   request.Params.Content,
-		Referrer:  referrer,
-	})
+	result, err := newMessageSender(state, convert.MessageFromDTO, a).Send(requestContext(request.Origin), messageCreateInput{Platform: request.Platform, ChannelID: request.Params.ChannelID, Content: request.Params.Content, Segments: segments, Referrer: referrer})
 	if err != nil {
 		if errors.Is(err, errUnsupportedPlatform) {
 			return nil, server.NotFound("unsupported platform")
+		}
+		if len(result) > 0 {
+			cause := qqActionError(err)
+			status := http.StatusInternalServerError
+			var typed interface{ HTTPStatus() int }
+			if errors.As(cause, &typed) {
+				status = typed.HTTPStatus()
+			}
+			raw, marshalErr := json.Marshal(map[string]any{"error": cause.Error(), "messages": result})
+			if marshalErr != nil {
+				return nil, marshalErr
+			}
+			response := server.NewResponse(status, raw)
+			response.Header.Set("Content-Type", "application/json")
+			return response, nil
 		}
 		return nil, err
 	}
@@ -594,54 +605,89 @@ func (a *Adapter) handleMessageList(request *server.Request[server.MessageListPa
 }
 
 func parseMessageReferrer(raw map[string]any) (messageReferrer, error) {
-	result := messageReferrer{}
-	if raw == nil {
-		return result, nil
-	}
-
-	if msgIDRaw, ok := raw["msg_id"]; ok {
-		result.MsgID = fmt.Sprint(msgIDRaw)
-	}
-	if directRaw, ok := raw["direct"]; ok {
-		if direct, ok := asBool(directRaw); ok {
-			result.Direct = direct
+	result := messageReferrer{Raw: raw}
+	for key, target := range map[string]*string{"msg_id": &result.MsgID, "event_id": &result.EventID, "app_id": &result.AppID} {
+		if value, present := raw[key]; present && value != nil {
+			text, ok := value.(string)
+			if !ok {
+				return result, server.BadRequest(key + " must be a string")
+			}
+			*target = text
 		}
 	}
-	if seqRaw, ok := raw["msg_seq"]; ok {
-		parsed, ok := asInt64(seqRaw)
-		if ok {
-			seq, err := int64ToInt(parsed, "msg_seq")
-			if err != nil {
-				return result, err
-			}
-			result.MsgSeq = seq
-			result.HasMsgSeq = true
+	if value, present := raw["direct"]; present {
+		direct, ok := asBool(value)
+		if !ok {
+			return result, server.BadRequest("direct must be boolean")
+		}
+		result.Direct = direct
+	}
+	if value, present := raw["msg_seq"]; present {
+		seq, err := replySequence(value)
+		if err != nil {
+			return result, err
+		}
+		result.MsgSeq = seq
+		result.HasMsgSeq = true
+	}
+	if value, present := raw["msg_scene"]; present && value != nil {
+		data, err := json.Marshal(value)
+		if err != nil {
+			return result, server.BadRequest("invalid msg_scene")
+		}
+		if err := json.Unmarshal(data, &result.Scene); err != nil {
+			return result, server.BadRequest("invalid msg_scene")
 		}
 	}
 	return result, nil
 }
 
-func mergePassiveReferrer(referrer *messageReferrer, passive convert.QQPassiveReferrer) error {
-	if referrer == nil {
-		return nil
+func replySequence(raw any) (int, error) {
+	if number, ok := raw.(json.Number); ok {
+		value, err := number.Int64()
+		if err != nil {
+			return 0, server.BadRequest("msg_seq must be an integer")
+		}
+		raw = value
 	}
-	if msgID := strings.TrimSpace(passive.MsgID); msgID != "" {
-		referrer.MsgID = msgID
+	if number, ok := raw.(uint64); ok && number > math.MaxUint32 {
+		return 0, server.BadRequest("msg_seq exceeds QQ sequence range")
 	}
-	if !passive.HasMsgSeq {
-		return nil
+	if number, ok := raw.(uint); ok && uint64(number) > math.MaxUint32 {
+		return 0, server.BadRequest("msg_seq exceeds QQ sequence range")
 	}
 
-	parsed, ok := asInt64(passive.MsgSeq)
-	if !ok {
-		return server.BadRequest("qq:passive seq must be an integer")
+	if number, ok := raw.(float64); ok && (math.IsNaN(number) || math.IsInf(number, 0) || math.Trunc(number) != number) {
+		return 0, server.BadRequest("msg_seq must be an integer")
 	}
-	seq, err := int64ToInt(parsed, "qq:passive seq")
-	if err != nil {
-		return err
+	if number, ok := raw.(float32); ok && math.Trunc(float64(number)) != float64(number) {
+		return 0, server.BadRequest("msg_seq must be an integer")
 	}
-	referrer.MsgSeq = seq
-	referrer.HasMsgSeq = true
+	value, ok := asInt64(raw)
+	if !ok || value < -1 || value > math.MaxUint32 {
+		return 0, server.BadRequest("msg_seq must be between -1 and 4294967295")
+	}
+	return int64ToInt(value, "msg_seq")
+}
+
+func mergePassiveReferrer(referrer *messageReferrer, passive convert.QQPassiveReferrer) error {
+	if passive.MsgID != "" {
+		if referrer.MsgID != "" && referrer.MsgID != passive.MsgID {
+			return server.BadRequest("qq:passive id conflicts with referrer.msg_id")
+		}
+		referrer.MsgID = passive.MsgID
+	}
+	if passive.HasMsgSeq {
+		value, err := replySequence(passive.MsgSeq)
+		if err != nil {
+			return err
+		}
+		if referrer.HasMsgSeq && referrer.MsgSeq != value {
+			return server.BadRequest("qq:passive seq conflicts with referrer.msg_seq")
+		}
+		referrer.MsgSeq = value
+		referrer.HasMsgSeq = true
+	}
 	return nil
 }
 

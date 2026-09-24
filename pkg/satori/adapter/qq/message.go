@@ -34,6 +34,10 @@ type messageSender struct {
 type messageReferrer struct {
 	Direct    bool
 	MsgID     string
+	EventID   string
+	AppID     string
+	Scene     dto.MessageScene
+	Raw       map[string]any
 	MsgSeq    int
 	HasMsgSeq bool
 }
@@ -42,6 +46,7 @@ type messageCreateInput struct {
 	Platform  string
 	ChannelID string
 	Content   string
+	Segments  []convert.MessageSegment
 	Referrer  messageReferrer
 }
 
@@ -63,25 +68,31 @@ func (s *messageSender) Send(ctx context.Context, input messageCreateInput) ([]*
 }
 
 func (s *messageSender) sendQQGuild(ctx context.Context, input messageCreateInput) ([]*message.Message, error) {
+	input.Referrer.Direct = input.Referrer.Direct || strings.Contains(input.ChannelID, "_")
 	if s.api == nil {
 		return []*message.Message{}, nil
 	}
 
-	segments := convert.ParseMessageSegments(input.Content, "qqguild")
+	segments := input.Segments
 	seq := newSeqCounter(input.Referrer)
 	result := make([]*message.Message, 0, len(segments))
 	for _, segment := range segments {
-		if input.Referrer.MsgID != "" && seq.Current() >= 5 {
-			break
+		if seq.Current() >= int(^uint32(0)) {
+			return result, server.BadRequest("QQ reply sequence is exhausted")
 		}
 
-		msg, err := s.sendQQGuildSegment(ctx, input, segment)
+		piece := input
+		piece.Referrer.MsgSeq = seq.Next()
+		msg, err := s.sendQQGuildSegment(ctx, piece, segment)
 		if err != nil {
-			return nil, err
+			return result, err
 		}
 		if msg != nil {
+			if msg.Id == "" {
+				return result, errors.New("QQ send response has no message ID")
+			}
+			s.attachReplyContext(msg, input.Referrer, seq.Current())
 			result = append(result, msg)
-			seq.Next()
 		}
 	}
 	return result, nil
@@ -94,6 +105,8 @@ func (s *messageSender) sendQQGuildSegment(
 ) (*message.Message, error) {
 	payload := &dto.MessageToCreate{
 		MsgID:            input.Referrer.MsgID,
+		EventID:          input.Referrer.EventID,
+		MsgSeq:           uint32(input.Referrer.MsgSeq),
 		MessageReference: makeMessageReference(segment.QuoteID),
 	}
 
@@ -220,7 +233,6 @@ func (s *messageSender) callQQGuildMultipartAPI(ctx context.Context, channelID s
 }
 
 func makeMessageReference(messageID string) *dto.MessageReference {
-	messageID = strings.TrimSpace(messageID)
 	if messageID == "" {
 		return nil
 	}
@@ -235,15 +247,16 @@ func (s *messageSender) sendQQ(ctx context.Context, input messageCreateInput) ([
 		return []*message.Message{}, nil
 	}
 
-	segments := convert.ParseMessageSegments(input.Content, "qq")
+	segments := input.Segments
 	seq := newSeqCounter(input.Referrer)
 	targetID, privateTarget := convert.SplitPrivateChannelID(input.ChannelID)
 	isDirect := input.Referrer.Direct || privateTarget
+	input.Referrer.Direct = isDirect
 
 	result := make([]*message.Message, 0, len(segments))
 	for _, segment := range segments {
-		if input.Referrer.MsgID != "" && seq.Current() >= 5 {
-			break
+		if seq.Current() >= int(^uint32(0)) {
+			return result, server.BadRequest("QQ reply sequence is exhausted")
 		}
 		var created *dto.Message
 		var err error
@@ -258,12 +271,14 @@ func (s *messageSender) sendQQ(ctx context.Context, input messageCreateInput) ([
 			created, err = s.sendQQResource(ctx, targetID, isDirect, segment, input.Referrer, seq.Next())
 		}
 		if err != nil {
-			return nil, err
+			return result, err
 		}
-		if created == nil || s.convertMessage == nil {
-			continue
+		if created == nil || created.ID == "" {
+			return result, errors.New("QQ send response has no message ID")
 		}
-		result = append(result, s.convertMessage(created, "qq"))
+		converted := s.convertMessage(created, "qq")
+		s.attachReplyContext(converted, input.Referrer, seq.Current())
+		result = append(result, converted)
 	}
 	return result, nil
 }
@@ -281,10 +296,12 @@ func (s *messageSender) sendQQArk(
 		return s.sendQQText(ctx, targetID, isDirect, convert.MessageSegment{Text: segment.ArkJSON}, referrer, seq)
 	}
 	payload := &dto.MessageToCreate{
-		MsgType: 3,
-		Ark:     ark,
-		MsgID:   resolveQQMsgID(referrer.MsgID, segment.QuoteID),
-		MsgSeq:  uint32(seq),
+		MsgType:          3,
+		Ark:              ark,
+		MsgID:            referrer.MsgID,
+		EventID:          referrer.EventID,
+		MessageReference: replyReference(referrer, segment.QuoteID),
+		MsgSeq:           uint32(seq),
 	}
 	return s.callQQMessageAPI(ctx, targetID, isDirect, payload)
 }
@@ -302,9 +319,11 @@ func (s *messageSender) sendQQMarkdown(
 		markdownContent = " "
 	}
 	payload := &dto.MessageToCreate{
-		MsgType: 2,
-		MsgID:   resolveQQMsgID(referrer.MsgID, segment.QuoteID),
-		MsgSeq:  uint32(seq),
+		MsgType:          2,
+		MsgID:            referrer.MsgID,
+		EventID:          referrer.EventID,
+		MessageReference: replyReference(referrer, segment.QuoteID),
+		MsgSeq:           uint32(seq),
 		Markdown: &dto.Markdown{
 			Content: markdownContent,
 		},
@@ -328,9 +347,11 @@ func (s *messageSender) sendQQText(
 		return nil, nil
 	}
 	payload := &dto.MessageToCreate{
-		Content: content,
-		MsgID:   resolveQQMsgID(referrer.MsgID, segment.QuoteID),
-		MsgSeq:  uint32(seq),
+		Content:          content,
+		MsgID:            referrer.MsgID,
+		EventID:          referrer.EventID,
+		MessageReference: replyReference(referrer, segment.QuoteID),
+		MsgSeq:           uint32(seq),
 	}
 	return s.callQQMessageAPI(ctx, targetID, isDirect, payload)
 }
@@ -369,7 +390,7 @@ func (s *messageSender) sendQQResource(ctx context.Context, targetID string, isD
 	if uploaded == nil || uploaded.FileInfo == "" {
 		return nil, errors.New("QQ upload response has no file_info")
 	}
-	payload := &dto.MessageToCreate{Content: " ", MsgType: dto.RichMediaMsg, MsgID: resolveQQMsgID(referrer.MsgID, segment.QuoteID), MsgSeq: uint32(seq), Media: &dto.MediaInfo{FileInfo: uploaded.FileInfo}}
+	payload := &dto.MessageToCreate{Content: " ", MsgType: dto.RichMediaMsg, MsgID: referrer.MsgID, EventID: referrer.EventID, MessageReference: replyReference(referrer, segment.QuoteID), MsgSeq: uint32(seq), Media: &dto.MediaInfo{FileInfo: uploaded.FileInfo}}
 	return s.callQQMessageAPI(ctx, targetID, isDirect, payload)
 }
 
@@ -480,12 +501,33 @@ func buildKeyboardFromButtons(rows [][]convert.MessageButton) *keyboard.MessageK
 	}
 }
 
-func resolveQQMsgID(defaultMsgID string, quoteID string) string {
-	quoteID = strings.TrimSpace(quoteID)
-	if quoteID != "" {
-		return quoteID
+func replyReference(referrer messageReferrer, quoteID string) *dto.MessageReference {
+	if quoteID == referrer.MsgID {
+		if index, ok := referrer.Scene.GetExt("msg_idx"); ok {
+			quoteID = index
+		}
 	}
-	return strings.TrimSpace(defaultMsgID)
+	return makeMessageReference(quoteID)
+}
+
+func (s *messageSender) attachReplyContext(result *message.Message, referrer messageReferrer, sequence int) {
+	if result == nil {
+		return
+	}
+	output := make(map[string]any, len(referrer.Raw)+5)
+	for key, value := range referrer.Raw {
+		output[key] = value
+	}
+	output["msg_id"] = referrer.MsgID
+	output["event_id"] = referrer.EventID
+	output["msg_seq"] = sequence
+	output["direct"] = referrer.Direct
+	output["app_id"] = s.state.appID
+	delete(output, "ref_idx")
+	if index, ok := result.Referrer["ref_idx"]; ok {
+		output["ref_idx"] = index
+	}
+	result.Referrer = output
 }
 
 type seqCounter struct {

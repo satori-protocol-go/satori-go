@@ -560,3 +560,82 @@ func TestQQNativeEvents(t *testing.T) {
 		})
 	}
 }
+
+func TestQQReplyContext(t *testing.T) {
+	f := newQQFixture(t, nil)
+	result, err := f.call("message.create", "qq", "bot-123", map[string]any{
+		"channel_id": "group", "content": `<quote id="REFIDX_quoted=="/>reply<message>next</message>`,
+		"referrer": map[string]any{"msg_id": "incoming", "event_id": "reply-event", "msg_seq": 2, "app_id": "123"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	sent := result.([]*message.Message)
+	if len(sent) != 2 || sent[1].Referrer["msg_seq"] != 4 || sent[1].Referrer["ref_idx"] != "REFIDX_sent==" {
+		t.Fatalf("reply results=%+v", sent)
+	}
+	var calls []qqRequest
+	for _, item := range f.requests() {
+		if item.Path == "/v2/groups/group/messages" {
+			calls = append(calls, item)
+		}
+	}
+	for i, item := range calls {
+		if string(item.Fields["msg_id"]) != `"incoming"` || string(item.Fields["event_id"]) != `"reply-event"` || string(item.Fields["msg_seq"]) != strconv.Itoa(3+i) {
+			t.Fatalf("independent reply fields=%s", item.Raw)
+		}
+	}
+	if !bytes.Contains(calls[0].Fields["message_reference"], []byte("REFIDX_quoted==")) {
+		t.Fatalf("quote=%s", calls[0].Raw)
+	}
+	result, err = f.call("message.create", "qq", "bot-123", map[string]any{"channel_id": "group", "content": "continued", "referrer": sent[1].Referrer})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.([]*message.Message)[0].Referrer["msg_seq"] != 5 {
+		t.Fatalf("continued context=%+v", result)
+	}
+	content := strings.Repeat("<message>piece</message>", 7)
+	result, err = f.call("message.create", "qq", "bot-123", map[string]any{"channel_id": "group", "content": content, "referrer": map[string]any{"msg_id": "incoming", "msg_seq": 5}})
+	if err != nil || len(result.([]*message.Message)) != 7 {
+		t.Fatalf("segmented reply=%+v err=%v", result, err)
+	}
+	result, err = f.call("message.create", "qq", "bot-123", map[string]any{"channel_id": "group", "content": `<qq:passive id="incoming" seq="7"/>passive`})
+	if err != nil || result.([]*message.Message)[0].Referrer["msg_seq"] != 8 {
+		t.Fatalf("passive context=%+v err=%v", result, err)
+	}
+	for _, input := range []map[string]any{
+		{"msg_id": "conflict", "msg_seq": 7}, {"msg_id": "incoming", "msg_seq": 6}, {"msg_seq": json.Number("1.5")},
+	} {
+		_, err = f.call("message.create", "qq", "bot-123", map[string]any{"channel_id": "group", "content": `<qq:passive id="incoming" seq="7"/>text`, "referrer": input})
+		var status interface{ HTTPStatus() int }
+		if !errors.As(err, &status) || status.HTTPStatus() != 400 {
+			t.Fatalf("conflicting context result=%v", err)
+		}
+	}
+	f.mu.Lock()
+	f.extra = func(w http.ResponseWriter, r *http.Request, item qqRequest) bool {
+		if r.URL.Path == "/v2/groups/partial/messages" && string(item.Fields["content"]) == `"second"` {
+			w.WriteHeader(403)
+			w.Write([]byte(`{"err_code":11253}`))
+			return true
+		}
+		return false
+	}
+	f.mu.Unlock()
+	result, err = f.call("message.create", "qq", "bot-123", map[string]any{"channel_id": "partial", "content": "<message>first</message><message>second</message>"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	response := result.(*server.Response)
+	var partial struct {
+		Error    string             `json:"error"`
+		Messages []*message.Message `json:"messages"`
+	}
+	if err := json.Unmarshal(response.Body, &partial); err != nil {
+		t.Fatal(err)
+	}
+	if response.StatusCode != 403 || len(partial.Messages) != 1 || partial.Messages[0].Id == "" || partial.Error == "" {
+		t.Fatalf("partial result=%d %s", response.StatusCode, response.Body)
+	}
+}
