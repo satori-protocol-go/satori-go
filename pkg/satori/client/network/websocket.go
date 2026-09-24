@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/gorilla/websocket"
@@ -16,6 +17,14 @@ import (
 	"github.com/satori-protocol-go/satori-go/pkg/satori/model/operation"
 	"github.com/satori-protocol-go/satori-go/pkg/satori/protocol"
 )
+
+const eventQueueSize = 128
+const pingInterval = 10 * time.Second
+
+type wsFrame struct {
+	Op   *operation.Opcode `json:"op"`
+	Body json.RawMessage   `json:"body"`
+}
 
 type WS struct {
 	base   *baseNetwork
@@ -27,7 +36,8 @@ type WS struct {
 	conn      *websocket.Conn
 	runCancel context.CancelFunc
 
-	writeMu sync.Mutex
+	writeMu          sync.Mutex
+	heartbeatPending atomic.Bool
 }
 
 func NewWS(app AppBridge, options WebSocketOptions) *WS {
@@ -129,7 +139,7 @@ func (n *WS) Close() error {
 }
 
 func (n *WS) Alive() bool {
-	return n.connection() != nil
+	return n.base.Available() && n.connection() != nil
 }
 
 func (n *WS) WaitForAvailable(ctx context.Context) error {
@@ -147,33 +157,49 @@ func (n *WS) connectAndServe(ctx context.Context) error {
 	wsEndpoint := joinURLPath(n.wsBase, "events")
 	connection, response, err := n.dialer.DialContext(ctx, wsEndpoint, nil)
 	if err != nil {
-		if response != nil {
+		if response != nil && response.Body != nil {
 			_ = response.Body.Close()
 		}
 		return err
 	}
 	n.setConnection(connection)
-	defer n.closeConnection()
-	n.base.MarkAvailable()
-
+	workCtx, cancel := context.WithCancel(ctx)
+	closeOnCancel := context.AfterFunc(workCtx, func() { _ = connection.Close() })
+	var workers sync.WaitGroup
+	defer func() {
+		cancel()
+		closeOnCancel()
+		n.closeConnection()
+		workers.Wait()
+		n.base.MarkUnavailable()
+	}()
+	n.heartbeatPending.Store(false)
 	if err := n.authenticate(connection); err != nil {
 		return err
 	}
-
-	recvErr := make(chan error, 1)
-	heartbeatCtx, cancelHeartbeat := context.WithCancel(ctx)
-	defer cancelHeartbeat()
-
-	go func() {
-		recvErr <- n.receiveLoop(connection)
-	}()
-	go n.heartbeatLoop(heartbeatCtx)
-
-	select {
-	case <-ctx.Done():
-		return ctx.Err()
-	case err := <-recvErr:
+	if err := workCtx.Err(); err != nil {
 		return err
+	}
+	n.base.MarkAvailable()
+
+	frames := make(chan wsFrame, eventQueueSize)
+	results := make(chan error, 2)
+	workers.Add(2)
+	go func() { defer workers.Done(); results <- n.receiveLoop(workCtx, connection, frames) }()
+	go func() { defer workers.Done(); results <- n.dispatchFrames(workCtx, frames) }()
+	ticker := time.NewTicker(pingInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-workCtx.Done():
+			return workCtx.Err()
+		case err := <-results:
+			return err
+		case <-ticker.C:
+			if err := n.heartbeatTick(); err != nil {
+				return err
+			}
+		}
 	}
 }
 
@@ -189,7 +215,7 @@ func (n *WS) authenticate(connection *websocket.Conn) error {
 		return err
 	}
 
-	_ = connection.SetReadDeadline(time.Now().Add(30 * time.Second))
+	_ = connection.SetReadDeadline(time.Now().Add(10 * time.Second))
 	_, payload, err := connection.ReadMessage()
 	_ = connection.SetReadDeadline(time.Time{})
 	if err != nil {
@@ -222,65 +248,82 @@ func (n *WS) authenticate(connection *websocket.Conn) error {
 	return nil
 }
 
-func (n *WS) receiveLoop(connection *websocket.Conn) error {
+func (n *WS) receiveLoop(ctx context.Context, connection *websocket.Conn, frames chan<- wsFrame) error {
+	defer close(frames)
 	for {
 		_, payload, err := connection.ReadMessage()
 		if err != nil {
 			return err
 		}
-
-		var frame struct {
-			Op   operation.Opcode `json:"op"`
-			Body json.RawMessage  `json:"body"`
-		}
+		var frame wsFrame
 		if err := decodeJSON(payload, &frame); err != nil {
-			continue
+			return err
 		}
-
-		switch frame.Op {
-		case operation.OpcodeEvent:
-			var evt event.Event
-			if err := decodeJSON(frame.Body, &evt); err != nil {
-				n.base.Log(context.Background(), logging.LevelWarn, fmt.Sprintf("failed to parse event payload network_id=%s error=%v", n.ID(), err))
-				continue
-			}
-			n.base.SetSequence(evt.Sn)
-			// Keep receive loop responsive even with slow callbacks.
-			go n.base.app.PostEvent(n.ID(), &evt)
-
-		case operation.OpcodeMeta:
-			var metaPayload operation.MetaBody
-			if err := decodeJSON(frame.Body, &metaPayload); err != nil {
-				continue
-			}
-			n.base.SetProxyURLs(metaPayload.ProxyUrls)
-			n.base.app.UpdateProxyURLs(n.ID(), metaPayload.ProxyUrls)
-
+		if frame.Op == nil {
+			return errors.New("Satori frame has no opcode")
+		}
+		switch *frame.Op {
 		case operation.OpcodePong:
-			continue
-
+			n.heartbeatPending.Store(false)
+		case operation.OpcodeEvent, operation.OpcodeMeta:
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case frames <- frame:
+			}
 		default:
-			if frame.Op > operation.OpcodeMeta {
-				n.base.Log(context.Background(), logging.LevelWarn, fmt.Sprintf("received unknown opcode network_id=%s opcode=%d", n.ID(), frame.Op))
+			n.base.Log(ctx, logging.LevelDebug, fmt.Sprintf("unhandled Satori opcode network_id=%s opcode=%d", n.ID(), *frame.Op))
+		}
+	}
+}
+
+// dispatchFrames serializes state changes and callbacks for this connection.
+// Advancing sn records a completed local processing attempt, not durable delivery.
+func (n *WS) dispatchFrames(ctx context.Context, frames <-chan wsFrame) error {
+	for {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case frame, open := <-frames:
+			if !open {
+				return nil
+			}
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+			switch *frame.Op {
+			case operation.OpcodeEvent:
+				var evt event.Event
+				if err := decodeJSON(frame.Body, &evt); err != nil {
+					return err
+				}
+				if evt.Login == nil || evt.Type == "" || evt.Sn < 0 {
+					return errors.New("invalid Satori event envelope")
+				}
+				if err := n.base.app.PostEvent(n.ID(), &evt); err != nil {
+					n.base.Log(ctx, logging.LevelError, fmt.Sprintf("event handling failed network_id=%s event_sn=%d error=%v", n.ID(), evt.Sn, err))
+				}
+				n.base.SetSequence(evt.Sn)
+			case operation.OpcodeMeta:
+				var metaPayload operation.MetaBody
+				if err := decodeJSON(frame.Body, &metaPayload); err != nil {
+					return err
+				}
+				n.base.SetProxyURLs(metaPayload.ProxyUrls)
+				n.base.app.UpdateProxyURLs(n.ID(), metaPayload.ProxyUrls)
 			}
 		}
 	}
 }
 
-func (n *WS) heartbeatLoop(ctx context.Context) {
-	ticker := time.NewTicker(9 * time.Second)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-ticker.C:
-			if err := n.sendJSON(map[string]any{"op": operation.OpcodePing}); err != nil {
-				return
-			}
-		}
+func (n *WS) heartbeatTick() error {
+	if n.heartbeatPending.Swap(true) {
+		return errors.New("Satori PONG timeout")
 	}
+	return n.sendJSON(map[string]any{"op": operation.OpcodePing})
 }
 
 func (n *WS) sendJSON(payload any) error {
@@ -290,6 +333,9 @@ func (n *WS) sendJSON(payload any) error {
 	connection := n.connection()
 	if connection == nil {
 		return errors.New("websocket connection is not established")
+	}
+	if err := connection.SetWriteDeadline(time.Now().Add(10 * time.Second)); err != nil {
+		return err
 	}
 	return connection.WriteJSON(payload)
 }
