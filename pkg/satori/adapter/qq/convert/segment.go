@@ -18,8 +18,9 @@ const (
 )
 
 type MessageResource struct {
-	Kind MessageResourceKind
-	Src  string
+	Kind  MessageResourceKind
+	Src   string
+	Title string
 }
 
 type MessageSegment struct {
@@ -120,13 +121,13 @@ func (p *qqMessageParser) walk(elements []element.Element) {
 			}
 			p.walk(typed.Children())
 		case *element.Img:
-			p.appendResource(MessageResourceImage, typed.Src)
+			p.appendResource(MessageResourceImage, typed.Src, typed.Title)
 		case *element.Audio:
-			p.appendResource(MessageResourceAudio, typed.Src)
+			p.appendResource(MessageResourceAudio, typed.Src, typed.Title)
 		case *element.Video:
-			p.appendResource(MessageResourceVideo, typed.Src)
+			p.appendResource(MessageResourceVideo, typed.Src, typed.Title)
 		case *element.File:
-			p.appendResource(MessageResourceFile, typed.Src)
+			p.appendResource(MessageResourceFile, typed.Src, typed.Title)
 		case *element.Extension:
 			if p.tryAppendExtendedSegment(typed) {
 				continue
@@ -168,12 +169,12 @@ func (p *qqMessageParser) flushText() {
 	p.currentText.Reset()
 }
 
-func (p *qqMessageParser) appendResource(kind MessageResourceKind, src string) {
+func (p *qqMessageParser) appendResource(kind MessageResourceKind, src, title string) {
 	if src == "" {
 		return
 	}
 	p.flushText()
-	p.segments = append(p.segments, MessageSegment{QuoteID: p.consumeQuote(), Resource: &MessageResource{Kind: kind, Src: src}})
+	p.segments = append(p.segments, MessageSegment{QuoteID: p.consumeQuote(), Resource: &MessageResource{Kind: kind, Src: src, Title: title}})
 }
 
 func (p *qqMessageParser) consumeQuote() string {
