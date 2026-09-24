@@ -1027,6 +1027,7 @@ func (s *Server) findRouteHandler(action string, platform string, selfID string)
 	routers := append([]Router(nil), s.routers...)
 	s.mu.RUnlock()
 
+	var selected RouteCall[any, any]
 	for _, adapter := range adapters {
 		handler, ok := matchRoute(adapter.Routes(), action)
 		if !ok {
@@ -1035,7 +1036,15 @@ func (s *Server) findRouteHandler(action string, platform string, selfID string)
 		if !adapter.Ensure(platform, selfID) {
 			continue
 		}
-		return handler, true
+		if selected != nil {
+			return func(*Request[any]) (any, error) {
+				return nil, NewActionError(409, "ambiguous platform account route", nil)
+			}, true
+		}
+		selected = handler
+	}
+	if selected != nil {
+		return selected, true
 	}
 
 	if handler, ok := matchRoute(serverRoutes, action); ok {

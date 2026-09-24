@@ -279,7 +279,18 @@ func valueOrDefaultFeatures(values []string, defaults []string) []string {
 	if len(values) == 0 {
 		return copyStrings(defaults)
 	}
-	return copyStrings(values)
+	allowed := make(map[string]bool, len(defaults))
+	for _, value := range defaults {
+		allowed[value] = true
+	}
+	result := make([]string, 0, len(values))
+	for _, value := range values {
+		if allowed[value] {
+			result = append(result, value)
+			delete(allowed, value)
+		}
+	}
+	return result
 }
 
 func copyUser(item *user.User) *user.User {

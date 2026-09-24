@@ -33,6 +33,16 @@ var defaultQQFeatures = []string{
 }
 
 var defaultQQGuildFeatures = []string{
+	"channel.update",
+	"channel.delete",
+	"message.update",
+	"message.list",
+	"guild.member.role.set",
+	"guild.member.role.unset",
+	"guild.role.list",
+	"guild.role.create",
+	"guild.role.update",
+	"guild.role.delete",
 	"channel.get",
 	"channel.list",
 	"channel.create",
