@@ -8,6 +8,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/satori-protocol-go/satori-go/pkg/satori/logging"
 	"github.com/satori-protocol-go/satori-go/pkg/satori/model/login"
 )
 
@@ -66,10 +67,11 @@ type ProtocolFactory func(*Account) *APIProtocol
 type Account struct {
 	*APIProtocol
 
-	Adapter  string
-	SelfInfo *login.Login
-	Config   APIConfig
+	// Protocol is initialized once. Mutable login/config state is accessed through snapshots.
 	Protocol *APIProtocol
+	logger   logging.Logger
+	selfInfo *login.Login
+	config   APIConfig
 
 	mu        sync.RWMutex
 	proxyURLs []string
@@ -81,10 +83,13 @@ func NewAccount(selfInfo *login.Login, cfg APIConfig, proxyURLs []string, protoc
 	if selfInfo == nil {
 		selfInfo = &login.Login{}
 	}
+	if cfg == nil {
+		cfg = APIInfo{}
+	}
 	account := &Account{
-		Adapter:  selfInfo.Adapter,
-		SelfInfo: selfInfo,
-		Config:   cfg,
+		logger:   logging.NewStdLogger(),
+		selfInfo: selfInfo.Clone(),
+		config:   cfg,
 		ready:    make(chan struct{}),
 	}
 	account.SetProxyURLs(proxyURLs)
@@ -102,22 +107,42 @@ func NewAccount(selfInfo *login.Login, cfg APIConfig, proxyURLs []string, protoc
 	return account
 }
 
+// SelfInfo returns a consistent login snapshot, safe to read or modify by the caller.
+func (a *Account) SelfInfo() *login.Login {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	return a.selfInfo.Clone()
+}
+
+// Config returns the configured API source. Configuration objects are immutable after use.
+func (a *Account) Config() APIConfig {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	return a.config
+}
+
+func (a *Account) Adapter() string {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	return a.selfInfo.Adapter
+}
+
 func (a *Account) Platform() string {
 	a.mu.RLock()
 	defer a.mu.RUnlock()
-	if a.SelfInfo == nil || strings.TrimSpace(a.SelfInfo.Platform) == "" {
-		return "satori"
+	if a.selfInfo == nil {
+		return ""
 	}
-	return a.SelfInfo.Platform
+	return a.selfInfo.Platform
 }
 
 func (a *Account) SelfID() string {
 	a.mu.RLock()
 	defer a.mu.RUnlock()
-	if a.SelfInfo == nil || a.SelfInfo.User == nil {
+	if a.selfInfo == nil || a.selfInfo.User == nil {
 		return ""
 	}
-	return a.SelfInfo.User.Id
+	return a.selfInfo.User.Id
 }
 
 func (a *Account) Connected() bool {
@@ -129,7 +154,32 @@ func (a *Account) Connected() bool {
 func (a *Account) SetConnected(connected bool) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
+	info := a.selfInfo.Clone()
+	if info == nil {
+		info = &login.Login{}
+	}
+	info.Status = login.LoginStatusOffline
+	if connected {
+		info.Status = login.LoginStatusOnline
+	}
+	a.selfInfo = info
+	a.setConnectedLocked(connected)
+}
 
+func (a *Account) apply(info *login.Login, config APIConfig, proxies []string) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if info != nil {
+		a.selfInfo = info.Clone()
+	}
+	if config != nil {
+		a.config = config
+	}
+	a.proxyURLs = append([]string(nil), proxies...)
+	a.setConnectedLocked(a.selfInfo != nil && a.selfInfo.Status == login.LoginStatusOnline)
+}
+
+func (a *Account) setConnectedLocked(connected bool) {
 	if connected {
 		if a.connected {
 			return
@@ -204,12 +254,12 @@ func (a *Account) EnsureURL(raw string) string {
 	}
 
 	if strings.HasPrefix(raw, "internal:") {
-		return joinURLPath(a.Config.APIBase(), "proxy", url.PathEscape(strings.TrimLeft(raw, "/")))
+		return joinURLPath(a.Config().APIBase(), "proxy", url.PathEscape(strings.TrimLeft(raw, "/")))
 	}
 
 	for _, prefix := range a.ProxyURLs() {
 		if strings.HasPrefix(raw, prefix) {
-			return joinURLPath(a.Config.APIBase(), "proxy", url.PathEscape(strings.TrimLeft(raw, "/")))
+			return joinURLPath(a.Config().APIBase(), "proxy", url.PathEscape(strings.TrimLeft(raw, "/")))
 		}
 	}
 
@@ -233,7 +283,7 @@ func (a *Account) Custom(config APIConfig, protocolFactory ProtocolFactory) *Acc
 
 func (a *Account) CustomWith(options ...CustomOption) *Account {
 	settings := &customOptions{
-		config: a.Config,
+		config: a.Config(),
 	}
 	for _, option := range options {
 		if option == nil {
@@ -248,11 +298,34 @@ func (a *Account) CustomWith(options ...CustomOption) *Account {
 		config = *settings.apiInfo
 	}
 	if config == nil {
-		config = a.Config
+		config = a.Config()
 	}
-	return NewAccount(a.SelfInfo, config, a.ProxyURLs(), settings.protocolFactory)
+	result := NewAccount(a.SelfInfo(), config, a.ProxyURLs(), settings.protocolFactory)
+	a.mu.RLock()
+	logger := a.logger
+	a.mu.RUnlock()
+	result.RegisterLogger(logger)
+	return result
 }
 
 func (a *Account) String() string {
 	return fmt.Sprintf("<Account %s (%s)>", a.SelfID(), a.Platform())
+}
+
+// RegisterLogger sets this account's API logger. It can be replaced while running.
+func (a *Account) RegisterLogger(logger logging.Logger) {
+	if logger == nil {
+		logger = logging.NopLogger{}
+	}
+	a.mu.Lock()
+	a.logger = logger
+	a.mu.Unlock()
+}
+func (a *Account) log(ctx context.Context, level logging.Level, values ...any) {
+	a.mu.RLock()
+	logger := a.logger
+	a.mu.RUnlock()
+	if logger != nil {
+		logger.Log(ctx, level, values...)
+	}
 }

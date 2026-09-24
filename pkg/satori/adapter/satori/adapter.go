@@ -117,10 +117,10 @@ func (a *Adapter) Cleanup(_ context.Context) error {
 
 func (a *Adapter) GetLogins(_ context.Context) ([]*login.Login, error) {
 	account := a.Account()
-	if account == nil || account.SelfInfo == nil {
+	if account == nil || account.SelfInfo() == nil {
 		return []*login.Login{}, nil
 	}
-	return []*login.Login{cloneLogin(account.SelfInfo)}, nil
+	return []*login.Login{cloneLogin(account.SelfInfo())}, nil
 }
 
 func (a *Adapter) ProxyUrls() []string {
