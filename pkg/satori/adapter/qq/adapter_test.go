@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"github.com/satori-protocol-go/satori-go/pkg/satori/protocol"
 	"net/http"
@@ -646,5 +647,22 @@ func TestQQAdapterMessageCreateQQPassiveReferrerInvalidSeq(t *testing.T) {
 	})
 	if err == nil {
 		t.Fatal("expected message.create to fail when qq:passive seq is invalid")
+	}
+}
+
+func TestQQCapabilityResponses(t *testing.T) {
+	adapter := newQQTestAdapter(t, &qqMockOpenAPI{})
+	for _, tc := range []struct {
+		action string
+		status int
+	}{
+		{"channel.mute", 404}, {"guild.get", 501}, {"guild.member.approve", 501},
+	} {
+		route := adapter.Routes()[tc.action]
+		_, err := route(&satoriserver.Request[any]{Action: tc.action, Platform: "qq", Params: map[string]any{"guild_id": "g", "channel_id": "c", "message_id": "m"}})
+		var result interface{ HTTPStatus() int }
+		if !errors.As(err, &result) || result.HTTPStatus() != tc.status {
+			t.Errorf("%s status=%v", tc.action, err)
+		}
 	}
 }

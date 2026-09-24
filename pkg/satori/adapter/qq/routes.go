@@ -140,6 +140,9 @@ func (a *Adapter) handleChannelMute(_ *server.Request[server.ChannelMuteParam]) 
 }
 
 func (a *Adapter) handleGuildGet(request *server.Request[server.GuildGetParam]) (any, error) {
+	if request.Platform == "qq" {
+		return nil, server.NewActionError(501, "guild.get is not implemented for QQ groups yet", nil)
+	}
 	if request.Platform != "qqguild" {
 		return nil, server.NotFound("guild.get is not supported in current platform")
 	}
@@ -375,6 +378,9 @@ func (a *Adapter) handleLoginGet(request *server.Request[server.LoginGetParam]) 
 }
 
 func (a *Adapter) handleGuildMemberGet(request *server.Request[server.GuildMemberGetParam]) (any, error) {
+	if request.Platform == "qq" {
+		return nil, server.NewActionError(501, "guild.member.get is not implemented for QQ groups yet", nil)
+	}
 	if request.Platform != "qqguild" {
 		return nil, server.NotFound("guild.member.get is not supported in current platform")
 	}
@@ -397,6 +403,9 @@ func (a *Adapter) handleGuildMemberGet(request *server.Request[server.GuildMembe
 }
 
 func (a *Adapter) handleGuildMemberList(request *server.Request[server.GuildListByGuildParam]) (any, error) {
+	if request.Platform == "qq" {
+		return nil, server.NewActionError(501, "guild.member.list is not implemented for QQ groups yet", nil)
+	}
 	if request.Platform != "qqguild" {
 		return nil, server.NotFound("guild.member.list is not supported in current platform")
 	}
@@ -431,6 +440,9 @@ func (a *Adapter) handleGuildMemberList(request *server.Request[server.GuildList
 }
 
 func (a *Adapter) handleGuildMemberKick(request *server.Request[server.GuildMemberKickParam]) (any, error) {
+	if request.Platform == "qq" {
+		return nil, server.NewActionError(501, "guild.member.kick is not implemented for QQ groups yet", nil)
+	}
 	if request.Platform != "qqguild" {
 		return nil, server.NotFound("guild.member.kick is not supported in current platform")
 	}
@@ -449,6 +461,9 @@ func (a *Adapter) handleGuildMemberKick(request *server.Request[server.GuildMemb
 }
 
 func (a *Adapter) handleGuildMemberMute(request *server.Request[server.GuildMemberMuteParam]) (any, error) {
+	if request.Platform == "qq" {
+		return nil, server.NewActionError(501, "guild.member.mute is not implemented for QQ groups yet", nil)
+	}
 	if request.Platform != "qqguild" {
 		return nil, server.NotFound("guild.member.mute is not supported in current platform")
 	}
@@ -943,7 +958,10 @@ func (a *Adapter) registerRoutes() {
 }
 
 func unsupportedRoute(action string) server.RouteCall[any, any] {
-	return func(_ *server.Request[any]) (any, error) {
+	return func(request *server.Request[any]) (any, error) {
+		if request.Platform == "qq" && (action == "guild.approve" || action == "guild.member.approve") {
+			return nil, server.NewActionError(501, action+" is not implemented by this adapter", nil)
+		}
 		return nil, server.NotFound(action + " is not supported")
 	}
 }
