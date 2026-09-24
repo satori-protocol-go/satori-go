@@ -213,7 +213,7 @@ func (a *Adapter) Ensure(platform string, selfID string) bool {
 	return false
 }
 
-func (a *Adapter) HandleProxied(prefix string, rawURL string) (*server.Response, error) {
+func (a *Adapter) HandleProxied(ctx context.Context, prefix string, rawURL string) (*server.Response, error) {
 	_ = prefix
 	_ = rawURL
 	return nil, server.NotFound("proxy is not supported")

@@ -25,7 +25,7 @@ type Provider interface {
 	ProxyUrls() []string
 	Ensure(platform string, selfID string) bool
 	HandleInternal(request Request[map[string]any], path string) (*Response, error)
-	HandleProxied(prefix string, rawURL string) (*Response, error)
+	HandleProxied(ctx context.Context, prefix string, rawURL string) (*Response, error)
 }
 
 type Adapter interface {

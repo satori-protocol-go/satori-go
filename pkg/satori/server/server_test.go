@@ -45,6 +45,11 @@ func (m *mockProvider) ProxyUrls() []string {
 }
 
 func (m *mockProvider) Ensure(platform string, selfID string) bool {
+	for _, info := range m.logins {
+		if info.User != nil && info.Platform == platform && info.User.Id == selfID {
+			return true
+		}
+	}
 	return platform == "mock" && selfID == "bot"
 }
 
@@ -57,7 +62,7 @@ func (m *mockProvider) HandleInternal(
 	return nil, satoriserver.NotFound("not found")
 }
 
-func (m *mockProvider) HandleProxied(prefix string, rawURL string) (*satoriserver.Response, error) {
+func (m *mockProvider) HandleProxied(ctx context.Context, prefix string, rawURL string) (*satoriserver.Response, error) {
 	_ = prefix
 	_ = rawURL
 	return nil, nil
@@ -262,6 +267,9 @@ func TestServerDefaultUploadAndProxy(t *testing.T) {
 		t.Fatalf("new server failed: %v", err)
 	}
 	defer server.Close()
+	if err := server.Apply(&mockProvider{logins: []*login.Login{{Sn: 1, Platform: "mock", User: &user.User{Id: "other"}}}}); err != nil {
+		t.Fatal(err)
+	}
 
 	httpServer := newTestHTTPServer(t, server)
 	defer httpServer.Close()
@@ -325,6 +333,57 @@ func TestServerDefaultUploadAndProxy(t *testing.T) {
 	if string(data) != "hello-upload" {
 		t.Fatalf("proxy body mismatch: %q", string(data))
 	}
+	local, err := server.GetLocalFile(internalURL)
+	if err != nil || string(local) != "hello-upload" {
+		t.Fatalf("owned resource=%q error=%v", local, err)
+	}
+	for _, tc := range []struct {
+		url    string
+		status int
+	}{
+		{strings.Replace(internalURL, "/bot/", "/other/", 1), 403},
+		{"internal:mock/bot/_tmp/../outside", 400},
+		{"internal:mock/missing/_tmp/file", 404},
+	} {
+		response, err := http.Get(httpServer.URL + "/v1/proxy/" + url.PathEscape(tc.url))
+		if err != nil {
+			t.Fatal(err)
+		}
+		response.Body.Close()
+		if response.StatusCode != tc.status {
+			t.Errorf("resource %s status=%d", tc.url, response.StatusCode)
+		}
+	}
+	small, err := satoriserver.NewServer(satoriserver.Config{MaxRequestBytes: 64})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer small.Close()
+	if err := small.Apply(&mockProvider{}); err != nil {
+		t.Fatal(err)
+	}
+	handler, err := small.Handler()
+	if err != nil {
+		t.Fatal(err)
+	}
+	body := bytes.NewBuffer(nil)
+	form := multipart.NewWriter(body)
+	out, err := form.CreateFormFile("file", "large.bin")
+	if err != nil {
+		t.Fatal(err)
+	}
+	out.Write(bytes.Repeat([]byte("x"), 128))
+	form.Close()
+	req := httptest.NewRequest("POST", "/v1/upload.create", body)
+	req.Header.Set("Content-Type", form.FormDataContentType())
+	req.Header.Set("Satori-Platform", "mock")
+	req.Header.Set("Satori-User-ID", "bot")
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+	if rec.Code != 413 {
+		t.Fatalf("limited upload=%d %s", rec.Code, rec.Body)
+	}
+
 }
 
 func TestDecodeMessageListParamStrictNumber(t *testing.T) {
@@ -445,7 +504,7 @@ func (p *failingLoginProvider) HandleInternal(
 	return nil, nil
 }
 
-func (p *failingLoginProvider) HandleProxied(string, string) (*satoriserver.Response, error) {
+func (p *failingLoginProvider) HandleProxied(ctx context.Context, _ string, _ string) (*satoriserver.Response, error) {
 	return nil, nil
 }
 
