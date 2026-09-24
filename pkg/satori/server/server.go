@@ -975,10 +975,14 @@ func (s *Server) proxyURLHandler(w http.ResponseWriter, request *http.Request) {
 	if (native || (request.Method != http.MethodGet && request.Method != http.MethodHead)) && !s.authorize(w, request) {
 		return
 	}
-	if request.URL.RawQuery != "" && !strings.Contains(rawURL, "?") {
-		rawURL += "?" + request.URL.RawQuery
+	if request.URL.RawQuery != "" {
+		separator := "?"
+		if strings.Contains(normalized, "?") {
+			separator = "&"
+		}
+		normalized += separator + request.URL.RawQuery
 	}
-	resp, err := s.fetchProxy(rawURL, request)
+	resp, err := s.fetchProxy(normalized, request)
 	if err != nil {
 		writeError(w, err)
 		return
@@ -1082,20 +1086,17 @@ func (s *Server) findRouteHandler(action string, platform string, selfID string)
 	return nil, false
 }
 
+// rawURL has already been decoded at the proxy route boundary. Query bytes
+// retain their own URL encoding when the target request is constructed.
 func (s *Server) fetchProxy(rawURL string, request *http.Request) (*Response, error) {
-	normalized, err := normalizeProxyURL(rawURL)
-	if err != nil {
-		return nil, BadRequest(err.Error())
-	}
-
-	if strings.HasPrefix(normalized, "internal:") {
-		return s.fetchInternalProxy(normalized, request)
+	if strings.HasPrefix(rawURL, "internal:") {
+		return s.fetchInternalProxy(rawURL, request)
 	}
 	ctx := context.Background()
 	if request != nil {
 		ctx = request.Context()
 	}
-	return s.fetchExternalProxy(ctx, normalized)
+	return s.fetchExternalProxy(ctx, rawURL)
 }
 
 func (s *Server) fetchInternalProxy(rawURL string, request *http.Request) (*Response, error) {
@@ -1107,6 +1108,14 @@ func (s *Server) fetchInternalProxy(rawURL string, request *http.Request) (*Resp
 	platform := match[1]
 	selfID := match[2]
 	path := match[3]
+	operationPath, query, _ := strings.Cut(path, "?")
+	if request != nil && (operationPath == "_api" || strings.HasPrefix(operationPath, "_api/")) {
+		// Match the ordinary /internal request boundary: path and raw query
+		// are distinct, so the provider sends the query exactly once.
+		request = request.Clone(request.Context())
+		request.URL.RawQuery = query
+		path = operationPath
+	}
 	if strings.ContainsAny(platform+selfID, "\\?#\x00") {
 		return nil, BadRequest("invalid internal identity")
 	}
