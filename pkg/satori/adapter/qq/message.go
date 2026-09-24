@@ -1,11 +1,11 @@
 package qq
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"net/http"
 	"regexp"
 	"strings"
 	"time"
@@ -13,9 +13,12 @@ import (
 	"github.com/WindowsSov8forUs/botgo-plus/dto"
 	"github.com/WindowsSov8forUs/botgo-plus/dto/keyboard"
 	"github.com/WindowsSov8forUs/botgo-plus/errs"
-	"github.com/WindowsSov8forUs/botgo-plus/openapi"
+	"github.com/WindowsSov8forUs/botgo-plus/media"
+	native "github.com/WindowsSov8forUs/botgo-plus/openapi/v1"
 	"github.com/satori-protocol-go/satori-go/pkg/satori/adapter/qq/convert"
+	"github.com/satori-protocol-go/satori-go/pkg/satori/logging"
 	"github.com/satori-protocol-go/satori-go/pkg/satori/model/message"
+	"github.com/satori-protocol-go/satori-go/pkg/satori/server"
 )
 
 var errUnsupportedPlatform = errors.New("unsupported platform")
@@ -23,8 +26,8 @@ var errUnsupportedPlatform = errors.New("unsupported platform")
 type messageConverter func(input *dto.Message, platform string) *message.Message
 
 type messageSender struct {
-	apiV1          openapi.OpenAPI
-	apiV2          openapi.OpenAPI
+	api            *native.Client
+	state          *appState
 	convertMessage messageConverter
 	adapter        *Adapter
 }
@@ -32,6 +35,10 @@ type messageSender struct {
 type messageReferrer struct {
 	Direct    bool
 	MsgID     string
+	EventID   string
+	AppID     string
+	Scene     dto.MessageScene
+	Raw       map[string]any
 	MsgSeq    int
 	HasMsgSeq bool
 }
@@ -40,18 +47,14 @@ type messageCreateInput struct {
 	Platform  string
 	ChannelID string
 	Content   string
+	Segments  []convert.MessageSegment
 	Referrer  messageReferrer
 }
 
 var markdownEscapePattern = regexp.MustCompile("([\\\\`*_{}\\[\\]()#+\\-.!>~])")
 
-func newMessageSender(apiV1 openapi.OpenAPI, apiV2 openapi.OpenAPI, convert messageConverter, adapter *Adapter) *messageSender {
-	return &messageSender{
-		apiV1:          apiV1,
-		apiV2:          apiV2,
-		convertMessage: convert,
-		adapter:        adapter,
-	}
+func newMessageSender(state *appState, convert messageConverter, adapter *Adapter) *messageSender {
+	return &messageSender{api: state.api, state: state, convertMessage: convert, adapter: adapter}
 }
 
 func (s *messageSender) Send(ctx context.Context, input messageCreateInput) ([]*message.Message, error) {
@@ -66,121 +69,101 @@ func (s *messageSender) Send(ctx context.Context, input messageCreateInput) ([]*
 }
 
 func (s *messageSender) sendQQGuild(ctx context.Context, input messageCreateInput) ([]*message.Message, error) {
-	if s.apiV1 == nil {
+	input.Referrer.Direct = input.Referrer.Direct || strings.Contains(input.ChannelID, "_")
+	if s.api == nil {
 		return []*message.Message{}, nil
 	}
 
-	segments := convert.ParseMessageSegments(input.Content, "qqguild")
+	segments := input.Segments
 	seq := newSeqCounter(input.Referrer)
 	result := make([]*message.Message, 0, len(segments))
 	for _, segment := range segments {
-		if input.Referrer.MsgID != "" && seq.Current() >= 5 {
-			break
+		if seq.Current() >= int(^uint32(0)) {
+			return result, server.BadRequest("QQ reply sequence is exhausted")
 		}
 
-		msg, err := s.sendQQGuildSegment(ctx, input, segment)
+		piece := input
+		piece.Referrer.MsgSeq = seq.Next()
+		msg, err := s.sendQQGuildSegment(ctx, piece, segment)
 		if err != nil {
-			return nil, err
+			return result, err
 		}
 		if msg != nil {
+			if msg.Id == "" {
+				return result, errors.New("QQ send response has no message ID")
+			}
+			s.attachReplyContext(msg, input.Referrer, seq.Current())
 			result = append(result, msg)
-			seq.Next()
 		}
 	}
 	return result, nil
 }
 
-func (s *messageSender) sendQQGuildSegment(
-	ctx context.Context,
-	input messageCreateInput,
-	segment convert.MessageSegment,
-) (*message.Message, error) {
-	payload := &dto.MessageToCreate{
-		MsgID:            input.Referrer.MsgID,
-		MessageReference: makeMessageReference(segment.QuoteID),
-	}
-
+func (s *messageSender) sendQQGuildSegment(ctx context.Context, input messageCreateInput, segment convert.MessageSegment) (*message.Message, error) {
+	payload := &dto.MessageToCreate{MsgID: input.Referrer.MsgID, EventID: input.Referrer.EventID, MsgSeq: uint32(input.Referrer.MsgSeq), MessageReference: makeMessageReference(segment.QuoteID)}
+	var created *dto.Message
+	var err error
 	if segment.Resource == nil {
 		payload.Content = segment.Text
 		if strings.TrimSpace(payload.Content) == "" {
 			return nil, nil
 		}
-		created, err := s.callQQGuildMessageAPI(ctx, input.ChannelID, input.Referrer.Direct, payload)
-		if err != nil {
-			return nil, err
+		created, err = s.callQQGuildMessageAPI(ctx, input.ChannelID, input.Referrer.Direct, payload)
+	} else {
+		resource, resolveErr := s.resolveResource(ctx, "qqguild", segment.Resource)
+		if resolveErr != nil {
+			return nil, resolveErr
 		}
-		if created == nil || s.convertMessage == nil {
-			return nil, nil
+		if segment.Resource.Kind != convert.MessageResourceImage {
+			if resource.URL == "" {
+				return nil, server.NewActionError(501, "QQ guild local resource type is not supported", nil)
+			}
+			payload.Content = resource.URL
+			created, err = s.callQQGuildMessageAPI(ctx, input.ChannelID, input.Referrer.Direct, payload)
+		} else if resource.URL != "" {
+			payload.Image = resource.URL
+			created, err = s.callQQGuildMessageAPI(ctx, input.ChannelID, input.Referrer.Direct, payload)
+		} else {
+			created, err = s.callQQGuildMultipartAPI(ctx, input.ChannelID, input.Referrer.Direct, payload, resource.Data)
 		}
-		return s.convertMessage(created, "qqguild"), nil
 	}
-
-	if segment.Resource.Kind != convert.MessageResourceImage {
-		payload.Content = segment.Resource.Src
-		if strings.TrimSpace(payload.Content) == "" {
-			return nil, nil
-		}
-		created, err := s.callQQGuildMessageAPI(ctx, input.ChannelID, input.Referrer.Direct, payload)
-		if err != nil {
-			return nil, err
-		}
-		if created == nil || s.convertMessage == nil {
-			return nil, nil
-		}
-		return s.convertMessage(created, "qqguild"), nil
-	}
-
-	resourcePayload, err := convert.ResolveMessageResourcePayload(segment.Resource.Src)
 	if err != nil {
-		payload.Content = segment.Resource.Src
-		created, callErr := s.callQQGuildMessageAPI(ctx, input.ChannelID, input.Referrer.Direct, payload)
-		if callErr != nil {
-			return nil, callErr
-		}
-		if created == nil || s.convertMessage == nil {
-			return nil, nil
-		}
-		return s.convertMessage(created, "qqguild"), nil
+		return nil, err
 	}
+	if created == nil || created.ID == "" {
+		return nil, errors.New("QQ send response has no message ID")
+	}
+	return s.convertMessage(created, "qqguild"), nil
+}
 
-	switch {
-	case resourcePayload.URL != "":
-		payload.Image = resourcePayload.URL
-		created, callErr := s.callQQGuildMessageAPI(ctx, input.ChannelID, input.Referrer.Direct, payload)
-		if callErr != nil {
-			return nil, callErr
-		}
-		if created == nil || s.convertMessage == nil {
-			return nil, nil
-		}
-		return s.convertMessage(created, "qqguild"), nil
-	case resourcePayload.FileData != "":
-		data, decodeErr := convert.DecodeMessageBase64(resourcePayload.FileData)
-		if decodeErr != nil {
-			return nil, decodeErr
-		}
-		created, callErr := s.callQQGuildMultipartAPI(ctx, input.ChannelID, input.Referrer.Direct, payload, data)
-		if callErr != nil {
-			return nil, callErr
-		}
-		if created == nil || s.convertMessage == nil {
-			return nil, nil
-		}
-		return s.convertMessage(created, "qqguild"), nil
-	default:
-		payload.Content = segment.Resource.Src
-		if strings.TrimSpace(payload.Content) == "" {
-			return nil, nil
-		}
-		created, callErr := s.callQQGuildMessageAPI(ctx, input.ChannelID, input.Referrer.Direct, payload)
-		if callErr != nil {
-			return nil, callErr
-		}
-		if created == nil || s.convertMessage == nil {
-			return nil, nil
-		}
-		return s.convertMessage(created, "qqguild"), nil
+func (s *messageSender) resolveResource(ctx context.Context, platform string, resource *convert.MessageResource) (convert.MessageResourcePayload, error) {
+	if err := ctx.Err(); err != nil {
+		return convert.MessageResourcePayload{}, err
 	}
+	payload, err := convert.ResolveMessageResourcePayload(resource.Src)
+	if err != nil {
+		return payload, server.BadRequest("invalid resource: " + err.Error())
+	}
+	if payload.Internal != "" {
+		parts := strings.SplitN(strings.TrimPrefix(payload.Internal, "internal:"), "/", 3)
+		if len(parts) != 3 || parts[0] != platform || parts[1] != s.state.selfID {
+			return payload, server.Forbidden("resource belongs to a different login")
+		}
+		s.adapter.mu.RLock()
+		owner := s.adapter.srv
+		s.adapter.mu.RUnlock()
+		if owner == nil {
+			return payload, server.NewActionError(503, "the resource owner is not attached", nil)
+		}
+		payload.Data, err = owner.GetLocalFile(payload.Internal)
+		if err != nil {
+			return payload, err
+		}
+	}
+	if resource.Title != "" {
+		payload.FileName = resource.Title
+	}
+	return payload, nil
 }
 
 func (s *messageSender) callQQGuildMessageAPI(
@@ -195,50 +178,28 @@ func (s *messageSender) callQQGuildMessageAPI(
 	)
 	if strings.Contains(channelID, "_") || referrerDirect {
 		dmGuildID := convert.SplitGuildCompositeID(channelID)
-		created, err = s.apiV1.PostDirectMessage(ctx, &dto.DirectMessage{GuildID: dmGuildID}, payload)
+		created, err = s.api.PostDirectMessage(ctx, &dto.DirectMessage{GuildID: dmGuildID}, payload)
 	} else {
-		created, err = s.apiV1.PostMessage(ctx, channelID, payload)
+		created, err = s.api.PostMessage(ctx, channelID, payload)
 	}
 	if err == nil {
 		return created, nil
 	}
-	if fallback, ok := s.tryAuditFallback(ctx, err, payload.Content); ok {
-		return fallback, nil
-	}
-	return nil, err
+	return s.awaitAudit(ctx, err, payload.Content)
 }
 
-func (s *messageSender) callQQGuildMultipartAPI(
-	ctx context.Context,
-	channelID string,
-	referrerDirect bool,
-	payload *dto.MessageToCreate,
-	fileImageData []byte,
-) (*dto.Message, error) {
-	if s.apiV1 == nil {
-		return s.callQQGuildMessageAPI(ctx, channelID, referrerDirect, payload)
-	}
-	var (
-		created *dto.Message
-		err     error
-	)
+func (s *messageSender) callQQGuildMultipartAPI(ctx context.Context, channelID string, referrerDirect bool, payload *dto.MessageToCreate, data []byte) (*dto.Message, error) {
 	if strings.Contains(channelID, "_") || referrerDirect {
-		dmGuildID := convert.SplitGuildCompositeID(channelID)
-		created, err = s.apiV1.PostDirectMessageMultipart(ctx, &dto.DirectMessage{GuildID: dmGuildID}, payload, fileImageData)
-	} else {
-		created, err = s.apiV1.PostMessageMultipart(ctx, channelID, payload, fileImageData)
+		return nil, server.NewActionError(501, "local-image multipart is not verified for QQ guild direct messages", nil)
 	}
+	created, err := s.api.PostMessageMultipart(ctx, channelID, payload, data)
 	if err == nil {
 		return created, nil
 	}
-	if fallback, ok := s.tryAuditFallback(ctx, err, payload.Content); ok {
-		return fallback, nil
-	}
-	return nil, err
+	return s.awaitAudit(ctx, err, payload.Content)
 }
 
 func makeMessageReference(messageID string) *dto.MessageReference {
-	messageID = strings.TrimSpace(messageID)
 	if messageID == "" {
 		return nil
 	}
@@ -249,19 +210,20 @@ func makeMessageReference(messageID string) *dto.MessageReference {
 }
 
 func (s *messageSender) sendQQ(ctx context.Context, input messageCreateInput) ([]*message.Message, error) {
-	if s.apiV2 == nil {
+	if s.api == nil {
 		return []*message.Message{}, nil
 	}
 
-	segments := convert.ParseMessageSegments(input.Content, "qq")
+	segments := input.Segments
 	seq := newSeqCounter(input.Referrer)
 	targetID, privateTarget := convert.SplitPrivateChannelID(input.ChannelID)
 	isDirect := input.Referrer.Direct || privateTarget
+	input.Referrer.Direct = isDirect
 
 	result := make([]*message.Message, 0, len(segments))
 	for _, segment := range segments {
-		if input.Referrer.MsgID != "" && seq.Current() >= 5 {
-			break
+		if seq.Current() >= int(^uint32(0)) {
+			return result, server.BadRequest("QQ reply sequence is exhausted")
 		}
 		var created *dto.Message
 		var err error
@@ -276,12 +238,14 @@ func (s *messageSender) sendQQ(ctx context.Context, input messageCreateInput) ([
 			created, err = s.sendQQResource(ctx, targetID, isDirect, segment, input.Referrer, seq.Next())
 		}
 		if err != nil {
-			return nil, err
+			return result, err
 		}
-		if created == nil || s.convertMessage == nil {
-			continue
+		if created == nil || created.ID == "" {
+			return result, errors.New("QQ send response has no message ID")
 		}
-		result = append(result, s.convertMessage(created, "qq"))
+		converted := s.convertMessage(created, "qq")
+		s.attachReplyContext(converted, input.Referrer, seq.Current())
+		result = append(result, converted)
 	}
 	return result, nil
 }
@@ -299,10 +263,12 @@ func (s *messageSender) sendQQArk(
 		return s.sendQQText(ctx, targetID, isDirect, convert.MessageSegment{Text: segment.ArkJSON}, referrer, seq)
 	}
 	payload := &dto.MessageToCreate{
-		MsgType: 3,
-		Ark:     ark,
-		MsgID:   resolveQQMsgID(referrer.MsgID, segment.QuoteID),
-		MsgSeq:  seq,
+		MsgType:          3,
+		Ark:              ark,
+		MsgID:            referrer.MsgID,
+		EventID:          referrer.EventID,
+		MessageReference: replyReference(referrer, segment.QuoteID),
+		MsgSeq:           uint32(seq),
 	}
 	return s.callQQMessageAPI(ctx, targetID, isDirect, payload)
 }
@@ -320,9 +286,11 @@ func (s *messageSender) sendQQMarkdown(
 		markdownContent = " "
 	}
 	payload := &dto.MessageToCreate{
-		MsgType: 2,
-		MsgID:   resolveQQMsgID(referrer.MsgID, segment.QuoteID),
-		MsgSeq:  seq,
+		MsgType:          2,
+		MsgID:            referrer.MsgID,
+		EventID:          referrer.EventID,
+		MessageReference: replyReference(referrer, segment.QuoteID),
+		MsgSeq:           uint32(seq),
 		Markdown: &dto.Markdown{
 			Content: markdownContent,
 		},
@@ -346,150 +314,91 @@ func (s *messageSender) sendQQText(
 		return nil, nil
 	}
 	payload := &dto.MessageToCreate{
-		Content: content,
-		MsgID:   resolveQQMsgID(referrer.MsgID, segment.QuoteID),
-		MsgSeq:  seq,
+		Content:          content,
+		MsgID:            referrer.MsgID,
+		EventID:          referrer.EventID,
+		MessageReference: replyReference(referrer, segment.QuoteID),
+		MsgSeq:           uint32(seq),
 	}
 	return s.callQQMessageAPI(ctx, targetID, isDirect, payload)
 }
 
-func (s *messageSender) sendQQResource(
-	ctx context.Context,
-	targetID string,
-	isDirect bool,
-	segment convert.MessageSegment,
-	referrer messageReferrer,
-	seq int,
-) (*dto.Message, error) {
+func (s *messageSender) sendQQResource(ctx context.Context, targetID string, isDirect bool, segment convert.MessageSegment, referrer messageReferrer, seq int) (*dto.Message, error) {
 	if segment.Resource == nil {
-		return nil, nil
+		return nil, errors.New("QQ resource is required")
 	}
-
-	resourcePayload, err := convert.ResolveMessageResourcePayload(segment.Resource.Src)
+	resource, err := s.resolveResource(ctx, "qq", segment.Resource)
 	if err != nil {
-		return s.sendQQText(ctx, targetID, isDirect, convert.MessageSegment{Text: segment.Resource.Src}, referrer, seq)
-	}
-	if resourcePayload.URL == "" && resourcePayload.FileData == "" {
-		return s.sendQQText(ctx, targetID, isDirect, convert.MessageSegment{Text: segment.Resource.Src}, referrer, seq)
-	}
-
-	uploadMessage := &dto.RichMediaMessage{
-		EventID:    resolveQQMsgID(referrer.MsgID, segment.QuoteID),
-		FileType:   convert.MapMessageResourceFileType(segment.Resource.Kind),
-		URL:        resourcePayload.URL,
-		FileData:   resourcePayload.FileData,
-		SrvSendMsg: false,
-	}
-
-	var mediaResponse *dto.MediaResponse
-	if isDirect {
-		response, callErr := s.apiV2.PostC2CMessage(ctx, targetID, uploadMessage)
-		if callErr != nil {
-			return nil, callErr
-		}
-		if response != nil {
-			mediaResponse = response.MediaResponse
-		}
-	} else {
-		response, callErr := s.apiV2.PostGroupMessage(ctx, targetID, uploadMessage)
-		if callErr != nil {
-			return nil, callErr
-		}
-		if response != nil {
-			mediaResponse = response.MediaResponse
-		}
-	}
-	if mediaResponse == nil || strings.TrimSpace(mediaResponse.FileInfo) == "" {
-		return s.sendQQText(ctx, targetID, isDirect, convert.MessageSegment{Text: segment.Resource.Src}, referrer, seq)
-	}
-
-	payload := &dto.MessageToCreate{
-		Content: " ",
-		MsgType: 7,
-		MsgID:   resolveQQMsgID(referrer.MsgID, segment.QuoteID),
-		MsgSeq:  seq,
-		Media:   dto.Media{FileInfo: mediaResponse.FileInfo},
-	}
-	return s.callQQMessageAPI(ctx, targetID, isDirect, payload)
-}
-
-func (s *messageSender) callQQMessageAPI(
-	ctx context.Context,
-	targetID string,
-	isDirect bool,
-	payload dto.APIMessage,
-) (*dto.Message, error) {
-	if isDirect {
-		response, err := s.apiV2.PostC2CMessage(ctx, targetID, payload)
-		if err != nil {
-			if fallback, ok := s.tryAuditFallback(ctx, err, ""); ok {
-				return fallback, nil
-			}
-			return nil, err
-		}
-		if response == nil {
-			return nil, nil
-		}
-		return response.Message, nil
-	}
-
-	response, err := s.apiV2.PostGroupMessage(ctx, targetID, payload)
-	if err != nil {
-		if fallback, ok := s.tryAuditFallback(ctx, err, ""); ok {
-			return fallback, nil
-		}
 		return nil, err
 	}
-	if response == nil {
-		return nil, nil
+	fileType := int(convert.MapMessageResourceFileType(segment.Resource.Kind))
+	s.adapter.log(ctx, logging.LevelDebug, fmt.Sprintf("QQ media upload app_id=%q file_type=%d local_bytes=%d", s.state.appID, fileType, len(resource.Data)))
+	var uploaded *dto.MediaUploadResult
+	if resource.Data != nil {
+		data := resource.Data
+		scope := media.GroupScope
+		if isDirect {
+			scope = media.C2CScope
+		}
+		uploaded, err = s.state.uploader.Upload(ctx, media.Target{Scope: scope, OpenID: targetID}, bytes.NewReader(data), int64(len(data)), fileType, resource.FileName)
+	} else {
+		request := &dto.MediaUploadRequest{FileType: fileType, URL: resource.URL, FileName: resource.FileName}
+		if isDirect {
+			uploaded, _, err = s.api.UploadC2CFile(ctx, targetID, request)
+		} else {
+			uploaded, _, err = s.api.UploadGroupFile(ctx, targetID, request)
+		}
 	}
-	return response.Message, nil
+	if err != nil {
+		return nil, err
+	}
+	s.adapter.log(ctx, logging.LevelDebug, fmt.Sprintf("QQ media upload completed app_id=%q file_type=%d", s.state.appID, fileType))
+	if uploaded == nil || uploaded.FileInfo == "" {
+		return nil, errors.New("QQ upload response has no file_info")
+	}
+	payload := &dto.MessageToCreate{Content: " ", MsgType: dto.RichMediaMsg, MsgID: referrer.MsgID, EventID: referrer.EventID, MessageReference: replyReference(referrer, segment.QuoteID), MsgSeq: uint32(seq), Media: &dto.MediaInfo{FileInfo: uploaded.FileInfo}}
+	return s.callQQMessageAPI(ctx, targetID, isDirect, payload)
 }
 
-func (s *messageSender) tryAuditFallback(ctx context.Context, err error, content string) (*dto.Message, bool) {
-	if s == nil || s.adapter == nil {
-		return nil, false
+func (s *messageSender) callQQMessageAPI(ctx context.Context, targetID string, isDirect bool, payload dto.APIMessage) (*dto.Message, error) {
+	var created *dto.Message
+	var err error
+	if isDirect {
+		created, err = s.api.PostC2CMessage(ctx, targetID, payload)
+	} else {
+		created, err = s.api.PostGroupMessage(ctx, targetID, payload)
 	}
-	auditID, ok := parseAuditIDFromError(err)
-	if !ok {
-		return nil, false
-	}
-	messageID, ok := s.adapter.waitAuditMessageID(ctx, auditID, defaultAuditWait)
-	if !ok {
-		return nil, false
-	}
-	return &dto.Message{ID: messageID, Content: content}, true
-}
-
-func parseAuditIDFromError(err error) (string, bool) {
 	if err == nil {
-		return "", false
+		return created, nil
 	}
-	wrapped := errs.Error(err)
-	if wrapped == nil {
-		return "", false
+	content := ""
+	if message, ok := payload.(*dto.MessageToCreate); ok {
+		content = message.Content
 	}
-	if wrapped.Code() != http.StatusCreated && wrapped.Code() != http.StatusAccepted {
-		return "", false
+	return s.awaitAudit(ctx, err, content)
+}
+
+func (s *messageSender) awaitAudit(ctx context.Context, err error, content string) (*dto.Message, error) {
+	var pending *errs.PendingError
+	if !errors.As(err, &pending) || pending.AuditID == "" {
+		return nil, err
 	}
-	body := struct {
-		Code int `json:"code"`
-		Data struct {
-			MessageAudit struct {
-				AuditID string `json:"audit_id"`
-			} `json:"message_audit"`
-		} `json:"data"`
-	}{}
-	if json.Unmarshal([]byte(wrapped.Text()), &body) != nil {
-		return "", false
+	s.adapter.log(ctx, logging.LevelInfo, fmt.Sprintf("QQ audit pending app_id=%q audit_id=%q", s.state.appID, pending.AuditID))
+	result, waitErr := s.adapter.waitAuditResult(ctx, s.state.appID, pending.AuditID, defaultAuditWait)
+	if waitErr != nil {
+		status := 503
+		if errors.Is(waitErr, context.DeadlineExceeded) {
+			status = 504
+		}
+		return nil, server.NewActionError(status, "QQ audit outcome remains pending: "+waitErr.Error(), errors.Join(pending, waitErr))
 	}
-	if body.Code != 304023 {
-		return "", false
+	if !result.Passed {
+		return nil, server.NewActionError(403, "QQ message audit rejected: "+result.Reason, pending)
 	}
-	if strings.TrimSpace(body.Data.MessageAudit.AuditID) == "" {
-		return "", false
+	if result.MessageID == "" {
+		return nil, server.NewActionError(502, "QQ audit passed without a message ID", pending)
 	}
-	return strings.TrimSpace(body.Data.MessageAudit.AuditID), true
+	return &dto.Message{ID: result.MessageID, Content: content, ChannelID: result.ChannelID, GuildID: result.GuildID}, nil
 }
 
 func escapeQQMarkdown(content string) string {
@@ -559,12 +468,33 @@ func buildKeyboardFromButtons(rows [][]convert.MessageButton) *keyboard.MessageK
 	}
 }
 
-func resolveQQMsgID(defaultMsgID string, quoteID string) string {
-	quoteID = strings.TrimSpace(quoteID)
-	if quoteID != "" {
-		return quoteID
+func replyReference(referrer messageReferrer, quoteID string) *dto.MessageReference {
+	if quoteID == referrer.MsgID {
+		if index, ok := referrer.Scene.GetExt("msg_idx"); ok {
+			quoteID = index
+		}
 	}
-	return strings.TrimSpace(defaultMsgID)
+	return makeMessageReference(quoteID)
+}
+
+func (s *messageSender) attachReplyContext(result *message.Message, referrer messageReferrer, sequence int) {
+	if result == nil {
+		return
+	}
+	output := make(map[string]any, len(referrer.Raw)+5)
+	for key, value := range referrer.Raw {
+		output[key] = value
+	}
+	output["msg_id"] = referrer.MsgID
+	output["event_id"] = referrer.EventID
+	output["msg_seq"] = sequence
+	output["direct"] = referrer.Direct
+	output["app_id"] = s.state.appID
+	delete(output, "ref_idx")
+	if index, ok := result.Referrer["ref_idx"]; ok {
+		output["ref_idx"] = index
+	}
+	result.Referrer = output
 }
 
 type seqCounter struct {

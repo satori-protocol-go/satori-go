@@ -1,95 +1,130 @@
 package qq
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
-	"strings"
 	"time"
+
+	"github.com/satori-protocol-go/satori-go/pkg/satori/logging"
 )
 
 const defaultAuditWait = 60 * time.Second
+const maxAuditEntries = 1024 // Local correlation capacity, not a QQ quota.
 
-func (a *Adapter) captureAuditResult(raw json.RawMessage) {
-	if len(bytes.TrimSpace(raw)) == 0 {
-		return
-	}
-	decoder := json.NewDecoder(bytes.NewReader(raw))
-	decoder.UseNumber()
-	payload := map[string]any{}
-	if err := decoder.Decode(&payload); err != nil {
-		return
-	}
-
-	auditID := strings.TrimSpace(anyString(payload["audit_id"]))
-	if auditID == "" {
-		return
-	}
-	messageID := strings.TrimSpace(anyString(payload["message_id"]))
-	if messageID == "" {
-		messageID = strings.TrimSpace(anyString(payload["id"]))
-	}
-
-	a.auditMu.Lock()
-	waiters := a.auditWaiters[auditID]
-	delete(a.auditWaiters, auditID)
-	a.auditMu.Unlock()
-
-	for _, ch := range waiters {
-		select {
-		case ch <- messageID:
-		default:
-		}
-		close(ch)
-	}
+type auditKey struct{ appID, auditID string }
+type auditResult struct {
+	Passed    bool
+	MessageID string
+	ChannelID string
+	GuildID   string
+	Reason    string
+}
+type auditEntry struct {
+	done    chan struct{}
+	result  *auditResult
+	expires time.Time
+	waiters int
 }
 
-func (a *Adapter) waitAuditMessageID(ctx context.Context, auditID string, timeout time.Duration) (string, bool) {
-	auditID = strings.TrimSpace(auditID)
-	if auditID == "" {
-		return "", false
+// The existing correlation store holds pending waiters and bounded early
+// results together. Expiry is swept during access; no maintenance goroutine.
+func (a *Adapter) auditEntryLocked(key auditKey, now time.Time) (*auditEntry, error) {
+	for id, entry := range a.audits {
+		if entry.waiters == 0 && !now.Before(entry.expires) {
+			delete(a.audits, id)
+		}
+	}
+	if entry := a.audits[key]; entry != nil {
+		return entry, nil
+	}
+	if len(a.audits) >= maxAuditEntries {
+		var oldest auditKey
+		var expiry time.Time
+		for id, entry := range a.audits {
+			if entry.waiters == 0 && (expiry.IsZero() || entry.expires.Before(expiry)) {
+				oldest = id
+				expiry = entry.expires
+			}
+		}
+		if expiry.IsZero() {
+			return nil, errors.New("local QQ audit correlation capacity reached")
+		}
+		delete(a.audits, oldest)
+	}
+	entry := &auditEntry{done: make(chan struct{}), expires: now.Add(defaultAuditWait)}
+	a.audits[key] = entry
+	return entry, nil
+}
+
+func (a *Adapter) captureAuditResult(appID, eventType string, raw json.RawMessage) {
+	var data struct {
+		AuditID   string `json:"audit_id"`
+		MessageID string `json:"message_id"`
+		ChannelID string `json:"channel_id"`
+		GuildID   string `json:"guild_id"`
+		Reason    string `json:"reject_reason"`
+	}
+	if json.Unmarshal(raw, &data) != nil || data.AuditID == "" {
+		return
+	}
+	if eventType != "MESSAGE_AUDIT_PASS" && eventType != "MESSAGE_AUDIT_REJECT" {
+		return
+	}
+	a.auditMu.Lock()
+	entry, err := a.auditEntryLocked(auditKey{appID, data.AuditID}, time.Now())
+	if err == nil && entry.result == nil {
+		entry.result = &auditResult{Passed: eventType == "MESSAGE_AUDIT_PASS", MessageID: data.MessageID, ChannelID: data.ChannelID, GuildID: data.GuildID, Reason: data.Reason}
+		entry.expires = time.Now().Add(defaultAuditWait)
+		close(entry.done)
+	}
+	a.auditMu.Unlock()
+	if err != nil {
+		a.log(context.Background(), logging.LevelWarn, err.Error())
+	}
+	a.log(context.Background(), logging.LevelInfo, fmt.Sprintf("QQ audit result app_id=%q audit_id=%q outcome=%q", appID, data.AuditID, eventType))
+	// The original audit event is still published by the common event path.
+}
+
+func (a *Adapter) waitAuditResult(ctx context.Context, appID, auditID string, timeout time.Duration) (auditResult, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return auditResult{}, err
+	}
+	if err := a.eventContext.Err(); err != nil {
+		return auditResult{}, err
 	}
 	if timeout <= 0 {
 		timeout = defaultAuditWait
 	}
-	if ctx == nil {
-		ctx = context.Background()
-	}
-
-	ch := make(chan string, 1)
 	a.auditMu.Lock()
-	a.auditWaiters[auditID] = append(a.auditWaiters[auditID], ch)
+	entry, err := a.auditEntryLocked(auditKey{appID, auditID}, time.Now())
+	if err == nil {
+		entry.waiters++
+	}
 	a.auditMu.Unlock()
-
+	if err != nil {
+		return auditResult{}, err
+	}
+	defer func() { a.auditMu.Lock(); entry.waiters--; a.auditMu.Unlock() }()
 	timer := time.NewTimer(timeout)
 	defer timer.Stop()
-
 	select {
-	case value, ok := <-ch:
-		if !ok || strings.TrimSpace(value) == "" {
-			return "", false
-		}
-		return strings.TrimSpace(value), true
+	case <-entry.done:
+		a.auditMu.Lock()
+		result := *entry.result
+		a.auditMu.Unlock()
+		return result, nil
 	case <-ctx.Done():
+		return auditResult{}, ctx.Err()
+	case <-a.eventContext.Done():
+		return auditResult{}, a.eventContext.Err()
 	case <-timer.C:
+		return auditResult{}, context.DeadlineExceeded
 	}
-
-	a.auditMu.Lock()
-	waiters := a.auditWaiters[auditID]
-	filtered := make([]chan string, 0, len(waiters))
-	for _, waiter := range waiters {
-		if waiter != ch {
-			filtered = append(filtered, waiter)
-		}
-	}
-	if len(filtered) == 0 {
-		delete(a.auditWaiters, auditID)
-	} else {
-		a.auditWaiters[auditID] = filtered
-	}
-	a.auditMu.Unlock()
-	return "", false
 }
 
 func anyString(raw any) string {
