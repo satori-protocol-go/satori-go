@@ -1,14 +1,13 @@
 package satori
 
 import (
-	"bytes"
 	"context"
-	"encoding/json"
 	"errors"
-	"fmt"
 	"io"
 	"mime/multipart"
 	"net/http"
+	"net/url"
+	"sort"
 	"strings"
 	"time"
 
@@ -31,35 +30,28 @@ type Config struct {
 	Timeout          time.Duration
 	HandshakeTimeout time.Duration
 	PostUpload       bool
-
-	EventBuffer int
-	HTTPClient  *http.Client
+	EventBuffer      int
+	HTTPClient       *http.Client
 }
 
 type Adapter struct {
 	server.RouterMixin
-
-	app        *client.App
-	postUpload bool
-	httpClient *http.Client
-	eventCh    chan *event.Event
+	app          *client.App
+	postUpload   bool
+	httpClient   *http.Client
+	eventCh      chan *event.Event
+	eventContext context.Context
+	cancelEvents context.CancelFunc
 }
 
 func New(cfg Config) (*Adapter, error) {
 	app, err := client.NewApp(client.WebSocketConfig{
-		Host:             cfg.Host,
-		Port:             cfg.Port,
-		Path:             cfg.Path,
-		Version:          cfg.Version,
-		Token:            cfg.Token,
-		Secure:           cfg.Secure,
-		Timeout:          cfg.Timeout,
-		HandshakeTimeout: cfg.HandshakeTimeout,
+		Host: cfg.Host, Port: cfg.Port, Path: cfg.Path, Version: cfg.Version,
+		Token: cfg.Token, Secure: cfg.Secure, Timeout: cfg.Timeout, HandshakeTimeout: cfg.HandshakeTimeout,
 	})
 	if err != nil {
 		return nil, err
 	}
-
 	buffer := cfg.EventBuffer
 	if buffer <= 0 {
 		buffer = defaultEventBuffer
@@ -68,14 +60,12 @@ func New(cfg Config) (*Adapter, error) {
 	if httpClient == nil {
 		httpClient = &http.Client{Timeout: protocol.DefaultRequestTimeout}
 	}
-
-	adapter := &Adapter{
-		app:        app,
-		postUpload: cfg.PostUpload,
-		httpClient: httpClient,
-		eventCh:    make(chan *event.Event, buffer),
-	}
-
+	ctx, cancel := context.WithCancel(context.Background())
+	adapter := &Adapter{app: app, postUpload: cfg.PostUpload, httpClient: httpClient,
+		eventCh: make(chan *event.Event, buffer), eventContext: ctx, cancelEvents: cancel}
+	app.SetDefaultProtocolFactory(func(account *client.Account) *client.APIProtocol {
+		return client.NewAPIProtocol(account, httpClient)
+	})
 	adapter.Route(protocol.ParseApi("internal/*"), adapter.handleRoute)
 	for _, api := range protocol.AllApis() {
 		if !cfg.PostUpload && api == protocol.ApiUploadCreate {
@@ -83,29 +73,27 @@ func New(cfg Config) (*Adapter, error) {
 		}
 		adapter.Route(api, adapter.handleRoute)
 	}
-
-	adapter.app.Register(func(_ *client.Account, evt *event.Event) error {
+	app.Register(func(_ *client.Account, evt *event.Event) error {
 		if evt == nil {
 			return nil
 		}
 		select {
 		case adapter.eventCh <- evt:
-		default:
-			// Keep client network loops responsive when consumers are slow.
+			return nil
+		case <-adapter.eventContext.Done():
+			return adapter.eventContext.Err()
 		}
-		return nil
 	})
-
 	return adapter, nil
 }
 
-func (a *Adapter) EnsureServer(_ *server.Server) {}
-
-func (a *Adapter) Publisher(_ context.Context) <-chan *event.Event {
-	return a.eventCh
-}
+func (a *Adapter) EnsureServer(_ *server.Server)                   {}
+func (a *Adapter) Publisher(_ context.Context) <-chan *event.Event { return a.eventCh }
 
 func (a *Adapter) Block(ctx context.Context) error {
+	stop := context.AfterFunc(ctx, a.cancelEvents)
+	defer stop()
+	defer a.cancelEvents()
 	if err := a.app.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
 		return err
 	}
@@ -113,105 +101,117 @@ func (a *Adapter) Block(ctx context.Context) error {
 }
 
 func (a *Adapter) Cleanup(_ context.Context) error {
+	a.cancelEvents()
 	return a.app.Close()
 }
 
 func (a *Adapter) GetLogins(_ context.Context) ([]*login.Login, error) {
-	account := a.Account()
-	if account == nil || account.SelfInfo() == nil {
-		return []*login.Login{}, nil
+	result := make([]*login.Login, 0)
+	targets := map[string]bool{}
+	for _, account := range a.app.Accounts() {
+		info := account.SelfInfo()
+		if info == nil {
+			continue
+		}
+		if info.User != nil && info.Platform != "" {
+			key := info.Platform + "/" + info.User.Id
+			if targets[key] {
+				return nil, server.NewActionError(409, "ambiguous upstream account "+key, nil)
+			}
+			targets[key] = true
+		}
+		result = append(result, info)
 	}
-	return []*login.Login{cloneLogin(account.SelfInfo())}, nil
+	sort.Slice(result, func(i, j int) bool { return result[i].Sn < result[j].Sn })
+	return result, nil
 }
 
 func (a *Adapter) ProxyUrls() []string {
-	account := a.Account()
-	if account == nil {
-		return []string{}
+	set := map[string]bool{}
+	for _, account := range a.app.Accounts() {
+		for _, prefix := range account.ProxyURLs() {
+			set[prefix] = true
+		}
 	}
-	return account.ProxyURLs()
+	result := make([]string, 0, len(set))
+	for prefix := range set {
+		result = append(result, prefix)
+	}
+	sort.Strings(result)
+	return result
 }
 
-func (a *Adapter) Ensure(platform string, selfID string) bool {
-	account := a.Account()
-	if account == nil {
-		return false
+func (a *Adapter) Ensure(platform, selfID string) bool {
+	for _, account := range a.app.Accounts() {
+		if account.Platform() == platform && account.SelfID() == selfID {
+			return true
+		}
 	}
-	return account.Platform() == platform && account.SelfID() == selfID
+	return false
+}
+
+// Account resolves exactly the requested platform identity within this upstream.
+func (a *Adapter) Account(platform, selfID string) (*client.Account, error) {
+	var selected *client.Account
+	for _, account := range a.app.Accounts() {
+		if account.Platform() != platform || account.SelfID() != selfID {
+			continue
+		}
+		if selected != nil {
+			return nil, server.NewActionError(409, "ambiguous upstream account", nil)
+		}
+		selected = account
+	}
+	if selected == nil {
+		return nil, server.NotFound("upstream account not found")
+	}
+	return selected, nil
 }
 
 func (a *Adapter) HandleInternal(request server.Request[map[string]any], path string) (*server.Response, error) {
-	path = strings.TrimSpace(path)
-	if strings.HasPrefix(path, "_api") {
-		account := a.Account()
-		if account == nil {
-			return nil, server.NotFound("no account found")
-		}
-
-		action := strings.TrimPrefix(path, "_api")
-		action = strings.TrimPrefix(action, "/")
-		if strings.TrimSpace(action) == "" {
-			return nil, server.BadRequest("internal api action is required")
-		}
-
-		params, err := internalCallParams(request)
-		if err != nil {
-			return nil, err
-		}
-		method := requestMethod(request.Origin, http.MethodPost)
-		raw, err := account.Protocol.CallAPI(requestContext(request.Origin), action, params, false, method)
-		if err != nil {
-			return nil, err
-		}
-
-		resp := server.NewResponse(http.StatusOK, raw)
-		resp.Header.Set("Content-Type", "application/json")
-		return resp, nil
+	account, err := a.Account(request.Platform, request.SelfID)
+	if err != nil {
+		return nil, err
 	}
-
-	if account := a.Account(); account != nil {
-		internalURL := fmt.Sprintf(
-			"internal:%s/%s/%s",
-			account.Platform(),
-			account.SelfID(),
-			strings.TrimPrefix(path, "/"),
-		)
-		data, err := account.Protocol.Download(requestContext(request.Origin), internalURL)
-		if err != nil {
-			return nil, err
-		}
-		return server.NewResponse(http.StatusOK, data), nil
+	if path == "_api" {
+		return nil, server.BadRequest("internal API action is required")
 	}
-
-	if path == "" {
-		return nil, server.NotFound("path is empty")
+	if strings.HasPrefix(path, "_api/") {
+		endpoint := strings.TrimRight(account.Config().APIBase(), "/") + "/internal/" + strings.TrimPrefix(path, "_api/")
+		return a.forwardNative(account, request.Origin, endpoint)
 	}
-	return a.fetchURL(requestContext(request.Origin), path)
+	endpoint := "internal:" + request.Platform + "/" + request.SelfID + "/" + path
+	return a.forwardNative(account, request.Origin, endpoint)
 }
 
 func (a *Adapter) HandleProxied(ctx context.Context, _ string, rawURL string) (*server.Response, error) {
-	return a.fetchURL(ctx, rawURL)
-}
-
-func (a *Adapter) Account() *client.Account {
-	accounts := a.app.Accounts()
-	for _, account := range accounts {
-		return account
+	parsed, err := url.Parse(rawURL)
+	if err != nil || parsed.Host == "" || parsed.User != nil || (parsed.Scheme != "http" && parsed.Scheme != "https") {
+		return nil, server.BadRequest("invalid resource URL")
 	}
-	return nil
+	request, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
+	if err != nil {
+		return nil, err
+	}
+	response, err := a.httpClient.Do(request)
+	if err != nil {
+		return nil, err
+	}
+	return forwardedResponse(response), nil
 }
 
 func (a *Adapter) handleRoute(request *server.Request[any]) (any, error) {
 	if request == nil {
-		return nil, server.BadRequest("request cannot be nil")
+		return nil, server.BadRequest("request is required")
 	}
-
-	account := a.Account()
-	if account == nil {
-		return nil, server.NotFound("no account found")
+	account, err := a.Account(request.Platform, request.SelfID)
+	if err != nil {
+		return nil, err
 	}
-
-	method := http.MethodPost
+	if strings.HasPrefix(request.Action, protocol.InternalApiPrefix) {
+		endpoint := strings.TrimRight(account.Config().APIBase(), "/") + "/" + request.Action
+		return a.forwardNative(account, request.Origin, endpoint)
+	}
 	if request.Action == string(protocol.ApiUploadCreate) {
 		if !a.postUpload {
 			return nil, server.NotFound("upload.create is not enabled")
@@ -224,49 +224,42 @@ func (a *Adapter) handleRoute(request *server.Request[any]) (any, error) {
 		if err != nil {
 			return nil, err
 		}
-		raw, err := account.Protocol.CallAPI(requestContext(request.Origin), request.Action, params, true, method)
-		if err != nil {
-			return nil, err
-		}
-		return decodeRawResult(raw)
+		return account.Protocol.CallAPI(requestContext(request.Origin), request.Action, params, true, http.MethodPost)
 	}
-
-	params, err := paramsToObject(request.Params)
-	if err != nil {
-		return nil, err
+	params, ok := request.Params.(map[string]any)
+	if request.Params != nil && !ok {
+		return nil, server.BadRequest("request params must be an object")
 	}
-	raw, err := account.Protocol.CallAPI(requestContext(request.Origin), request.Action, params, false, method)
-	if err != nil {
-		return nil, err
-	}
-	return decodeRawResult(raw)
+	return account.Protocol.CallAPI(requestContext(request.Origin), request.Action, params, false, http.MethodPost)
 }
 
-func (a *Adapter) fetchURL(ctx context.Context, rawURL string) (*server.Response, error) {
-	if ctx == nil {
-		ctx = context.Background()
-	}
-	request, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
-	if err != nil {
-		return nil, err
-	}
-	resp, err := a.httpClient.Do(request)
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
-
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, err
-	}
-	result := server.NewResponse(resp.StatusCode, body)
-	for key, values := range resp.Header {
-		for _, value := range values {
-			result.Header.Add(key, value)
+func (a *Adapter) forwardNative(account *client.Account, origin *http.Request, endpoint string) (*server.Response, error) {
+	method := http.MethodGet
+	var options []client.RequestOption
+	if origin != nil {
+		method = origin.Method
+		options = append(options, client.WithRequestBody(origin.Body, origin.Header.Get("Content-Type")))
+		if origin.URL.RawQuery != "" && !strings.Contains(endpoint, "?") {
+			endpoint += "?" + origin.URL.RawQuery
+		}
+		for _, key := range []string{"Accept", "Range", "If-None-Match", "If-Modified-Since"} {
+			if value := origin.Header.Get(key); value != "" {
+				options = append(options, client.WithRequestHeader(key, value))
+			}
 		}
 	}
-	return result, nil
+	response, err := account.Protocol.RequestInternal(requestContext(origin), endpoint, method, nil, options...)
+	if err != nil {
+		return nil, err
+	}
+	return forwardedResponse(response), nil
+}
+
+func forwardedResponse(response *http.Response) *server.Response {
+	result := server.NewStreamResponse(response.StatusCode, response.Body)
+	result.ContentLength = response.ContentLength
+	result.Header = response.Header.Clone()
+	return result
 }
 
 func requestContext(request *http.Request) context.Context {
@@ -276,105 +269,30 @@ func requestContext(request *http.Request) context.Context {
 	return request.Context()
 }
 
-func requestMethod(request *http.Request, fallback string) string {
-	if request == nil || strings.TrimSpace(request.Method) == "" {
-		return fallback
-	}
-	return request.Method
-}
-
-func paramsToObject(raw any) (map[string]any, error) {
-	if raw == nil {
-		return map[string]any{}, nil
-	}
-	params, ok := raw.(map[string]any)
-	if !ok {
-		return nil, server.BadRequest("request params must be an object")
-	}
-	return params, nil
-}
-
-func decodeRawResult(raw []byte) (any, error) {
-	if len(bytes.TrimSpace(raw)) == 0 {
-		return map[string]any{}, nil
-	}
-	var result any
-	if err := json.Unmarshal(raw, &result); err != nil {
-		return nil, err
-	}
-	return result, nil
-}
-
 func formToMultipartParams(form *multipart.Form) (map[string]any, error) {
 	result := map[string]any{}
-	if form == nil {
-		return result, nil
-	}
 	for key, values := range form.Value {
-		if len(values) == 0 {
-			continue
+		if len(values) > 0 {
+			result[key] = values[len(values)-1]
 		}
-		result[key] = values[len(values)-1]
 	}
 	for name, files := range form.File {
-		if len(files) == 0 {
-			continue
+		if len(files) != 1 {
+			return nil, server.BadRequest("upload field names must be unique")
 		}
-		fileHeader := files[len(files)-1]
-		opened, err := fileHeader.Open()
+		file := files[0]
+		opened, err := file.Open()
 		if err != nil {
 			return nil, err
 		}
 		data, err := io.ReadAll(opened)
-		_ = opened.Close()
+		opened.Close()
 		if err != nil {
 			return nil, err
 		}
-		result[name] = client.NewUpload(
-			data,
-			fileHeader.Filename,
-			fileHeader.Header.Get("Content-Type"),
-		)
+		result[name] = client.NewUpload(data, file.Filename, file.Header.Get("Content-Type"))
 	}
 	return result, nil
-}
-
-func internalCallParams(request server.Request[map[string]any]) (map[string]any, error) {
-	params := map[string]any{}
-	if request.Params != nil {
-		params = request.Params
-	}
-	if request.Origin == nil {
-		return params, nil
-	}
-
-	body, err := io.ReadAll(request.Origin.Body)
-	if err != nil {
-		return nil, err
-	}
-	request.Origin.Body = io.NopCloser(bytes.NewReader(body))
-	if len(bytes.TrimSpace(body)) == 0 {
-		return params, nil
-	}
-
-	decoded := map[string]any{}
-	if err := json.Unmarshal(body, &decoded); err != nil {
-		return nil, server.BadRequest("invalid internal api params")
-	}
-	return decoded, nil
-}
-
-func cloneLogin(source *login.Login) *login.Login {
-	if source == nil {
-		return nil
-	}
-	cloned := *source
-	if source.User != nil {
-		userValue := *source.User
-		cloned.User = &userValue
-	}
-	cloned.Features = append([]string(nil), source.Features...)
-	return &cloned
 }
 
 var _ server.Adapter = (*Adapter)(nil)
