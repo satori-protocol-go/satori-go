@@ -493,17 +493,17 @@ func TestAccountCustomWithOptions(t *testing.T) {
 		satoriclient.WithCustomToken("next-token"),
 		satoriclient.WithCustomTimeout(5*time.Second),
 	)
-	if customized.Config.APIBase() != "https://api.example.com:7443/bot/v2" {
-		t.Fatalf("customized api base mismatch: %q", customized.Config.APIBase())
+	if customized.Config().APIBase() != "https://api.example.com:7443/bot/v2" {
+		t.Fatalf("customized api base mismatch: %q", customized.Config().APIBase())
 	}
-	if customized.Config.TokenValue() != "next-token" {
-		t.Fatalf("customized token mismatch: %q", customized.Config.TokenValue())
+	if customized.Config().TokenValue() != "next-token" {
+		t.Fatalf("customized token mismatch: %q", customized.Config().TokenValue())
 	}
-	if customized.Config.TimeoutValue() != 5*time.Second {
-		t.Fatalf("customized timeout mismatch: %v", customized.Config.TimeoutValue())
+	if customized.Config().TimeoutValue() != 5*time.Second {
+		t.Fatalf("customized timeout mismatch: %v", customized.Config().TimeoutValue())
 	}
-	if account.Config.APIBase() != "http://localhost:5140/v1" {
-		t.Fatalf("original account config should remain unchanged: %q", account.Config.APIBase())
+	if account.Config().APIBase() != "http://localhost:5140/v1" {
+		t.Fatalf("original account config should remain unchanged: %q", account.Config().APIBase())
 	}
 
 	accountFromStatic := satoriclient.NewAccount(
@@ -520,8 +520,8 @@ func TestAccountCustomWithOptions(t *testing.T) {
 		satoriclient.WithCustomPath("/next"),
 		satoriclient.WithCustomVersion("v1"),
 	)
-	if parsed.Config.APIBase() != "https://static.example.com:9443/next/v1" {
-		t.Fatalf("parsed custom api base mismatch: %q", parsed.Config.APIBase())
+	if parsed.Config().APIBase() != "https://static.example.com:9443/next/v1" {
+		t.Fatalf("parsed custom api base mismatch: %q", parsed.Config().APIBase())
 	}
 }
 
@@ -698,5 +698,110 @@ func TestApplicationLifecycle(t *testing.T) {
 				t.Fatal("runner cleanup timeout")
 			}
 		})
+	}
+}
+
+func TestLoginStateSynchronization(t *testing.T) {
+	app, err := satoriclient.NewApp()
+	if err != nil {
+		t.Fatal(err)
+	}
+	config := staticAPIConfig{base: "http://127.0.0.1/v1", token: "fixture"}
+	first := &login.Login{Sn: 0, Platform: "mock", User: &user.User{Id: "alpha", Name: "before"}, Status: login.LoginStatusOnline, Adapter: "fixture", Features: []string{"old"}}
+	partial := &login.Login{Sn: 1, Status: login.LoginStatusOffline, Adapter: "fixture"}
+	second := &login.Login{Sn: 0, Platform: "mock", User: &user.User{Id: "beta"}, Status: login.LoginStatusOnline, Adapter: "fixture"}
+	if err := app.SyncLogins("source-a", config, nil, []*login.Login{first, partial}); err != nil {
+		t.Fatal(err)
+	}
+	if err := app.SyncLogins("source-b", config, nil, []*login.Login{second}); err != nil {
+		t.Fatal(err)
+	}
+	if len(app.Accounts()) != 3 {
+		t.Fatalf("login count=%d", len(app.Accounts()))
+	}
+	alpha := app.AccountsBySelfID("alpha")[0]
+	var change event.Event
+	if err := json.Unmarshal([]byte(`{"sn":1,"type":"login-updated","timestamp":1,"login":{"sn":0,"status":0,"user":{"id":"alpha","name":"after"},"features":["new"]}}`), &change); err != nil {
+		t.Fatal(err)
+	}
+	if err := app.PostEvent("source-a", &change); err != nil {
+		t.Fatal(err)
+	}
+	info := alpha.SelfInfo()
+	if alpha.Connected() || info.User.Name != "after" || info.Status != login.LoginStatusOffline || len(info.Features) != 1 || info.Features[0] != "new" {
+		t.Fatalf("updated login=%+v", info)
+	}
+	// The snapshot can be inspected independently while the live account advances.
+	info.User.Name = "caller-owned"
+	if alpha.SelfInfo().User.Name != "after" {
+		t.Fatalf("live login name=%s", alpha.SelfInfo().User.Name)
+	}
+	app.UpdateProxyURLs("source-a", []string{"https://example.invalid/assets/"})
+	if len(app.Accounts()) != 3 || len(alpha.ProxyURLs()) != 1 {
+		t.Fatalf("META logins=%d proxies=%v", len(app.Accounts()), alpha.ProxyURLs())
+	}
+	if err := app.SyncLogins("source-a", config, nil, []*login.Login{}); err != nil {
+		t.Fatal(err)
+	}
+	if len(app.Accounts()) != 1 || len(app.AccountsBySelfID("beta")) != 1 {
+		t.Fatalf("empty READY login set=%v", app.Accounts())
+	}
+	if err := json.Unmarshal([]byte(`{"sn":2,"type":"login-removed","timestamp":2,"login":{"sn":0,"status":0}}`), &change); err != nil {
+		t.Fatal(err)
+	}
+	if err := app.PostEvent("source-b", &change); err != nil {
+		t.Fatal(err)
+	}
+	if len(app.Accounts()) != 0 {
+		t.Fatalf("removed source login set=%v", app.Accounts())
+	}
+	first.Sn = 7
+	if err := app.SyncLogins("source-a", config, nil, []*login.Login{first}); err != nil {
+		t.Fatal(err)
+	}
+	received := ""
+	app.Register(func(account *satoriclient.Account, evt *event.Event) error { received = account.SelfID(); return nil })
+	if err := app.PostEvent("source-a", &event.Event{Type: event.EventTypeMessageCreated, Login: &login.Login{Sn: 7, Platform: "mock", User: &user.User{Id: "alpha"}}}); err != nil {
+		t.Fatal(err)
+	}
+	if received != "alpha" || app.AccountsBySelfID("alpha")[0].SelfInfo().Sn != 7 {
+		t.Fatalf("rebound account=%s", received)
+	}
+}
+
+func TestAccountSnapshotConsistency(t *testing.T) {
+	app, err := satoriclient.NewApp()
+	if err != nil {
+		t.Fatal(err)
+	}
+	info := &login.Login{Sn: 0, Platform: "mock", User: &user.User{Id: "bot", Name: "0"}, Status: login.LoginStatusOnline, Features: []string{"0"}}
+	if err := app.SyncLogins("source", staticAPIConfig{base: "http://127.0.0.1"}, nil, []*login.Login{info}); err != nil {
+		t.Fatal(err)
+	}
+	account := app.AccountsBySelfID("bot")[0]
+	done := make(chan error, 1)
+	go func() {
+		for n := 1; n <= 100; n++ {
+			value := strconv.Itoa(n)
+			err := app.PostEvent("source", &event.Event{Type: event.EventTypeLoginUpdated, Login: &login.Login{Sn: 0, Platform: "mock", User: &user.User{Id: "bot", Name: value}, Status: login.LoginStatusOnline, Features: []string{value}}})
+			if err != nil {
+				done <- err
+				return
+			}
+		}
+		done <- nil
+	}()
+	for n := 0; n < 100; n++ {
+		snapshot := account.SelfInfo()
+		if len(snapshot.Features) != 1 || snapshot.User.Name != snapshot.Features[0] {
+			t.Fatalf("inconsistent login=%+v", snapshot)
+		}
+		_ = account.Config().APIBase()
+	}
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	if account.SelfInfo().User.Name != "100" {
+		t.Fatalf("final login=%+v", account.SelfInfo())
 	}
 }

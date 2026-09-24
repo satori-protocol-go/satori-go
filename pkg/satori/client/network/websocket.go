@@ -213,7 +213,9 @@ func (n *WS) authenticate(connection *websocket.Conn) error {
 	}
 
 	n.base.SetProxyURLs(ready.ProxyUrls)
-	n.base.app.SyncLogins(n.ID(), n.base.Config(), ready.ProxyUrls, ready.Logins)
+	if err := n.base.app.SyncLogins(n.ID(), n.base.Config(), ready.ProxyUrls, ready.Logins); err != nil {
+		return err
+	}
 	if len(ready.Logins) == 0 {
 		n.base.Log(context.Background(), logging.LevelWarn, fmt.Sprintf("no login available for websocket network_id=%s", n.ID()))
 	}
@@ -252,7 +254,7 @@ func (n *WS) receiveLoop(connection *websocket.Conn) error {
 				continue
 			}
 			n.base.SetProxyURLs(metaPayload.ProxyUrls)
-			n.base.app.SyncLogins(n.ID(), n.base.Config(), metaPayload.ProxyUrls, nil)
+			n.base.app.UpdateProxyURLs(n.ID(), metaPayload.ProxyUrls)
 
 		case operation.OpcodePong:
 			continue
