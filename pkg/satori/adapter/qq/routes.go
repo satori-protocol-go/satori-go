@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/url"
+	"sort"
 	"strconv"
 	"strings"
 
@@ -652,49 +653,67 @@ func (a *Adapter) handleMessageList(request *server.Request[server.MessageListPa
 	if strings.Contains(channelID, "_") {
 		return nil, server.NotFound("message.list is not supported for user-channel")
 	}
-
+	direction := request.Params.Direction.ValueOr(model.Direction("before"))
+	order := request.Params.Order.ValueOr(model.Order("asc"))
+	next := request.Params.Next.ValueOr("")
+	if next == "" && direction != "before" {
+		return nil, server.BadRequest("direction must be before when next is absent")
+	}
+	if direction == "around" {
+		return nil, server.NewActionError(501, "around pagination is not implemented for QQ channels", nil)
+	}
+	limit := request.Params.Limit.ValueOr(20)
+	if limit <= 0 || limit > 20 {
+		limit = 20
+	}
+	pager := &dto.MessagesPager{ID: next, Type: dto.MPTBefore, Limit: strconv.FormatInt(limit, 10)}
+	if direction == "after" {
+		pager.Type = dto.MPTAfter
+	}
 	state, err := a.resolveRequestState(request.Origin, request.SelfID)
 	if err != nil {
 		return nil, err
 	}
-	api := state.apiV1
-
-	pager := &dto.MessagesPager{Limit: "20"}
-	if limit, ok := request.Params.Limit.Get(); ok && limit > 0 {
-		pager.Limit = strconv.FormatInt(limit, 10)
-	}
-	if nextValue, ok := request.Params.Next.Get(); ok {
-		next := nextValue
-		if next != "" {
-			direction := ""
-			if directionValue, ok := request.Params.Direction.Get(); ok {
-				direction = strings.ToLower(string(directionValue))
-			}
-			switch direction {
-			case "after":
-				pager.Type = dto.MPTAfter
-			default:
-				pager.Type = dto.MPTBefore
-			}
-			pager.ID = next
-		}
-	}
-
-	items, err := api.Messages(requestContext(request.Origin), channelID, pager)
+	items, err := state.apiV1.Messages(requestContext(request.Origin), channelID, pager)
 	if err != nil {
 		return nil, err
 	}
-	result := make([]*message.Message, 0, len(items))
+	values := make([]*dto.Message, 0, len(items))
 	for _, item := range items {
+		if item != nil {
+			values = append(values, item)
+		}
+	}
+	sort.SliceStable(values, func(i, j int) bool {
+		x, xerr := strconv.ParseUint(values[i].SeqInChannel, 10, 64)
+		y, yerr := strconv.ParseUint(values[j].SeqInChannel, 10, 64)
+		if xerr == nil && yerr == nil {
+			return x < y
+		}
+		a, _ := values[i].Timestamp.Time()
+		b, _ := values[j].Timestamp.Time()
+		return a.Before(b)
+	})
+	cursor := ""
+	if len(values) > 0 {
+		if direction == "before" {
+			cursor = values[0].ID
+		} else {
+			cursor = values[len(values)-1].ID
+		}
+	}
+	if order == "desc" {
+		for i, j := 0, len(values)-1; i < j; i, j = i+1, j-1 {
+			values[i], values[j] = values[j], values[i]
+		}
+	}
+	result := make([]*message.Message, 0, len(values))
+	for _, item := range values {
 		result = append(result, convert.MessageFromDTO(item, request.Platform))
 	}
-
-	response := &model.BidiPaginated[*message.Message]{Data: result}
-	if len(result) > 0 {
-		response.Prev = result[0].Id
-		response.Next = result[len(result)-1].Id
-	}
-	return response, nil
+	// QQ returns a message cursor, not a has_more flag. An empty subsequent page
+	// terminates traversal; short pages may still continue.
+	return &model.BidiPaginated[*message.Message]{Data: result, Prev: cursor, Next: cursor}, nil
 }
 
 func parseMessageReferrer(raw map[string]any) (messageReferrer, error) {
