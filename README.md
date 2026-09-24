@@ -20,13 +20,13 @@ Satori 协议的 Go 客户端、服务端和 QQ / Satori 桥接适配器。平�
 | `channel.delete` | 封装 | 可注册 | 404 | 实现 | 按上游 |
 | `channel.mute` | 封装 | 可注册 | 404 | 404 | 按上游 |
 | `user.channel.create` | 封装 | 可注册 | 实现 | 实现 | 按上游 |
-| `guild.get` | 封装 | 可注册 | 501 | 实现 | 按上游 |
+| `guild.get` | 封装 | 可注册 | 实现 | 实现 | 按上游 |
 | `guild.list` | 封装 | 可注册 | 404 | 实现 | 按上游 |
 | `guild.approve` | 封装 | 可注册 | 501 | 404 | 按上游 |
-| `guild.member.list` | 封装 | 可注册 | 501 | 实现 | 按上游 |
-| `guild.member.get` | 封装 | 可注册 | 501 | 实现 | 按上游 |
-| `guild.member.kick` | 封装 | 可注册 | 501 | 实现 | 按上游 |
-| `guild.member.mute` | 封装 | 可注册 | 501 | 实现 | 按上游 |
+| `guild.member.list` | 封装 | 可注册 | 实现 | 实现 | 按上游 |
+| `guild.member.get` | 封装 | 可注册 | 实现 | 实现 | 按上游 |
+| `guild.member.kick` | 封装 | 可注册 | 实现 | 实现 | 按上游 |
+| `guild.member.mute` | 封装 | 可注册 | 实现 | 实现 | 按上游 |
 | `guild.member.approve` | 封装 | 可注册 | 501 | 404 | 按上游 |
 | `guild.member.role.set` | 封装 | 可注册 | 404 | 实现 | 按上游 |
 | `guild.member.role.unset` | 封装 | 可注册 | 404 | 实现 | 按上游 |
@@ -48,3 +48,5 @@ Satori 协议的 Go 客户端、服务端和 QQ / Satori 桥接适配器。平�
 `features` 使用已实现的能力集合；QQFeatures / QQGuildFeatures 只能限制默认集合，不能声明缺少实现的能力。meta、READY 和 login 更新复用同一份登录资料。`admin/login.list` 为历史客户端扩展，不在标准 API 支持承诺中。
 
 日常验证：`go test ./...`。测试只调用本地合成服务，不表示已经完成真实 QQ 权限或媒体联调。
+
+普通 QQ 群资料与成员管理需要平台授权；成员分页使用原生 `next_cursor`。永久移除中黑名单部分失败时返回 502 和原始部分成功内容。频道消息列表支持 before/after 与 asc/desc；around 当前返回 501。

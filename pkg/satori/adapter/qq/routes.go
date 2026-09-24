@@ -10,6 +10,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/WindowsSov8forUs/botgo-plus/dto"
 	"github.com/WindowsSov8forUs/botgo-plus/errs"
@@ -141,7 +142,15 @@ func (a *Adapter) handleChannelMute(_ *server.Request[server.ChannelMuteParam]) 
 
 func (a *Adapter) handleGuildGet(request *server.Request[server.GuildGetParam]) (any, error) {
 	if request.Platform == "qq" {
-		return nil, server.NewActionError(501, "guild.get is not implemented for QQ groups yet", nil)
+		state, err := a.resolveRequestState(request.Origin, request.SelfID)
+		if err != nil {
+			return nil, err
+		}
+		info, _, err := state.api.GetQQGroupInfo(requestContext(request.Origin), request.Params.GuildID)
+		if err != nil {
+			return nil, err
+		}
+		return &guild.Guild{Id: firstNonEmpty(info.GroupOpenID, request.Params.GuildID), Name: info.GroupName}, nil
 	}
 	if request.Platform != "qqguild" {
 		return nil, server.NotFound("guild.get is not supported in current platform")
@@ -261,7 +270,15 @@ func (a *Adapter) handleLoginGet(request *server.Request[server.LoginGetParam]) 
 
 func (a *Adapter) handleGuildMemberGet(request *server.Request[server.GuildMemberGetParam]) (any, error) {
 	if request.Platform == "qq" {
-		return nil, server.NewActionError(501, "guild.member.get is not implemented for QQ groups yet", nil)
+		state, err := a.resolveRequestState(request.Origin, request.SelfID)
+		if err != nil {
+			return nil, err
+		}
+		member, _, err := state.api.GetQQGroupMember(requestContext(request.Origin), request.Params.GuildID, request.Params.UserID)
+		if err != nil {
+			return nil, err
+		}
+		return convert.GroupMemberFromNative(member)
 	}
 	if request.Platform != "qqguild" {
 		return nil, server.NotFound("guild.member.get is not supported in current platform")
@@ -286,7 +303,23 @@ func (a *Adapter) handleGuildMemberGet(request *server.Request[server.GuildMembe
 
 func (a *Adapter) handleGuildMemberList(request *server.Request[server.GuildListByGuildParam]) (any, error) {
 	if request.Platform == "qq" {
-		return nil, server.NewActionError(501, "guild.member.list is not implemented for QQ groups yet", nil)
+		state, err := a.resolveRequestState(request.Origin, request.SelfID)
+		if err != nil {
+			return nil, err
+		}
+		page, _, err := state.api.GetQQGroupMembers(requestContext(request.Origin), request.Params.GuildID, request.Params.Next.ValueOr(""))
+		if err != nil {
+			return nil, err
+		}
+		values := make([]*guildmember.GuildMember, 0, len(page.Members))
+		for _, member := range page.Members {
+			value, err := convert.GroupMemberFromNative(&member)
+			if err != nil {
+				return nil, err
+			}
+			values = append(values, value)
+		}
+		return &model.Paginated[*guildmember.GuildMember]{Data: values, Next: page.NextCursor}, nil
 	}
 	if request.Platform != "qqguild" {
 		return nil, server.NotFound("guild.member.list is not supported in current platform")
@@ -323,7 +356,20 @@ func (a *Adapter) handleGuildMemberList(request *server.Request[server.GuildList
 
 func (a *Adapter) handleGuildMemberKick(request *server.Request[server.GuildMemberKickParam]) (any, error) {
 	if request.Platform == "qq" {
-		return nil, server.NewActionError(501, "guild.member.kick is not implemented for QQ groups yet", nil)
+		state, err := a.resolveRequestState(request.Origin, request.SelfID)
+		if err != nil {
+			return nil, err
+		}
+		result, meta, err := state.api.RemoveQQGroupMembers(requestContext(request.Origin), request.Params.GuildID, &dto.QQGroupRemoveRequest{MemberOpenIDs: []string{request.Params.UserID}, AddToMemberBlacklist: request.Params.Permanent.ValueOr(false)})
+		if err != nil {
+			return nil, err
+		}
+		if result.RemoveMembersResult != "success" || len(result.BlacklistFailedOpenIDs) > 0 {
+			response := server.NewResponse(502, meta.Raw)
+			response.Header = meta.Header.Clone()
+			return response, nil
+		}
+		return nil, nil
 	}
 	if request.Platform != "qqguild" {
 		return nil, server.NotFound("guild.member.kick is not supported in current platform")
@@ -344,7 +390,21 @@ func (a *Adapter) handleGuildMemberKick(request *server.Request[server.GuildMemb
 
 func (a *Adapter) handleGuildMemberMute(request *server.Request[server.GuildMemberMuteParam]) (any, error) {
 	if request.Platform == "qq" {
-		return nil, server.NewActionError(501, "guild.member.mute is not implemented for QQ groups yet", nil)
+		duration := request.Params.Duration
+		if duration < 0 || duration > math.MaxInt64/int64(time.Millisecond) {
+			return nil, server.BadRequest("mute duration is outside the supported millisecond range")
+		}
+		state, err := a.resolveRequestState(request.Origin, request.SelfID)
+		if err != nil {
+			return nil, err
+		}
+		op := dto.QQGroupMuteOperation{Op: "del", MemberOpenID: request.Params.UserID}
+		if duration > 0 {
+			op.Op = "add"
+			op.MuteExpireAt = time.Now().UTC().Add(time.Duration(duration) * time.Millisecond).Format(time.RFC3339Nano)
+		}
+		_, err = state.api.SetQQGroupMemberMute(requestContext(request.Origin), request.Params.GuildID, &dto.QQGroupMuteRequest{Members: []dto.QQGroupMuteOperation{op}})
+		return nil, err
 	}
 	if request.Platform != "qqguild" {
 		return nil, server.NotFound("guild.member.mute is not supported in current platform")
