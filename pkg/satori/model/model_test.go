@@ -10,6 +10,7 @@ import (
 	"github.com/satori-protocol-go/satori-go/pkg/satori/model/login"
 	"github.com/satori-protocol-go/satori-go/pkg/satori/model/message"
 	"github.com/satori-protocol-go/satori-go/pkg/satori/model/message/element"
+	"github.com/satori-protocol-go/satori-go/pkg/satori/model/operation"
 	"github.com/satori-protocol-go/satori-go/pkg/satori/model/paginated"
 	"github.com/satori-protocol-go/satori-go/pkg/satori/model/user"
 	"github.com/satori-protocol-go/satori-go/pkg/satori/types"
@@ -92,6 +93,10 @@ func TestResourceWire(t *testing.T) {
 	}
 
 	t.Run("optional-login-fields", func(t *testing.T) {
+		zero := int64(0)
+		if string(object(t, operation.IdentifyBody{Sn: &zero})["sn"]) != "0" {
+			t.Fatal("zero recovery position")
+		}
 		for _, raw := range []string{"false", "null"} {
 			var value types.Option[bool]
 			if err := json.Unmarshal([]byte(raw), &value); err != nil {

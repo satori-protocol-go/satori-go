@@ -2,7 +2,6 @@ package server
 
 import (
 	"encoding/json"
-	"mime/multipart"
 
 	"github.com/satori-protocol-go/satori-go/pkg/satori/model"
 	"github.com/satori-protocol-go/satori-go/pkg/satori/protocol"
@@ -184,6 +183,6 @@ type UserGetParam struct {
 	UserID string `json:"user_id"`
 }
 
-type UploadCreateParam = *multipart.Form
+type UploadCreateParam map[string]UploadFile
 
 type InternalParam = map[string]any

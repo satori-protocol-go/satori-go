@@ -7,8 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"mime/multipart"
-	"net/http"
+		"net/http"
 	"strings"
 	"time"
 
@@ -189,8 +188,8 @@ func (a *Adapter) HandleInternal(request server.Request[map[string]any], path st
 	return a.fetchURL(requestContext(request.Origin), path)
 }
 
-func (a *Adapter) HandleProxied(_ string, rawURL string) (*server.Response, error) {
-	return a.fetchURL(context.Background(), rawURL)
+func (a *Adapter) HandleProxied(ctx context.Context, _ string, rawURL string) (*server.Response, error) {
+	return a.fetchURL(ctx, rawURL)
 }
 
 func (a *Adapter) Account() *client.Account {
@@ -216,7 +215,7 @@ func (a *Adapter) handleRoute(request *server.Request[any]) (any, error) {
 		if !a.postUpload {
 			return nil, server.NotFound("upload.create is not enabled")
 		}
-		form, ok := request.Params.(*multipart.Form)
+		form, ok := request.Params.(server.UploadCreateParam)
 		if !ok || form == nil {
 			return nil, server.BadRequest("invalid multipart form")
 		}
@@ -305,38 +304,10 @@ func decodeRawResult(raw []byte) (any, error) {
 	return result, nil
 }
 
-func formToMultipartParams(form *multipart.Form) (map[string]any, error) {
-	result := map[string]any{}
-	if form == nil {
-		return result, nil
-	}
-	for key, values := range form.Value {
-		if len(values) == 0 {
-			continue
-		}
-		result[key] = values[len(values)-1]
-	}
-	for name, files := range form.File {
-		if len(files) == 0 {
-			continue
-		}
-		fileHeader := files[len(files)-1]
-		opened, err := fileHeader.Open()
-		if err != nil {
-			return nil, err
-		}
-		data, err := io.ReadAll(opened)
-		_ = opened.Close()
-		if err != nil {
-			return nil, err
-		}
-		result[name] = client.NewUpload(
-			data,
-			fileHeader.Filename,
-			fileHeader.Header.Get("Content-Type"),
-		)
-	}
-	return result, nil
+func formToMultipartParams(files server.UploadCreateParam) (map[string]any, error) {
+    result := make(map[string]any,len(files))
+    for name,file := range files { result[name] = client.NewUpload(file.Data,file.Filename,file.ContentType) }
+    return result,nil
 }
 
 func internalCallParams(request server.Request[map[string]any]) (map[string]any, error) {
