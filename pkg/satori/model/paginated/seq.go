@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"iter"
-	"strings"
 	"sync"
 )
 
@@ -28,7 +27,7 @@ func NewPaginatedSeq[T any](ctx context.Context, nextToken string, fetch Paginat
 	return &PaginatedSeq[T]{
 		fetch: fetch,
 		ctx:   ctx,
-		next:  strings.TrimSpace(nextToken),
+		next:  nextToken,
 	}
 }
 
@@ -69,7 +68,7 @@ func (r *PaginatedSeq[T]) SetNextToken(nextToken string) {
 		return
 	}
 	r.mu.Lock()
-	r.next = strings.TrimSpace(nextToken)
+	r.next = nextToken
 	r.mu.Unlock()
 }
 
@@ -104,7 +103,7 @@ func (r *PaginatedSeq[T]) Pages() iter.Seq2[*Paginated[T], error] {
 				return
 			}
 
-			token = strings.TrimSpace(page.Next)
+			token = page.Next
 			r.SetNextToken(token)
 			if token == "" {
 				return
@@ -138,7 +137,7 @@ func (r *PaginatedSeq[T]) Iter() iter.Seq2[T, error] {
 					return
 				}
 			}
-			token = strings.TrimSpace(page.Next)
+			token = page.Next
 			r.SetNextToken(token)
 			if token == "" {
 				return
