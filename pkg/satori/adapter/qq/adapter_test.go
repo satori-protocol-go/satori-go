@@ -13,6 +13,7 @@ import (
 	"github.com/satori-protocol-go/satori-go/pkg/satori/model/login"
 	"github.com/satori-protocol-go/satori-go/pkg/satori/model/message"
 	"io"
+	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -619,6 +620,89 @@ func TestQQMultiAppOwnershipAndShardStatus(t *testing.T) {
 		t.Fatal(err)
 	}
 	check(login.LoginStatusReconnect, login.LoginStatusConnect)
+}
+
+func TestQQOwnedMediaPipeline(t *testing.T) {
+	f := newQQFixture(t, nil)
+	owner, err := server.NewServer(server.Config{Token: "satori-token"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer owner.Close()
+	if err := owner.Apply(f.adapter); err != nil {
+		t.Fatal(err)
+	}
+	handler, err := owner.Handler()
+	if err != nil {
+		t.Fatal(err)
+	}
+	image := []byte("\x89PNG\r\n\x1a\nimage-body")
+	for _, tc := range []struct{ platform, target, prepare string }{
+		{"qq", "group", "/v2/groups/group/upload_prepare"},
+		{"qq", "private:user", "/v2/users/user/upload_prepare"},
+		{"qqguild", "channel", ""},
+	} {
+		t.Run(tc.target, func(t *testing.T) {
+			body := bytes.NewBuffer(nil)
+			form := multipart.NewWriter(body)
+			part, err := form.CreateFormFile("image", "fixture.png")
+			if err != nil {
+				t.Fatal(err)
+			}
+			part.Write(image)
+			form.Close()
+			r := httptest.NewRequest("POST", "/v1/upload.create", body)
+			r.Header.Set("Content-Type", form.FormDataContentType())
+			r.Header.Set("Authorization", "Bearer satori-token")
+			r.Header.Set("Satori-Platform", tc.platform)
+			r.Header.Set("Satori-User-ID", "bot-123")
+			uploaded := httptest.NewRecorder()
+			handler.ServeHTTP(uploaded, r)
+			var urls map[string]string
+			if err := json.Unmarshal(uploaded.Body.Bytes(), &urls); err != nil || uploaded.Code != 200 {
+				t.Fatalf("upload=%d %s err=%v", uploaded.Code, uploaded.Body, err)
+			}
+			before := len(f.requests())
+			data, _ := json.Marshal(map[string]any{"channel_id": tc.target, "content": `<img title="fixture.png" src="` + urls["image"] + `"/>`})
+			r = httptest.NewRequest("POST", "/v1/message.create", bytes.NewReader(data))
+			r.Header.Set("Content-Type", "application/json")
+			r.Header.Set("Authorization", "Bearer satori-token")
+			r.Header.Set("Satori-Platform", tc.platform)
+			r.Header.Set("Satori-User-ID", "bot-123")
+			sent := httptest.NewRecorder()
+			handler.ServeHTTP(sent, r)
+			var messages []message.Message
+			if err := json.Unmarshal(sent.Body.Bytes(), &messages); err != nil || sent.Code != 200 || len(messages) != 1 {
+				t.Fatalf("send=%d %s err=%v", sent.Code, sent.Body, err)
+			}
+			calls := f.requests()[before:]
+			if tc.prepare != "" {
+				if len(calls) != 5 || calls[0].Path != tc.prepare || calls[1].Method != "PUT" || !bytes.Equal(calls[1].Raw, image) || string(calls[0].Fields["file_name"]) != `"fixture.png"` {
+					t.Fatalf("media pipeline=%+v", calls)
+				}
+				if !strings.HasSuffix(calls[2].Path, "/upload_part_finish") || !strings.HasSuffix(calls[3].Path, "/files") || !bytes.Contains(calls[4].Fields["media"], []byte("opaque!file-info")) {
+					t.Fatalf("media confirmation/message=%+v", calls)
+				}
+			} else if len(calls) != 1 || !bytes.Equal(calls[0].Image, image) {
+				t.Fatalf("channel image=%+v", calls)
+			}
+		})
+	}
+	f.mu.Lock()
+	f.extra = func(w http.ResponseWriter, r *http.Request, _ qqRequest) bool {
+		if r.URL.Path == "/v2/groups/failure/upload_prepare" {
+			w.WriteHeader(403)
+			w.Write([]byte(`{"err_code":11253}`))
+			return true
+		}
+		return false
+	}
+	f.mu.Unlock()
+	_, err = f.call("message.create", "qq", "bot-123", map[string]any{"channel_id": "failure", "content": `<img src="data:image/png;base64,aW1hZ2U="/>`})
+	var status interface{ HTTPStatus() int }
+	if !errors.As(err, &status) || status.HTTPStatus() != 403 || !strings.Contains(err.Error(), "prepare") {
+		t.Fatalf("upload stage failure=%v", err)
+	}
 }
 
 type capturedQQLog struct {

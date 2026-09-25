@@ -145,7 +145,20 @@ func (s *messageSender) resolveResource(ctx context.Context, platform string, re
 		return payload, server.BadRequest("invalid resource: " + err.Error())
 	}
 	if payload.Internal != "" {
-		return payload, server.NewActionError(501, "internal QQ resources are not yet supported", nil)
+		parts := strings.SplitN(strings.TrimPrefix(payload.Internal, "internal:"), "/", 3)
+		if len(parts) != 3 || parts[0] != platform || parts[1] != s.state.selfID {
+			return payload, server.Forbidden("resource belongs to a different login")
+		}
+		s.adapter.mu.RLock()
+		owner := s.adapter.srv
+		s.adapter.mu.RUnlock()
+		if owner == nil {
+			return payload, server.NewActionError(503, "the resource owner is not attached", nil)
+		}
+		payload.Data, err = owner.GetLocalFile(payload.Internal)
+		if err != nil {
+			return payload, err
+		}
 	}
 	if resource.Title != "" {
 		payload.FileName = resource.Title
