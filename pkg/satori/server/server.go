@@ -40,7 +40,7 @@ const (
 	defaultStreamThreshold = 16 * 1024 * 1024
 	defaultStreamChunkSize = 64 * 1024
 	defaultHeartbeat       = 12 * time.Second
-	defaultIdentifyTimeout = 30 * time.Second
+	defaultIdentifyTimeout = 10 * time.Second
 	defaultReadFormMemory  = 32 << 20 // 32 MB
 	defaultCleanupTimeout  = 10 * time.Second
 	defaultWebhookTimeout  = protocol.DefaultRequestTimeout
@@ -97,6 +97,8 @@ type Server struct {
 	streamThreshold int
 	streamChunkSize int
 
+	// Lock order: publishMu, then mu. Provider calls and network I/O never hold mu.
+	publishMu   sync.Mutex
 	mu          sync.RWMutex
 	routers     []Router
 	adapters    []Adapter
@@ -461,7 +463,14 @@ func (s *Server) Run(ctx context.Context) error {
 	defer cancel()
 
 	var runErr error
-	defer s.finishRun(done, runErr)
+	defer func() {
+		s.finishRun(done, runErr)
+		level := LogLevelInfo
+		if runErr != nil {
+			level = LogLevelError
+		}
+		s.log(ctx, level, fmt.Sprintf("Satori server stopped error_type=%T", runErr))
+	}()
 
 	if err := s.runPreparing(runCtx); err != nil {
 		runErr = err
@@ -474,6 +483,7 @@ func (s *Server) Run(ctx context.Context) error {
 		return runErr
 	}
 
+	s.log(runCtx, LogLevelInfo, fmt.Sprintf("Satori server running host=%q port=%d", s.Host, s.Port))
 	blockErr := s.runBlocking(runCtx)
 	cleanupCtx, cancelCleanup := context.WithTimeout(context.Background(), defaultCleanupTimeout)
 	cleanupErr := s.runCleanup(cleanupCtx)
@@ -523,6 +533,8 @@ func (s *Server) Close() error {
 	return s.Shutdown(ctx)
 }
 
+// Post publishes an event from a uniquely identifiable registered login.
+// Provider publishers are bound directly to their source by the running server.
 func (s *Server) Post(evt *event.Event) error {
 	if evt == nil {
 		return nil
@@ -538,6 +550,8 @@ func (s *Server) Post(evt *event.Event) error {
 }
 
 func (s *Server) postFrom(ctx context.Context, source int, evt *event.Event) error {
+	s.publishMu.Lock()
+	defer s.publishMu.Unlock()
 	if evt == nil {
 		return nil
 	}
@@ -553,8 +567,14 @@ func (s *Server) postFrom(ctx context.Context, source int, evt *event.Event) err
 	owned.Login = binding.info.Merge(evt.Login)
 	owned.Login.Sn = binding.sn
 	owned.Sn = s.sequence
+	body, err := json.Marshal(&owned)
+	if err != nil {
+		s.mu.Unlock()
+		return err
+	}
+	frozen := cachedEvent{sn: owned.Sn, kind: owned.Type, body: body}
 	s.sequence++
-	s.eventCache.Append(&owned)
+	s.eventCache.Append(frozen)
 	connections := make([]*websocketConnection, 0, len(s.connections))
 	for connection := range s.connections {
 		connections = append(connections, connection)
@@ -562,25 +582,28 @@ func (s *Server) postFrom(ctx context.Context, source int, evt *event.Event) err
 	webhooks := append([]WebhookEndpoint(nil), s.webhooks...)
 	s.mu.Unlock()
 
-	payload := map[string]any{"op": operation.OpcodeEvent, "body": &owned}
+	payload := map[string]any{"op": operation.OpcodeEvent, "body": frozen.body}
 	for _, connection := range connections {
 		if !connection.Alive() {
 			continue
 		}
 		if err := connection.Send(payload); err != nil {
-			s.log(ctx, LogLevelWarn, fmt.Sprintf("websocket broadcast failed connection_id=%s error=%v", connection.ID(), err))
+			s.log(context.Background(), LogLevelWarn, fmt.Sprintf("websocket broadcast failed connection_id=%s error=%v", connection.ID(), err))
 			_ = connection.Close()
 			s.removeConnection(connection)
 		}
 	}
+	var deliveryErr error
 	for _, webhook := range webhooks {
-		if err := s.sendWebhook(webhook, operation.OpcodeEvent, &owned); err != nil {
-			s.log(ctx, LogLevelError, fmt.Sprintf("webhook event delivery failed error=%v", err))
+		if err := s.sendWebhook(ctx, webhook, operation.OpcodeEvent, frozen.body); err != nil {
+			deliveryErr = errors.Join(deliveryErr, err)
 		}
 	}
-	return nil
+	return deliveryErr
 }
 
+// bindLoginLocked assigns a runtime-local downstream number. Source keys remain
+// available for late lifecycle events and are not persisted beyond this server.
 func (s *Server) bindLoginLocked(source int, info *login.Login) *loginBinding {
 	key := providerLoginKey{source: source, sn: info.Sn}
 	if binding := s.loginMappings[key]; binding != nil {
@@ -693,7 +716,7 @@ func (s *Server) webhookCreateHandler(w http.ResponseWriter, request *http.Reque
 	s.mu.Unlock()
 
 	proxyURLs := s.getProxyURLs()
-	if err := s.sendWebhook(hook, operation.OpcodeMeta, map[string]any{"proxy_urls": proxyURLs}); err != nil {
+	if err := s.sendWebhook(request.Context(), hook, operation.OpcodeMeta, map[string]any{"proxy_urls": proxyURLs}); err != nil {
 		writeError(w, err)
 		return
 	}
@@ -761,7 +784,7 @@ func (s *Server) websocketServerHandler(w http.ResponseWriter, request *http.Req
 		_ = connection.CloseWith(3000, "Unauthorized")
 		return
 	}
-	if token != s.Token {
+	if s.Token != "" && token != s.Token {
 		s.log(
 			request.Context(),
 			LogLevelWarn,
@@ -771,56 +794,12 @@ func (s *Server) websocketServerHandler(w http.ResponseWriter, request *http.Req
 		return
 	}
 
-	logins, proxyUrls, err := s.collectMeta(request.Context())
-	if err != nil {
-		s.log(
-			request.Context(),
-			LogLevelError,
-			fmt.Sprintf("websocket prepare ready failed connection_id=%s remote_addr=%s error=%v", connection.ID(), connection.RemoteAddr(), err),
-		)
-		_ = connection.CloseWith(websocket.CloseInternalServerErr, "Internal Server Error")
+	if err := s.openEventStream(request.Context(), connection, sequence); err != nil {
+		s.log(request.Context(), LogLevelWarn, fmt.Sprintf("websocket initialization failed connection_id=%s error=%v", connection.ID(), err))
 		return
 	}
-
-	if err := connection.Send(map[string]any{
-		"op": operation.OpcodeReady,
-		"body": map[string]any{
-			"logins":     logins,
-			"proxy_urls": proxyUrls,
-		},
-	}); err != nil {
-		s.log(
-			request.Context(),
-			LogLevelWarn,
-			fmt.Sprintf("websocket send ready failed connection_id=%s remote_addr=%s error=%v", connection.ID(), connection.RemoteAddr(), err),
-		)
-		return
-	}
-	s.log(
-		request.Context(),
-		LogLevelDebug,
-		fmt.Sprintf("websocket ready sent connection_id=%s remote_addr=%s", connection.ID(), connection.RemoteAddr()),
-	)
-
-	s.addConnection(connection)
 	defer s.removeConnection(connection)
 
-	if sequence > -1 {
-		for _, evt := range s.eventCache.After(sequence) {
-			if evt == nil || isLoginEventType(evt.Type) {
-				continue
-			}
-			if err := connection.Send(map[string]any{
-				"op":   operation.OpcodeEvent,
-				"body": evt,
-			}); err != nil {
-				return
-			}
-			time.Sleep(100 * time.Millisecond)
-		}
-	}
-
-	go connection.Heartbeat(defaultHeartbeat)
 	connection.WaitClosed()
 	closeReason, closeErr := connection.CloseInfo()
 	lastHeartbeatAt, lastHeartbeatLatency := connection.LastHeartbeat()
@@ -831,12 +810,39 @@ func (s *Server) websocketServerHandler(w http.ResponseWriter, request *http.Req
 	}
 	if !lastHeartbeatAt.IsZero() {
 		closedBuilder.WriteString(fmt.Sprintf(
-			" last_heartbeat_at=%s last_heartbeat_latency_ms=%d",
+			" last_heartbeat_at=%s last_heartbeat_read_wait_ms=%d",
 			lastHeartbeatAt.Format(time.RFC3339Nano),
 			lastHeartbeatLatency.Milliseconds(),
 		))
 	}
 	s.log(request.Context(), LogLevelInfo, closedBuilder.String())
+}
+
+// openEventStream shares the publication order boundary. Provider snapshots run
+// without the general state lock; events produced meanwhile wait for this handoff.
+func (s *Server) openEventStream(ctx context.Context, connection *websocketConnection, sequence int64) error {
+	s.publishMu.Lock()
+	defer s.publishMu.Unlock()
+	logins, proxyURLs, err := s.collectMeta(ctx)
+	if err != nil {
+		return err
+	}
+	if err := connection.Send(map[string]any{"op": operation.OpcodeReady, "body": map[string]any{"logins": logins, "proxy_urls": proxyURLs}}); err != nil {
+		return err
+	}
+	go connection.Heartbeat(defaultHeartbeat)
+	if sequence >= 0 {
+		for _, evt := range s.eventCache.After(sequence) {
+			if isLoginEventType(evt.kind) {
+				continue
+			}
+			if err := connection.Send(map[string]any{"op": operation.OpcodeEvent, "body": evt.body}); err != nil {
+				return err
+			}
+		}
+	}
+	s.addConnection(connection)
+	return nil
 }
 
 // authorized protects Satori RPC and metadata routes, not platform callbacks or static files.
@@ -1251,26 +1257,20 @@ func (s *Server) collectMeta(ctx context.Context) ([]*login.Login, []string, err
 }
 
 func (s *Server) broadcastMetaToWebhooks(ctx context.Context) error {
-	proxyURLs := s.getProxyURLs()
+	body := map[string]any{"proxy_urls": s.getProxyURLs()}
 	s.mu.RLock()
 	webhooks := append([]WebhookEndpoint(nil), s.webhooks...)
 	s.mu.RUnlock()
-
-	body := map[string]any{"proxy_urls": proxyURLs}
-	for _, webhook := range webhooks {
-		if err := s.sendWebhook(webhook, operation.OpcodeMeta, body); err != nil {
-			s.log(
-				ctx,
-				LogLevelError,
-				fmt.Sprintf("webhook meta delivery failed url=%s opcode=%d error=%v", webhook.URL, operation.OpcodeMeta, err),
-			)
-			return err
+	var result error
+	for _, hook := range webhooks {
+		if err := s.sendWebhook(ctx, hook, operation.OpcodeMeta, body); err != nil {
+			result = errors.Join(result, err)
 		}
 	}
-	return nil
+	return result
 }
 
-func (s *Server) sendWebhook(webhook WebhookEndpoint, opcode operation.Opcode, body any) error {
+func (s *Server) sendWebhook(ctx context.Context, webhook WebhookEndpoint, opcode operation.Opcode, body any) error {
 	payload, err := json.Marshal(body)
 	if err != nil {
 		return err
@@ -1280,7 +1280,7 @@ func (s *Server) sendWebhook(webhook WebhookEndpoint, opcode operation.Opcode, b
 	if timeout <= 0 {
 		timeout = defaultWebhookTimeout
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, webhook.URL, bytes.NewReader(payload))
@@ -1288,15 +1288,26 @@ func (s *Server) sendWebhook(webhook WebhookEndpoint, opcode operation.Opcode, b
 		return err
 	}
 	req.Header.Set("Content-Type", "application/json")
-	protocol.SetBearer(req.Header, webhook.Token)
+	if webhook.Token != "" {
+		protocol.SetBearer(req.Header, webhook.Token)
+	}
 	protocol.SetOpcode(req.Header, int(opcode))
 
 	resp, err := s.httpClient.Do(req)
 	if err != nil {
+		s.log(ctx, LogLevelError, fmt.Sprintf("Satori webhook transport failed opcode=%d error_type=%T", opcode, err))
 		return err
 	}
 	defer resp.Body.Close()
+	level := LogLevelDebug
 	if resp.StatusCode >= 400 {
+		level = LogLevelWarn
+	}
+	if resp.StatusCode >= 500 {
+		level = LogLevelError
+	}
+	s.log(ctx, level, fmt.Sprintf("Satori webhook response opcode=%d status=%d", opcode, resp.StatusCode))
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		bodyData, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
 		return fmt.Errorf("webhook response status %d: %s", resp.StatusCode, string(bodyData))
 	}
@@ -1549,11 +1560,8 @@ func (s *Server) runBlocking(ctx context.Context) error {
 	default:
 	}
 
-	if err := s.broadcastMetaToWebhooks(ctx); err != nil {
-		recordFirst(err)
-		cancel()
-		_ = group.Wait()
-		return firstErr
+	if err := s.broadcastMetaToWebhooks(groupCtx); err != nil {
+		s.log(ctx, LogLevelWarn, fmt.Sprintf("Satori metadata delivery failed error_type=%T", err))
 	}
 
 	select {
@@ -1615,7 +1623,7 @@ func (s *Server) runPublisherTask(ctx context.Context, source int, stream <-chan
 				return nil
 			}
 			if err := s.postFrom(ctx, source, evt); err != nil {
-				return err
+				s.log(ctx, LogLevelError, fmt.Sprintf("Satori event delivery failed source=%d error_type=%T", source, err))
 			}
 		}
 	}
@@ -1755,36 +1763,34 @@ func (s *Server) mountAdapterRootRoutes(router chi.Router) {
 func readIdentify(connection *websocketConnection) (string, int64, error) {
 	connection.connection.SetReadDeadline(time.Now().Add(defaultIdentifyTimeout))
 	defer connection.connection.SetReadDeadline(time.Time{})
-
 	_, payload, err := connection.connection.ReadMessage()
 	if err != nil {
 		return "", -1, err
 	}
-
 	var frame struct {
-		Op   operation.Opcode `json:"op"`
-		Body map[string]any   `json:"body"`
+		Op   *operation.Opcode `json:"op"`
+		Body struct {
+			Token    string `json:"token"`
+			Sn       *int64 `json:"sn"`
+			Sequence *int64 `json:"sequence"`
+		} `json:"body"`
 	}
 	if err := json.Unmarshal(payload, &frame); err != nil {
 		return "", -1, err
 	}
-	if frame.Op != operation.OpcodeIdentify {
+	if frame.Op == nil || *frame.Op != operation.OpcodeIdentify {
 		return "", -1, errors.New("invalid identify opcode")
 	}
-
-	token := asString(frame.Body["token"])
-	sequence := int64(-1)
-	if value, ok := frame.Body["sequence"]; ok {
-		if parsed, ok := toInt64(value); ok {
-			sequence = parsed
-		}
-	} else if value, ok := frame.Body["sn"]; ok {
-		if parsed, ok := toInt64(value); ok {
-			sequence = parsed
-		}
+	position := frame.Body.Sn
+	if position == nil {
+		position = frame.Body.Sequence
 	}
-
-	return token, sequence, nil
+	sequence := int64(-1)
+	if position != nil {
+		// Preserve the existing negative sentinel for clients that explicitly opt out of replay.
+		sequence = *position
+	}
+	return frame.Body.Token, sequence, nil
 }
 
 func parseParams(action string, request *http.Request) (any, error) {

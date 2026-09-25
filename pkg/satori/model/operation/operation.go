@@ -29,7 +29,7 @@ type EventBody event.Event
 // IDENTIFY 信令的 Body 数据
 type IdentifyBody struct {
 	Token string `json:"token,omitempty"` // 鉴权令牌
-	Sn    int64  `json:"sn,omitempty"`    // 序列号
+	Sn    *int64 `json:"sn,omitempty"`    // 序列号
 }
 
 // READY 信令的 Body 数据
