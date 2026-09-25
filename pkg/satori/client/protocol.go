@@ -18,6 +18,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/satori-protocol-go/satori-go/pkg/satori/logging"
 	"github.com/satori-protocol-go/satori-go/pkg/satori/model"
 	"github.com/satori-protocol-go/satori-go/pkg/satori/model/channel"
 	"github.com/satori-protocol-go/satori-go/pkg/satori/model/event"
@@ -266,7 +267,7 @@ func (p *APIProtocol) RequestInternal(
 	method string,
 	params map[string]any,
 	requestOptions ...RequestOption,
-) (map[string]any, error) {
+) (*http.Response, error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -282,11 +283,6 @@ func (p *APIProtocol) RequestInternal(
 			continue
 		}
 		option(options)
-	}
-	if options.timeoutSet && options.timeout > 0 {
-		var cancel context.CancelFunc
-		ctx, cancel = context.WithTimeout(ctx, options.timeout)
-		defer cancel()
 	}
 
 	var (
@@ -307,7 +303,7 @@ func (p *APIProtocol) RequestInternal(
 		if options.contentType != "" && headers.Get("Content-Type") == "" {
 			headers.Set("Content-Type", options.contentType)
 		}
-	} else if method != http.MethodGet || len(options.params) > 0 {
+	} else if options.params != nil {
 		var extraHeaders http.Header
 		body, extraHeaders, err = encodeJSONBody(options.params)
 		if err != nil {
@@ -352,11 +348,21 @@ func (p *APIProtocol) RequestInternal(
 	if err != nil {
 		return nil, err
 	}
-	payload, err := p.doRequestWithClient(request, client)
-	if err != nil {
-		return nil, err
+	// Native responses are consumed and closed by the caller. Only the configured
+	// SDK origin receives automatic credentials; redirects remain visible.
+	if p.isAPIURL(request.URL) {
+		for name, values := range p.apiHeaders() {
+			if name == "Content-Type" {
+				continue
+			}
+			if request.Header.Get(name) == "" {
+				request.Header[name] = append([]string(nil), values...)
+			}
+		}
 	}
-	return decodeObject(payload)
+	rawClient := *client
+	rawClient.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
+	return p.exchange(request, &rawClient)
 }
 
 func (p *APIProtocol) CallAPI(
@@ -528,9 +534,6 @@ func (p *APIProtocol) MessageList(
 	if direction == "" {
 		direction = "before"
 	}
-	if limit <= 0 {
-		limit = 50
-	}
 	if order == "" {
 		order = "asc"
 	}
@@ -538,13 +541,12 @@ func (p *APIProtocol) MessageList(
 		return nil, errors.New("invalid direction when next token is empty")
 	}
 
-	resp, err := p.CallAPI(ctx, string(protocol.ApiMessageList), map[string]any{
-		"channel_id": channelID,
-		"next":       nextToken,
-		"direction":  direction,
-		"limit":      limit,
-		"order":      order,
-	}, false, http.MethodPost)
+	params := map[string]any{"channel_id": channelID, "next": nextToken, "direction": direction, "order": order}
+	// Zero means use the platform's default; only the adapter knows its quota.
+	if limit != 0 {
+		params["limit"] = limit
+	}
+	resp, err := p.CallAPI(ctx, string(protocol.ApiMessageList), params, false, http.MethodPost)
 	if err != nil {
 		return nil, err
 	}
@@ -964,20 +966,23 @@ func (p *APIProtocol) FriendApprove(ctx context.Context, requestID string, appro
 	return err
 }
 
-func (p *APIProtocol) Internal(ctx context.Context, action string, method string, params map[string]any) (any, error) {
-	internalAction := protocol.NormalizeInternalApi(action)
-	if internalAction == "" {
+// Internal performs a native request. The caller consumes and closes Response.Body.
+func (p *APIProtocol) Internal(ctx context.Context, action string, method string, params map[string]any) (*http.Response, error) {
+	action = protocol.NormalizeInternalApi(action)
+	if action == "" {
 		return nil, errors.New("internal action cannot be empty")
 	}
-	resp, err := p.CallAPI(ctx, internalAction, params, false, method)
-	if err != nil {
-		return nil, err
+	return p.RequestInternal(ctx, joinURLPath(p.account.Config().APIBase(), action), normalizeAPIMethod(method), params)
+}
+
+func (p *APIProtocol) isAPIURL(target *url.URL) bool {
+	base, err := url.Parse(p.account.Config().APIBase())
+	if err != nil || target == nil {
+		return false
 	}
-	var result any
-	if err := decodeJSON(resp, &result); err != nil {
-		return nil, err
-	}
-	return result, nil
+	prefix := strings.TrimRight(base.Path, "/")
+	return target.Scheme == base.Scheme && strings.EqualFold(target.Host, base.Host) &&
+		(target.Path == prefix || strings.HasPrefix(target.Path, prefix+"/"))
 }
 
 func (p *APIProtocol) MetaGet(ctx context.Context) (*meta.Meta, error) {
@@ -1096,7 +1101,7 @@ func (p *APIProtocol) doRequestWithClient(request *http.Request, client *http.Cl
 		client = &http.Client{Timeout: p.timeout}
 	}
 
-	response, err := client.Do(request)
+	response, err := p.exchange(request, client)
 	if err != nil {
 		return nil, err
 	}
@@ -1117,7 +1122,7 @@ func (p *APIProtocol) resolveInternalRequestClient(options *InternalRequestOptio
 		return p.client, nil
 	}
 	requiresTransportClone := options.proxySet || options.tlsConfig != nil
-	if !requiresTransportClone {
+	if !requiresTransportClone && !options.timeoutSet {
 		return p.client, nil
 	}
 
@@ -1126,6 +1131,15 @@ func (p *APIProtocol) resolveInternalRequestClient(options *InternalRequestOptio
 		baseClient = &http.Client{Timeout: p.timeout}
 	}
 	clonedClient := *baseClient
+	if options.timeoutSet {
+		if options.timeout < 0 {
+			return nil, errors.New("request timeout must be nonnegative")
+		}
+		clonedClient.Timeout = options.timeout
+	}
+	if !requiresTransportClone {
+		return &clonedClient, nil
+	}
 
 	clonedTransport, err := cloneHTTPTransport(baseClient.Transport)
 	if err != nil {
@@ -1197,7 +1211,7 @@ type multipartPart struct {
 func resolveChannelID(target any) (string, error) {
 	switch typed := target.(type) {
 	case string:
-		channelID := strings.TrimSpace(typed)
+		channelID := typed
 		if channelID == "" {
 			return "", errors.New("channel id cannot be empty")
 		}
@@ -1206,13 +1220,13 @@ func resolveChannelID(target any) (string, error) {
 		if typed == nil {
 			return "", errors.New("channel cannot be nil")
 		}
-		channelID := strings.TrimSpace(typed.Id)
+		channelID := typed.Id
 		if channelID == "" {
 			return "", errors.New("channel id cannot be empty")
 		}
 		return channelID, nil
 	case channel.Channel:
-		channelID := strings.TrimSpace(typed.Id)
+		channelID := typed.Id
 		if channelID == "" {
 			return "", errors.New("channel id cannot be empty")
 		}
@@ -1225,7 +1239,7 @@ func resolveChannelID(target any) (string, error) {
 func resolveUserID(target any) (string, error) {
 	switch typed := target.(type) {
 	case string:
-		userID := strings.TrimSpace(typed)
+		userID := typed
 		if userID == "" {
 			return "", errors.New("user id cannot be empty")
 		}
@@ -1234,13 +1248,13 @@ func resolveUserID(target any) (string, error) {
 		if typed == nil {
 			return "", errors.New("user cannot be nil")
 		}
-		userID := strings.TrimSpace(typed.Id)
+		userID := typed.Id
 		if userID == "" {
 			return "", errors.New("user id cannot be empty")
 		}
 		return userID, nil
 	case user.User:
-		userID := strings.TrimSpace(typed.Id)
+		userID := typed.Id
 		if userID == "" {
 			return "", errors.New("user id cannot be empty")
 		}
@@ -1596,17 +1610,6 @@ func stringValue(value any) string {
 	}
 }
 
-func decodeObject(payload []byte) (map[string]any, error) {
-	if len(bytes.TrimSpace(payload)) == 0 {
-		return map[string]any{}, nil
-	}
-	result := map[string]any{}
-	if err := json.Unmarshal(payload, &result); err != nil {
-		return nil, err
-	}
-	return result, nil
-}
-
 func decodeJSON(payload []byte, target any) error {
 	_, err := protocol.DecodeJSONBytes(payload, target)
 	return err
@@ -1641,4 +1644,23 @@ func appendQueryValues(rawURL string, values url.Values) (string, error) {
 	}
 	parsed.RawQuery = query.Encode()
 	return parsed.String(), nil
+}
+
+// exchange logs transport metadata, never URLs, authorization or payload bytes.
+func (p *APIProtocol) exchange(request *http.Request, client *http.Client) (*http.Response, error) {
+	started := time.Now()
+	response, err := client.Do(request)
+	status := 0
+	if response != nil {
+		status = response.StatusCode
+	}
+	level := logging.LevelDebug
+	if status >= 400 {
+		level = logging.LevelWarn
+	}
+	if err != nil || status >= 500 {
+		level = logging.LevelError
+	}
+	p.account.log(request.Context(), level, fmt.Sprintf("Satori HTTP method=%s status=%d elapsed_ms=%d error_type=%T", request.Method, status, time.Since(started).Milliseconds(), err))
+	return response, err
 }
