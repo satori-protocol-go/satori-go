@@ -7,7 +7,11 @@ import (
 	"errors"
 	"fmt"
 	"github.com/WindowsSov8forUs/botgo-plus/interaction/signature"
+	"github.com/go-chi/chi/v5"
+	"github.com/satori-protocol-go/satori-go/pkg/satori/model"
+	"github.com/satori-protocol-go/satori-go/pkg/satori/model/event"
 	"github.com/satori-protocol-go/satori-go/pkg/satori/model/login"
+	"github.com/satori-protocol-go/satori-go/pkg/satori/model/message"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -207,6 +211,167 @@ func (f *qqFixture) call(action, platform, selfID string, params map[string]any)
 	return handler(&server.Request[any]{Action: action, Platform: platform, SelfID: selfID, Params: params})
 }
 
+func TestQQMessages(t *testing.T) {
+	declared := []string{"message.create", "guild.plain", "vendor:feature"}
+	f := newQQFixture(t, func(cfg *Config) { cfg.QQFeatures = declared })
+	logins, err := f.adapter.GetLogins(context.Background())
+	if err != nil || len(logins) != 2 || logins[0].Sn == logins[1].Sn {
+		t.Fatalf("logins=%+v error=%v", logins, err)
+	}
+	for _, id := range []string{"wrapped", "direct"} {
+		t.Run("message-get-"+id, func(t *testing.T) {
+			result, err := f.call("message.get", "qqguild", "bot-123", map[string]any{"channel_id": "channel", "message_id": id})
+			if err != nil {
+				t.Fatal(err)
+			}
+			value := result.(*message.Message)
+			if value.Id != id || value.Content != "retrieved" {
+				t.Fatalf("retrieved=%+v", value)
+			}
+		})
+	}
+	if strings.Join(logins[0].Features, ",") != strings.Join(declared, ",") {
+		t.Fatalf("explicit features=%v", logins[0].Features)
+	}
+	for _, tc := range []struct{ name, platform, target, content, path string }{
+		{"group", "qq", "group", "hello", "/v2/groups/group/messages"},
+		{"c2c", "qq", "private:user", "hello", "/v2/users/user/messages"},
+		{"channel", "qqguild", "channel", "hello", "/channels/channel/messages"},
+		{"channel-image", "qqguild", "channel", `<quote id="original"/><img src="data:image/png;base64,aW1hZ2U="/>`, "/channels/channel/messages"},
+		{"group-image", "qq", "group", `<img src="https://example.invalid/image.png"/>`, "/v2/groups/group/messages"},
+		{"c2c-audio", "qq", "private:user", `<audio src="https://example.invalid/audio.silk"/>`, "/v2/users/user/messages"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			result, err := f.call("message.create", tc.platform, "bot-123", map[string]any{"channel_id": tc.target, "content": tc.content, "referrer": map[string]any{"msg_id": "incoming", "msg_seq": 1}})
+			if err != nil {
+				t.Fatal(err)
+			}
+			messages := result.([]*message.Message)
+			if len(messages) != 1 || messages[0].Id == "" {
+				t.Fatalf("messages=%+v", messages)
+			}
+			calls := f.requests()
+			last := calls[len(calls)-1]
+			if last.Method != "POST" || last.Path != tc.path {
+				t.Fatalf("request=%s %s", last.Method, last.Path)
+			}
+			if tc.name == "channel-image" {
+				if string(last.Image) != "image" || !bytes.Contains(last.Fields["message_reference"], []byte("original")) {
+					t.Fatalf("image=%q reference=%s", last.Image, last.Fields["message_reference"])
+				}
+			}
+			if strings.Contains(tc.name, "group-image") || tc.name == "c2c-audio" {
+				if !bytes.Contains(last.Fields["media"], []byte("opaque!file-info")) || string(last.Fields["msg_type"]) != "7" {
+					t.Fatalf("media=%s", last.Raw)
+				}
+			}
+		})
+	}
+
+	t.Run("pagination", func(t *testing.T) {
+		for _, direction := range []string{"before", "after"} {
+			for _, order := range []string{"asc", "desc"} {
+				params := map[string]any{"channel_id": "channel", "next": " opaque+/== ", "direction": direction, "order": order, "limit": 100}
+				result, err := f.call("message.list", "qqguild", "bot-123", params)
+				if err != nil {
+					t.Fatal(err)
+				}
+				page := result.(*model.BidiPaginated[*message.Message])
+				cursor := "old"
+				if direction == "after" {
+					cursor = "new"
+				}
+				first := "old"
+				if order == "desc" {
+					first = "new"
+				}
+				if len(page.Data) != 2 || page.Data[0].Id != first || page.Prev != cursor || page.Next != cursor {
+					t.Fatalf("%s %s page=%+v", direction, order, page)
+				}
+				params["next"] = page.Next
+				result, err = f.call("message.list", "qqguild", "bot-123", params)
+				if err != nil {
+					t.Fatal(err)
+				}
+				page = result.(*model.BidiPaginated[*message.Message])
+				if len(page.Data) != 0 || page.Prev != "" || page.Next != "" {
+					t.Fatalf("terminal page=%+v", page)
+				}
+			}
+		}
+
+	})
+	t.Run("reply-context", func(t *testing.T) {
+		beforeReply := len(f.requests())
+		result, err := f.call("message.create", "qq", "bot-123", map[string]any{
+			"channel_id": "group", "content": `<quote id="REFIDX_quoted=="/>reply<message>next</message>`,
+			"referrer": map[string]any{"msg_id": "incoming", "event_id": "reply-event", "msg_seq": 2, "app_id": "123"},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		sent := result.([]*message.Message)
+		if len(sent) != 2 || sent[1].Referrer["msg_seq"] != 4 || sent[1].Referrer["ref_idx"] != "REFIDX_sent==" {
+			t.Fatalf("reply results=%+v", sent)
+		}
+		var calls []qqRequest
+		for _, item := range f.requests()[beforeReply:] {
+			if item.Path == "/v2/groups/group/messages" {
+				calls = append(calls, item)
+			}
+		}
+		for i, item := range calls {
+			if string(item.Fields["msg_id"]) != `"incoming"` || string(item.Fields["event_id"]) != `"reply-event"` || string(item.Fields["msg_seq"]) != strconv.Itoa(3+i) {
+				t.Fatalf("independent reply fields=%s", item.Raw)
+			}
+		}
+		if !bytes.Contains(calls[0].Fields["message_reference"], []byte("REFIDX_quoted==")) {
+			t.Fatalf("quote=%s", calls[0].Raw)
+		}
+		result, err = f.call("message.create", "qq", "bot-123", map[string]any{"channel_id": "group", "content": "continued", "referrer": sent[1].Referrer})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if result.([]*message.Message)[0].Referrer["msg_seq"] != 5 {
+			t.Fatalf("continued context=%+v", result)
+		}
+		result, err = f.call("message.create", "qq", "bot-123", map[string]any{"channel_id": "group", "content": `<qq:passive id="incoming" seq="7"/>passive`})
+		if err != nil || result.([]*message.Message)[0].Referrer["msg_seq"] != 8 {
+			t.Fatalf("passive context=%+v err=%v", result, err)
+		}
+		f.mu.Lock()
+		f.extra = func(w http.ResponseWriter, r *http.Request, item qqRequest) bool {
+			if r.URL.Path == "/v2/groups/partial/messages" && string(item.Fields["content"]) == `"second"` {
+				w.WriteHeader(403)
+				w.Write([]byte(`{"err_code":11253}`))
+				return true
+			}
+			return false
+		}
+		f.mu.Unlock()
+		result, err = f.call("message.create", "qq", "bot-123", map[string]any{"channel_id": "partial", "content": "<message>first</message><message>second</message>"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		response := result.(*server.Response)
+		var partial struct {
+			Error    string             `json:"error"`
+			Messages []*message.Message `json:"messages"`
+		}
+		if err := json.Unmarshal(response.Body, &partial); err != nil {
+			t.Fatal(err)
+		}
+		if response.StatusCode != 403 || len(partial.Messages) != 1 || partial.Messages[0].Id == "" || partial.Error == "" {
+			t.Fatalf("partial result=%d %s", response.StatusCode, response.Body)
+		}
+
+	})
+
+	if text := f.logs.text(); !strings.Contains(text, `QQ API action="message.create"`) {
+		t.Fatalf("QQ request logs=%s", text)
+	}
+}
+
 func signedQQRequest(t *testing.T, raw []byte, appID, secret string) *http.Request {
 	t.Helper()
 	r := httptest.NewRequest("POST", "/qqbot", bytes.NewReader(raw))
@@ -256,6 +421,93 @@ func TestQQWebhookDelivery(t *testing.T) {
 	secondEvent := <-f.adapter.eventCh
 	if secondEvent.Message == nil || secondEvent.Message.Id != "second" {
 		t.Fatalf("second event=%+v", secondEvent)
+	}
+}
+
+func TestQQWebhook(t *testing.T) {
+	f := newQQFixture(t, nil)
+	router := chi.NewRouter()
+	f.adapter.RegisterRootRoutes(router)
+	raw := []byte(`{"op":13,"d":{"plain_token":"plain","event_ts":"123"}}`)
+	r := httptest.NewRequest("POST", "/qqbot", bytes.NewReader(raw))
+	r.Header.Set("X-Bot-Appid", "123")
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, r)
+	var challenge struct {
+		Plain     string `json:"plain_token"`
+		Signature string `json:"signature"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &challenge); err != nil {
+		t.Fatalf("challenge status=%d body=%s err=%v", w.Code, w.Body, err)
+	}
+	header := http.Header{}
+	header.Set(signature.HeaderTimestamp, "123")
+	expected, err := signature.Generate("fixture-secret", header, []byte("plain"))
+	if err != nil || w.Code != 200 || challenge.Plain != "plain" || challenge.Signature != expected {
+		t.Fatalf("challenge=%+v status=%d err=%v", challenge, w.Code, err)
+	}
+
+	logger := &capturedQQLog{}
+	f.adapter.RegisterLogger(logger)
+	cases := []struct {
+		kind string
+		data map[string]any
+		want event.EventType
+	}{
+		{"GROUP_AT_MESSAGE_CREATE", map[string]any{"id": "at-message", "content": "hello", "group_openid": "group", "author": map[string]string{"member_openid": "member"}}, event.EventTypeMessageCreated},
+		{"GROUP_MESSAGE_CREATE", map[string]any{
+			"id": "incoming", "group_openid": "group", "content": `hello <img src="file:///literal"/> <@member>`,
+			"author":        map[string]any{"member_openid": "member", "member_role": "admin", "union_openid": "different-scope"},
+			"message_scene": map[string]any{"ext": []string{"msg_idx=REFIDX_in==", "future=abc"}},
+			"attachments":   []any{map[string]any{"content_type": "voice", "voice_wav_url": "https://example.invalid/voice.wav", "asr_refer_text": "speech"}},
+			"ark_data":      map[string]any{"prompt": "card", "fields": map[string]any{"future": []int{1, 2}}},
+			"msg_elements":  []any{map[string]any{"msg_idx": "REFIDX_child==", "content": "child", "msg_elements": []any{map[string]any{"content": "nested"}}}},
+		}, event.EventTypeMessageCreated},
+		{"GROUP_MEMBER_ADD", map[string]any{"group_openid": "group", "member_openid": "member", "member_role": "admin", "op_member_openid": "operator"}, event.EventTypeGuildMemberAdded},
+		{"GROUP_JOIN_REQUEST", map[string]any{"group_openid": "group", "member_openid": "member", "join_request_id": "join-id"}, event.EventTypeGuildMemberRequest},
+		{"FUTURE_QQ_EVENT", map[string]any{"opaque": json.Number("9007199254740993")}, event.EventTypeInternal},
+	}
+	for _, tc := range cases {
+		t.Run(tc.kind, func(t *testing.T) {
+			raw, err := json.Marshal(map[string]any{"op": 0, "s": 8, "t": tc.kind, "id": "native-event-id", "d": tc.data})
+			if err != nil {
+				t.Fatal(err)
+			}
+			response := httptest.NewRecorder()
+			router.ServeHTTP(response, signedQQRequest(t, raw, "123", "fixture-secret"))
+			if response.Code != 200 || !strings.Contains(response.Body.String(), `"d":0`) {
+				t.Fatalf("callback=%d %s", response.Code, response.Body)
+			}
+			select {
+			case evt := <-f.adapter.eventCh:
+				if evt.Type != tc.want || evt.Login.Platform != "qq" || evt.Login.User.Id != "bot-123" || evt.Type_ != tc.kind {
+					t.Fatalf("event=%+v", evt)
+				}
+				preserved, ok := evt.Data_.(json.RawMessage)
+				if !ok || !bytes.Equal(raw, preserved) || evt.Referrer["qq_event_id"] != "native-event-id" {
+					t.Fatalf("native context=%+v", evt.Referrer)
+				}
+				if tc.kind == "GROUP_MESSAGE_CREATE" {
+					if evt.Channel.Id != "group" || evt.User.Id != "member" || len(evt.Member.Roles) != 1 || evt.Member.Roles[0].Id != "admin" || evt.Referrer["ref_idx"] != "REFIDX_in==" {
+						t.Fatalf("group resources=%+v", evt)
+					}
+					for _, fragment := range []string{"&lt;img", `<at id="member"/>`, `<audio`, "voice.wav", "qq:ark-data", "nested", "REFIDX_child=="} {
+						if !strings.Contains(evt.Message.Content, fragment) {
+							t.Errorf("missing %q in %s", fragment, evt.Message.Content)
+						}
+					}
+				}
+				if tc.kind == "GROUP_JOIN_REQUEST" && evt.Message.Id != "join-id" {
+					t.Fatalf("request message=%+v", evt.Message)
+				}
+			case <-time.After(time.Second):
+				t.Fatal("converted event timed out")
+			}
+		})
+	}
+
+	if text := logger.text(); !strings.Contains(text, `message_id="incoming"`) || !strings.Contains(text, "QQ webhook response") {
+		t.Fatalf("QQ callback logs=%s", text)
 	}
 }
 
