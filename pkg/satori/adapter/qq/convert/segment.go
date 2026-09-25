@@ -30,6 +30,8 @@ type MessageSegment struct {
 	ArkJSON  string
 	Markdown bool
 	Buttons  [][]MessageButton
+	// Pre-encoded alternative for an unquoted, text-only QQ group user mention.
+	GroupMentionMarkdown string
 }
 
 type QQPassiveReferrer struct {
@@ -56,13 +58,21 @@ func ParseMessage(content, platform string) ([]MessageSegment, QQPassiveReferrer
 	return state.segments, state.passive, nil
 }
 
+type userMentionSpan struct {
+	start int
+	end   int
+	id    string
+}
+
 type qqMessageParser struct {
-	platform     string
-	pendingQuote string
-	currentText  strings.Builder
-	segments     []MessageSegment
-	passive      QQPassiveReferrer
-	err          error
+	platform      string
+	pendingQuote  string
+	currentText   strings.Builder
+	segments      []MessageSegment
+	passive       QQPassiveReferrer
+	err           error
+	groupMentions bool
+	mentions      []userMentionSpan
 }
 
 func parseQQMessage(content string, platform string) (*qqMessageParser, error) {
@@ -73,13 +83,17 @@ func parseQQMessage(content string, platform string) (*qqMessageParser, error) {
 	}
 
 	state := &qqMessageParser{
-		platform: platform,
-		segments: make([]MessageSegment, 0, len(elements)),
+		platform:      platform,
+		segments:      make([]MessageSegment, 0, len(elements)),
+		groupMentions: platform == "qq",
 	}
 	state.walk(elements)
 	state.flushText()
 	if state.err != nil {
 		return nil, state.err
+	}
+	if state.groupMentions && len(state.mentions) > 0 && len(state.segments) == 1 {
+		state.segments[0].GroupMentionMarkdown = renderUserMentionMarkdown(state.segments[0].Text, state.mentions)
 	}
 	return state, nil
 }
@@ -107,12 +121,19 @@ func (p *qqMessageParser) walk(elements []element.Element) {
 			p.walk(typed.Children())
 			p.flushText()
 		case *element.Quote:
+			p.groupMentions = false
 			p.flushText()
 			if typed.Id != "" {
 				p.pendingQuote = typed.Id
 			}
 		case *element.At:
+			start := p.currentText.Len()
 			p.writeText(p.renderAt(typed))
+			if typed.Id == "" || typed.Type != "" || typed.Role != "" {
+				p.groupMentions = false
+			} else if p.groupMentions {
+				p.mentions = append(p.mentions, userMentionSpan{start: start, end: p.currentText.Len(), id: typed.Id})
+			}
 		case *element.Sharp:
 			p.writeText(p.renderSharp(typed))
 		case *element.A:
@@ -129,12 +150,16 @@ func (p *qqMessageParser) walk(elements []element.Element) {
 		case *element.File:
 			p.appendResource(MessageResourceFile, typed.Src, typed.Title)
 		case *element.Extension:
+			if typed.Tag() != "qq:passive" {
+				p.groupMentions = false
+			}
 			if p.tryAppendExtendedSegment(typed) {
 				continue
 			}
 			p.writeText(p.renderExtension(typed))
 			p.walk(typed.Children())
 		case *element.Button:
+			p.groupMentions = false
 			// Buttons are only meaningful in qq markdown mode.
 			if p.platform == "qq" {
 				p.flushText()
@@ -170,6 +195,7 @@ func (p *qqMessageParser) flushText() {
 }
 
 func (p *qqMessageParser) appendResource(kind MessageResourceKind, src, title string) {
+	p.groupMentions = false
 	if src == "" {
 		return
 	}
@@ -181,6 +207,29 @@ func (p *qqMessageParser) consumeQuote() string {
 	value := p.pendingQuote
 	p.pendingQuote = ""
 	return value
+}
+
+var mentionMarkdownEscaper = strings.NewReplacer(
+	"\\", "\\\\", "`", "\\`", "*", "\\*", "_", "\\_",
+	"{", "\\{", "}", "\\}", "[", "\\[", "]", "\\]",
+	"(", "\\(", ")", "\\)", "#", "\\#", "+", "\\+",
+	"-", "\\-", ".", "\\.", "!", "\\!", "<", "\\<",
+	">", "\\>", "~", "\\~",
+)
+
+// Only structured user mentions become native tags; ordinary text is escaped once.
+func renderUserMentionMarkdown(text string, mentions []userMentionSpan) string {
+	var out strings.Builder
+	position := 0
+	for _, mention := range mentions {
+		out.WriteString(mentionMarkdownEscaper.Replace(text[position:mention.start]))
+		out.WriteString(`<qqbot-at-user id="`)
+		out.WriteString(xhtml.Escape(mention.id, true))
+		out.WriteString(`" />`)
+		position = mention.end
+	}
+	out.WriteString(mentionMarkdownEscaper.Replace(text[position:]))
+	return out.String()
 }
 
 func (p *qqMessageParser) renderAt(input *element.At) string {
