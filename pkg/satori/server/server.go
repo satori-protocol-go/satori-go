@@ -139,9 +139,6 @@ func NewServer(cfg Config) (*Server, error) {
 		path = "/" + path
 	}
 	path = strings.TrimSuffix(path, "/")
-	if (host == "0.0.0.0" || host == "::") && strings.TrimSpace(cfg.Token) == "" {
-		return nil, errors.New("token is required when server host is public")
-	}
 
 	streamThreshold := cfg.StreamThreshold
 	if streamThreshold <= 0 {
@@ -352,18 +349,17 @@ func (s *Server) Handler() (http.Handler, error) {
 	baseHandler := s.baseHandler
 	s.mu.RUnlock()
 
+	var router chi.Router
 	if replaceRouter != nil {
 		// ReplaceRouter mode mounts Satori protocol routes into the caller-provided chi router.
 		// Route conflict behavior is governed by chi's matcher precedence:
 		// parent-level exact routes can override grouped Route(base, ...) handlers.
 		// Consumers should register conflicting routes intentionally based on desired priority.
-		if err := s.RegisterRoutes(replaceRouter); err != nil {
-			return nil, err
-		}
-		return s.wrapResponseHeaders(replaceRouter), nil
+		router = replaceRouter
+	} else {
+		router = chi.NewRouter()
 	}
 
-	router := chi.NewRouter()
 	if err := s.RegisterRoutes(router); err != nil {
 		return nil, err
 	}
@@ -421,17 +417,20 @@ func (s *Server) mountProtocolRoutes(router chi.Router) {
 	base := s.apiBasePath()
 	router.Route(base, func(r chi.Router) {
 		r.Get("/events", s.websocketServerHandler)
-		r.Post("/meta", s.metaGetHandler)
-		r.Post("/meta/webhook.create", s.webhookCreateHandler)
-		r.Post("/meta/webhook.delete", s.webhookDeleteHandler)
+		r.Post("/meta", s.authorized(s.metaGetHandler))
+		r.Post("/meta/webhook.create", s.authorized(s.webhookCreateHandler))
+		r.Post("/meta/webhook.delete", s.authorized(s.webhookDeleteHandler))
 		for _, method := range [...]string{
 			http.MethodGet,
 			http.MethodPost,
 			http.MethodPut,
+			http.MethodPatch,
+			http.MethodHead,
+			http.MethodOptions,
 			http.MethodDelete,
 		} {
 			r.MethodFunc(method, "/proxy/*", s.proxyURLHandler)
-			r.MethodFunc(method, "/*", s.httpServerHandler)
+			r.MethodFunc(method, "/*", s.authorized(s.httpServerHandler))
 		}
 	})
 }
@@ -767,10 +766,37 @@ func (s *Server) websocketServerHandler(w http.ResponseWriter, request *http.Req
 	s.log(request.Context(), LogLevelInfo, closedBuilder.String())
 }
 
+// authorized protects Satori RPC and metadata routes, not platform callbacks or static files.
+func (s *Server) authorized(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if s.authorize(w, r) {
+			next(w, r)
+		}
+	}
+}
+
+func (s *Server) authorize(w http.ResponseWriter, r *http.Request) bool {
+	if s.Token == "" {
+		return true
+	}
+	token, ok := protocol.ParseBearer(r.Header.Get(protocol.HeaderAuthorization))
+	if !ok || token != s.Token {
+		s.log(r.Context(), LogLevelWarn, "Satori HTTP authorization failed status=401")
+		w.Header().Set("WWW-Authenticate", "Bearer")
+		writeError(w, Unauthorized("invalid Satori authorization"))
+		return false
+	}
+	return true
+}
+
 func (s *Server) httpServerHandler(w http.ResponseWriter, request *http.Request) {
 	s.ensureDefaultUploadRoute()
 
 	action := s.extractAction(request)
+	if protocol.IsApi(protocol.ParseApi(action)) && request.Method != http.MethodPost {
+		writeMethodNotAllowed(w)
+		return
+	}
 	s.mu.RLock()
 	hasAdapters := len(s.adapters) > 0
 	hasServerRoutes := len(s.routes) > 0
@@ -879,6 +905,7 @@ func (s *Server) findRouteHandler(action string, platform string, selfID string)
 	routers := append([]Router(nil), s.routers...)
 	s.mu.RUnlock()
 
+	var selected RouteCall[any, any]
 	for _, adapter := range adapters {
 		handler, ok := matchRoute(adapter.Routes(), action)
 		if !ok {
@@ -887,7 +914,15 @@ func (s *Server) findRouteHandler(action string, platform string, selfID string)
 		if !adapter.Ensure(platform, selfID) {
 			continue
 		}
-		return handler, true
+		if selected != nil {
+			return func(*Request[any]) (any, error) {
+				return nil, NewActionError(409, "ambiguous platform account route", nil)
+			}, true
+		}
+		selected = handler
+	}
+	if selected != nil {
+		return selected, true
 	}
 
 	if handler, ok := matchRoute(serverRoutes, action); ok {
@@ -1660,6 +1695,10 @@ func readIdentify(connection *websocketConnection) (string, int64, error) {
 }
 
 func parseParams(action string, request *http.Request) (any, error) {
+	// Native handlers receive the original method, query and body via Origin.
+	if strings.HasPrefix(action, protocol.InternalApiPrefix) {
+		return nil, nil
+	}
 	if action == string(protocol.ApiUploadCreate) {
 		if err := request.ParseMultipartForm(defaultReadFormMemory); err != nil {
 			return nil, BadRequest(err.Error())
