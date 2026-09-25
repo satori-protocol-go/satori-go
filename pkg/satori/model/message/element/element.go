@@ -131,8 +131,7 @@ func (e *BaseElement) MarshalXHTML(strip bool) string {
 		return ""
 	}
 	tag := e.ownerTag()
-	_, hasText := e.attrs["text"]
-	if tag == "text" || hasText {
+	if tag == "text" {
 		text, _ := e.Get("text")
 		if strip {
 			return fmt.Sprint(text)

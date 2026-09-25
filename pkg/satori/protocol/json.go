@@ -24,6 +24,13 @@ func DecodeJSONBytes(data []byte, target any) (bool, error) {
 		}
 		return false, err
 	}
+	var extra any
+	if err := decoder.Decode(&extra); err != io.EOF {
+		if err == nil {
+			err = errors.New("multiple JSON values in request body")
+		}
+		return false, err
+	}
 	return true, nil
 }
 
