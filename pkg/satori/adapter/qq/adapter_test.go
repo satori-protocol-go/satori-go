@@ -6,14 +6,17 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/WindowsSov8forUs/botgo-plus/interaction/signature"
 	"github.com/satori-protocol-go/satori-go/pkg/satori/model/login"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/WindowsSov8forUs/botgo-plus/dto"
 	sdklog "github.com/WindowsSov8forUs/botgo-plus/log"
@@ -202,6 +205,58 @@ func (f *qqFixture) call(action, platform, selfID string, params map[string]any)
 		return nil, fmt.Errorf("route %s missing", action)
 	}
 	return handler(&server.Request[any]{Action: action, Platform: platform, SelfID: selfID, Params: params})
+}
+
+func signedQQRequest(t *testing.T, raw []byte, appID, secret string) *http.Request {
+	t.Helper()
+	r := httptest.NewRequest("POST", "/qqbot", bytes.NewReader(raw))
+	r.Header.Set("X-Bot-Appid", appID)
+	r.Header.Set(signature.HeaderTimestamp, strconv.FormatInt(time.Now().Unix(), 10))
+	signed, err := signature.Generate(secret, r.Header, raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	r.Header.Set("X-Signature-Ed25519", signed)
+	return r
+}
+
+func TestQQWebhookDelivery(t *testing.T) {
+	f := newQQFixture(t, func(cfg *Config) { cfg.EventBuffer = 1 })
+	payload := func(id string) []byte {
+		return []byte(fmt.Sprintf(`{"op":0,"s":1,"t":"GROUP_AT_MESSAGE_CREATE","d":{"id":%q,"content":"hello","group_openid":"g","author":{"member_openid":"u"}}}`, id))
+	}
+	first := httptest.NewRecorder()
+	f.adapter.handleWebhookRequest(first, signedQQRequest(t, payload("first"), "123", "fixture-secret"))
+	if first.Code != 200 {
+		t.Fatalf("first response=%d %s", first.Code, first.Body.String())
+	}
+	done := make(chan *httptest.ResponseRecorder, 1)
+	go func() {
+		second := httptest.NewRecorder()
+		f.adapter.handleWebhookRequest(second, signedQQRequest(t, payload("second"), "123", "fixture-secret"))
+		done <- second
+	}()
+	select {
+	case result := <-done:
+		t.Fatalf("callback acknowledged before queue delivery: %d", result.Code)
+	case <-time.After(30 * time.Millisecond):
+	}
+	firstEvent := <-f.adapter.eventCh
+	if firstEvent.Message == nil || firstEvent.Message.Id != "first" {
+		t.Fatalf("first event=%+v", firstEvent)
+	}
+	select {
+	case result := <-done:
+		if result.Code != 200 {
+			t.Fatalf("second response=%d %s", result.Code, result.Body.String())
+		}
+	case <-time.After(time.Second):
+		t.Fatal("callback did not finish after queue became available")
+	}
+	secondEvent := <-f.adapter.eventCh
+	if secondEvent.Message == nil || secondEvent.Message.Id != "second" {
+		t.Fatalf("second event=%+v", secondEvent)
+	}
 }
 
 func TestQQNativeResponses(t *testing.T) {

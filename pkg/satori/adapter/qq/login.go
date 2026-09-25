@@ -127,8 +127,10 @@ func (a *Adapter) pushEvent(ctx context.Context, evt *event.Event) error {
 	select {
 	case a.eventCh <- evt:
 		return nil
-	default:
-		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-a.eventContext.Done():
+		return a.eventContext.Err()
 	}
 }
 
