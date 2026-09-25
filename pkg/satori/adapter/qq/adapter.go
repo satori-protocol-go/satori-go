@@ -88,7 +88,9 @@ func New(cfg Config) (*Adapter, error) {
 	if wsIntents == 0 {
 		wsIntents = defaultWSIntents
 	}
-	logger.Log(context.Background(), logging.LevelInfo, fmt.Sprintf("subscribed intents=%d", wsIntents))
+	if cfg.UseWebSocket {
+		logger.Log(context.Background(), logging.LevelInfo, fmt.Sprintf("Using intent mask %d for the QQ WebSocket connection.", wsIntents))
+	}
 	wsReconnect := cfg.WSReconnectDelay
 	if wsReconnect <= 0 {
 		wsReconnect = defaultWSReconnect

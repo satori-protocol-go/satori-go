@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/gorilla/websocket"
+	"github.com/satori-protocol-go/satori-go/pkg/satori/logging"
 	"github.com/satori-protocol-go/satori-go/pkg/satori/model/operation"
 )
 
@@ -89,7 +90,7 @@ func (c *websocketConnection) CloseWith(code int, reason string) error {
 	)
 	c.writeMu.Unlock()
 	if writeErr != nil {
-		c.setCloseInfo("close control write failed", writeErr)
+		c.setCloseInfo("failed to send the close frame", writeErr)
 	}
 	return c.Close()
 }
@@ -97,11 +98,11 @@ func (c *websocketConnection) CloseWith(code int, reason string) error {
 func (c *websocketConnection) Close() error {
 	var closeErr error
 	c.closeOnce.Do(func() {
-		c.setCloseInfo("closed", nil)
+		c.setCloseInfo("connection closed", nil)
 		close(c.closeSignal)
 		closeErr = c.connection.Close()
 		if closeErr != nil {
-			c.setCloseInfo("close failed", closeErr)
+			c.setCloseInfo("failed to close the connection", closeErr)
 		}
 	})
 	return closeErr
@@ -114,7 +115,7 @@ func (c *websocketConnection) Send(payload any) error {
 		return err
 	}
 	if err := c.connection.WriteJSON(payload); err != nil {
-		c.setCloseInfo("write failed", err)
+		c.setCloseInfo("failed to write a frame", err)
 		return err
 	}
 	return nil
@@ -136,22 +137,22 @@ func (c *websocketConnection) Heartbeat(timeout time.Duration) {
 		_, payload, err := c.connection.ReadMessage()
 		if err != nil {
 			if isTimeoutError(err) {
-				c.setCloseInfo("heartbeat timeout", err)
+				c.setCloseInfo("heartbeat timed out", err)
 				c.log(LogLevelWarn, fmt.Sprintf(
-					"websocket heartbeat timeout connection_id=%s remote_addr=%s error=%v",
+					"WebSocket client %s at %s timed out while waiting for a heartbeat: %s",
 					c.id,
-					c.remoteAddr,
-					err,
+					logging.SafeText(c.remoteAddr),
+					logging.ErrorText(err),
 				))
 			} else {
 				var closeErr *websocket.CloseError
 				if errors.As(err, &closeErr) {
 					c.setCloseInfo(
-						fmt.Sprintf("peer closed (%d)", closeErr.Code),
+						fmt.Sprintf("peer closed the connection with code %d", closeErr.Code),
 						err,
 					)
 				} else {
-					c.setCloseInfo("read failed", err)
+					c.setCloseInfo("failed to read a frame", err)
 				}
 			}
 			_ = c.Close()
@@ -172,18 +173,18 @@ func (c *websocketConnection) Heartbeat(timeout time.Duration) {
 		c.setHeartbeat(latency)
 		if err := c.Send(map[string]any{"op": operation.OpcodePong}); err != nil {
 			c.log(LogLevelWarn, fmt.Sprintf(
-				"websocket pong failed connection_id=%s remote_addr=%s error=%v",
+				"Failed to send PONG to WebSocket client %s at %s: %s",
 				c.id,
-				c.remoteAddr,
-				err,
+				logging.SafeText(c.remoteAddr),
+				logging.ErrorText(err),
 			))
 			_ = c.Close()
 			return
 		}
 		c.log(LogLevelDebug, fmt.Sprintf(
-			"websocket heartbeat pong connection_id=%s remote_addr=%s read_wait_ms=%d",
+			"Sent PONG to WebSocket client %s at %s after waiting %d ms for input.",
 			c.id,
-			c.remoteAddr,
+			logging.SafeText(c.remoteAddr),
 			latency.Milliseconds(),
 		))
 	}

@@ -104,7 +104,7 @@ func (a *Adapter) runShardLoop(ctx context.Context, state *appState, gatewayURL 
 			return statusErr
 		}
 		if err != nil {
-			a.log(ctx, logging.LevelWarn, fmt.Sprintf("QQ gateway disconnected app_id=%s shard_id=%d error=%v", state.appID, target.ID, err))
+			a.log(ctx, logging.LevelWarn, fmt.Sprintf("QQ gateway shard %d for app %s ended with an error: %s", target.ID, logging.SafeText(state.appID), logging.ErrorText(err)))
 			if manager.CanNotResume(err) {
 				session.ID = ""
 				session.LastSeq = 0
@@ -246,7 +246,7 @@ func parseWSIntentNames(names []string, logger logging.Logger) int64 {
 			intents |= value
 			continue
 		}
-		logger.Log(context.Background(), logging.LevelWarn, fmt.Sprintf("unknown intent=%s", raw))
+		logger.Log(context.Background(), logging.LevelWarn, fmt.Sprintf("Ignoring unknown QQ WebSocket intent %q.", raw))
 	}
 	return int64(intents)
 }
@@ -338,7 +338,14 @@ func (a *Adapter) updateShardStatus(ctx context.Context, state *appState, shard 
 		events = append(events, &event.Event{Type: event.EventTypeLoginUpdated, Timestamp: time.Now().UnixMilli(), Login: cloneLogin(info)})
 	}
 	a.mu.Unlock()
-	a.log(ctx, logging.LevelInfo, fmt.Sprintf("QQ gateway state app_id=%q shard=%d status=%d", state.appID, shard, status))
+	description := fmt.Sprintf("QQ gateway shard %d is offline for app %s; the login is reconnecting.", shard, logging.SafeText(state.appID))
+	if ready {
+		description = fmt.Sprintf("QQ gateway shard %d is ready for app %s; waiting for the remaining shards.", shard, logging.SafeText(state.appID))
+		if status == login.LoginStatusOnline {
+			description = fmt.Sprintf("QQ gateway shard %d is ready for app %s; all required shards are online.", shard, logging.SafeText(state.appID))
+		}
+	}
+	a.log(ctx, logging.LevelInfo, description)
 	for _, evt := range events {
 		if err := a.pushEvent(ctx, evt); err != nil {
 			return err

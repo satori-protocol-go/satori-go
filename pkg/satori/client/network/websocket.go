@@ -113,7 +113,7 @@ func (n *WS) Run(ctx context.Context) error {
 			return nil
 		}
 
-		n.base.Log(ctx, logging.LevelWarn, fmt.Sprintf("websocket network disconnected network_id=%s error=%v", n.ID(), err))
+		n.base.Log(ctx, logging.LevelWarn, fmt.Sprintf("WebSocket connection %s to the Satori server ended with an error: %s", logging.SafeText(n.ID()), logging.ErrorText(err)))
 		n.base.app.MarkNetworkStatus(n.ID(), login.LoginStatusReconnect, false)
 
 		select {
@@ -181,7 +181,7 @@ func (n *WS) connectAndServe(ctx context.Context) error {
 		return err
 	}
 	n.base.MarkAvailable()
-	n.base.Log(ctx, logging.LevelInfo, fmt.Sprintf("Satori websocket ready network_id=%s", n.ID()))
+	n.base.Log(ctx, logging.LevelInfo, fmt.Sprintf("WebSocket connection %s to the Satori server is authenticated and ready.", logging.SafeText(n.ID())))
 
 	frames := make(chan wsFrame, eventQueueSize)
 	results := make(chan error, 2)
@@ -244,7 +244,7 @@ func (n *WS) authenticate(connection *websocket.Conn) error {
 		return err
 	}
 	if len(ready.Logins) == 0 {
-		n.base.Log(context.Background(), logging.LevelWarn, fmt.Sprintf("no login available for websocket network_id=%s", n.ID()))
+		n.base.Log(context.Background(), logging.LevelWarn, fmt.Sprintf("The Satori server reported no available logins on WebSocket connection %s.", logging.SafeText(n.ID())))
 	}
 	return nil
 }
@@ -273,7 +273,7 @@ func (n *WS) receiveLoop(ctx context.Context, connection *websocket.Conn, frames
 			case frames <- frame:
 			}
 		default:
-			n.base.Log(ctx, logging.LevelDebug, fmt.Sprintf("unhandled Satori opcode network_id=%s opcode=%d", n.ID(), *frame.Op))
+			n.base.Log(ctx, logging.LevelDebug, fmt.Sprintf("Ignored unsupported Satori frame %s on WebSocket connection %s.", logging.FrameName(*frame.Op), logging.SafeText(n.ID())))
 		}
 	}
 }
@@ -305,7 +305,7 @@ func (n *WS) dispatchFrames(ctx context.Context, frames <-chan wsFrame) error {
 					return errors.New("invalid Satori event envelope")
 				}
 				if err := n.base.app.PostEvent(n.ID(), &evt); err != nil {
-					n.base.Log(ctx, logging.LevelError, fmt.Sprintf("event handling failed network_id=%s event_sn=%d error=%v", n.ID(), evt.Sn, err))
+					n.base.Log(ctx, logging.LevelError, fmt.Sprintf("Failed to handle event %d received on WebSocket connection %s: %s", evt.Sn, logging.SafeText(n.ID()), logging.ErrorText(err)))
 				}
 				n.base.SetSequence(evt.Sn)
 			case operation.OpcodeMeta:

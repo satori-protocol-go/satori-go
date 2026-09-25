@@ -117,7 +117,7 @@ func (n *Webhook) Run(ctx context.Context) error {
 		return err
 	}
 	n.base.MarkAvailable()
-	n.base.Log(ctx, logging.LevelInfo, fmt.Sprintf("Satori webhook ready network_id=%s", n.ID()))
+	n.base.Log(ctx, logging.LevelInfo, fmt.Sprintf("Webhook receiver %s is ready on %s.", logging.SafeText(n.ID()), listener.Addr()))
 	defer n.base.MarkUnavailable()
 
 	select {
@@ -215,7 +215,7 @@ func (n *Webhook) handleRequest(w http.ResponseWriter, request *http.Request) {
 	if n.token != "" {
 		token, ok := protocol.ParseBearer(request.Header.Get(protocol.HeaderAuthorization))
 		if !ok || token != n.token {
-			n.base.Log(request.Context(), logging.LevelWarn, "Satori webhook authorization failed status=401")
+			n.base.Log(request.Context(), logging.LevelWarn, fmt.Sprintf("Rejected a request to Webhook receiver %s because authorization failed.", logging.SafeText(n.ID())))
 			w.WriteHeader(http.StatusUnauthorized)
 			return
 		}
@@ -253,7 +253,7 @@ func (n *Webhook) handleRequest(w http.ResponseWriter, request *http.Request) {
 			return
 		}
 		if err := n.base.app.PostEvent(n.ID(), &evt); err != nil {
-			n.base.Log(request.Context(), logging.LevelError, fmt.Sprintf("webhook event handling failed network_id=%s event_sn=%d error=%v", n.ID(), evt.Sn, err))
+			n.base.Log(request.Context(), logging.LevelError, fmt.Sprintf("Failed to handle event %d received by Webhook receiver %s: %s", evt.Sn, logging.SafeText(n.ID()), logging.ErrorText(err)))
 			w.WriteHeader(http.StatusServiceUnavailable)
 			return
 		}
@@ -262,7 +262,7 @@ func (n *Webhook) handleRequest(w http.ResponseWriter, request *http.Request) {
 		w.WriteHeader(http.StatusBadRequest)
 		return
 	}
-	n.base.Log(request.Context(), logging.LevelDebug, fmt.Sprintf("Satori webhook accepted network_id=%s opcode=%d", n.ID(), opcode))
+	n.base.Log(request.Context(), logging.LevelDebug, fmt.Sprintf("Handled the %s frame received by Webhook receiver %s.", logging.FrameName(operation.Opcode(opcode)), logging.SafeText(n.ID())))
 	w.WriteHeader(http.StatusOK)
 }
 

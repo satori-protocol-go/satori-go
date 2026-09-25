@@ -23,6 +23,7 @@ import (
 
 	"github.com/go-chi/chi/v5"
 	"github.com/gorilla/websocket"
+	"github.com/satori-protocol-go/satori-go/pkg/satori/logging"
 	"github.com/satori-protocol-go/satori-go/pkg/satori/model/event"
 	"github.com/satori-protocol-go/satori-go/pkg/satori/model/login"
 	"github.com/satori-protocol-go/satori-go/pkg/satori/model/meta"
@@ -482,7 +483,11 @@ func (s *Server) Run(ctx context.Context) error {
 		if runErr != nil {
 			level = LogLevelError
 		}
-		s.log(ctx, level, fmt.Sprintf("Satori server stopped error_type=%T", runErr))
+		description := "Satori server stopped."
+		if runErr != nil {
+			description = "Satori server stopped with an error: " + logging.ErrorText(runErr)
+		}
+		s.log(ctx, level, description)
 	}()
 
 	if err := s.runPreparing(runCtx); err != nil {
@@ -496,7 +501,13 @@ func (s *Server) Run(ctx context.Context) error {
 		return runErr
 	}
 
-	s.log(runCtx, LogLevelInfo, fmt.Sprintf("Satori server running host=%q port=%d", s.Host, s.Port))
+	s.mu.RLock()
+	address := net.JoinHostPort(s.Host, strconv.Itoa(s.Port))
+	if s.listener != nil {
+		address = s.listener.Addr().String()
+	}
+	s.mu.RUnlock()
+	s.log(runCtx, LogLevelInfo, fmt.Sprintf("Satori server is listening on %s.", address))
 	blockErr := s.runBlocking(runCtx)
 	cleanupCtx, cancelCleanup := context.WithTimeout(context.Background(), defaultCleanupTimeout)
 	cleanupErr := s.runCleanup(cleanupCtx)
@@ -601,7 +612,7 @@ func (s *Server) postFrom(ctx context.Context, source int, evt *event.Event) err
 			continue
 		}
 		if err := connection.Send(payload); err != nil {
-			s.log(context.Background(), LogLevelWarn, fmt.Sprintf("websocket broadcast failed connection_id=%s error=%v", connection.ID(), err))
+			s.log(context.Background(), LogLevelWarn, fmt.Sprintf("Failed to send an event to WebSocket client %s: %s", connection.ID(), logging.ErrorText(err)))
 			_ = connection.Close()
 			s.removeConnection(connection)
 		}
@@ -793,19 +804,19 @@ func (s *Server) websocketServerHandler(w http.ResponseWriter, request *http.Req
 		},
 	)
 	defer connection.Close()
-	acceptMessage := fmt.Sprintf("websocket accepted connection_id=%s remote_addr=%s", connection.ID(), connection.RemoteAddr())
+	acceptMessage := fmt.Sprintf("Accepted WebSocket client %s from %s.", connection.ID(), logging.SafeText(connection.RemoteAddr()))
 	if subprotocol := conn.Subprotocol(); subprotocol != "" {
-		acceptMessage = fmt.Sprintf("%s subprotocol=%s", acceptMessage, subprotocol)
+		acceptMessage += fmt.Sprintf(" Negotiated subprotocol %q.", subprotocol)
 	}
 	s.log(request.Context(), LogLevelInfo, acceptMessage)
 
 	token, sequence, err := readIdentify(connection)
 	if err != nil {
-		s.log(
-			request.Context(),
-			LogLevelWarn,
-			fmt.Sprintf("websocket identify failed connection_id=%s remote_addr=%s error=%v", connection.ID(), connection.RemoteAddr(), err),
-		)
+		description := fmt.Sprintf("Failed to read IDENTIFY from WebSocket client %s at %s: %s", connection.ID(), logging.SafeText(connection.RemoteAddr()), logging.ErrorText(err))
+		if isTimeoutError(err) {
+			description = fmt.Sprintf("WebSocket client %s at %s timed out during identification.", connection.ID(), logging.SafeText(connection.RemoteAddr()))
+		}
+		s.log(request.Context(), LogLevelWarn, description)
 		_ = connection.CloseWith(3000, "Unauthorized")
 		return
 	}
@@ -813,14 +824,14 @@ func (s *Server) websocketServerHandler(w http.ResponseWriter, request *http.Req
 		s.log(
 			request.Context(),
 			LogLevelWarn,
-			fmt.Sprintf("websocket unauthorized token connection_id=%s remote_addr=%s", connection.ID(), connection.RemoteAddr()),
+			fmt.Sprintf("Rejected WebSocket client %s at %s because its access token is invalid.", connection.ID(), logging.SafeText(connection.RemoteAddr())),
 		)
 		_ = connection.CloseWith(3000, "Unauthorized")
 		return
 	}
 
 	if err := s.openEventStream(request.Context(), connection, sequence); err != nil {
-		s.log(request.Context(), LogLevelWarn, fmt.Sprintf("websocket initialization failed connection_id=%s error=%v", connection.ID(), err))
+		s.log(request.Context(), LogLevelWarn, fmt.Sprintf("Failed to initialize the event stream for WebSocket client %s: %s", connection.ID(), logging.ErrorText(err)))
 		return
 	}
 	defer s.removeConnection(connection)
@@ -829,13 +840,13 @@ func (s *Server) websocketServerHandler(w http.ResponseWriter, request *http.Req
 	closeReason, closeErr := connection.CloseInfo()
 	lastHeartbeatAt, lastHeartbeatLatency := connection.LastHeartbeat()
 	var closedBuilder strings.Builder
-	closedBuilder.WriteString(fmt.Sprintf("websocket closed connection_id=%s remote_addr=%s reason=%s", connection.ID(), connection.RemoteAddr(), closeReason))
+	closedBuilder.WriteString(fmt.Sprintf("WebSocket client %s at %s closed: %s.", connection.ID(), logging.SafeText(connection.RemoteAddr()), logging.SafeText(closeReason)))
 	if closeErr != nil {
-		closedBuilder.WriteString(fmt.Sprintf(" error=%v", closeErr))
+		closedBuilder.WriteString(fmt.Sprintf(" Connection error: %s.", logging.ErrorText(closeErr)))
 	}
 	if !lastHeartbeatAt.IsZero() {
 		closedBuilder.WriteString(fmt.Sprintf(
-			" last_heartbeat_at=%s last_heartbeat_read_wait_ms=%d",
+			" Last heartbeat at %s; input wait was %d ms.",
 			lastHeartbeatAt.Format(time.RFC3339Nano),
 			lastHeartbeatLatency.Milliseconds(),
 		))
@@ -885,7 +896,7 @@ func (s *Server) authorize(w http.ResponseWriter, r *http.Request) bool {
 	}
 	token, ok := protocol.ParseBearer(r.Header.Get(protocol.HeaderAuthorization))
 	if !ok || token != s.Token {
-		s.log(r.Context(), LogLevelWarn, "Satori HTTP authorization failed status=401")
+		s.log(r.Context(), LogLevelWarn, "Rejected an HTTP request because Satori API authorization failed.")
 		w.Header().Set("WWW-Authenticate", "Bearer")
 		writeError(w, Unauthorized("invalid Satori authorization"))
 		return false
@@ -983,7 +994,7 @@ func (s *Server) proxyURLHandler(w http.ResponseWriter, request *http.Request) {
 		chunkSize = s.streamChunkSize
 	}
 	if err := writeServerResponse(w, resp, chunkSize); err != nil {
-		s.log(request.Context(), LogLevelError, fmt.Sprintf("Satori resource response interrupted error_type=%T", err))
+		s.log(request.Context(), LogLevelError, fmt.Sprintf("Failed to write the resource response to the client: %s", logging.ErrorText(err)))
 	}
 }
 
@@ -1009,7 +1020,11 @@ func (s *Server) executeRoute(
 		if status >= 500 {
 			level = LogLevelError
 		}
-		s.log(request.Context(), level, fmt.Sprintf("Satori RPC action=%q platform=%q self_id=%q status=%d elapsed_ms=%d", label, platform, selfID, status, time.Since(started).Milliseconds()))
+		description := fmt.Sprintf("Satori request %s for %s bot %s ended with HTTP %d after %d ms.", logging.SafeText(label), logging.SafeText(platform), logging.SafeText(selfID), status, time.Since(started).Milliseconds())
+		if status >= 200 && status < 300 {
+			description = fmt.Sprintf("Handled Satori request %s for %s bot %s in %d ms (HTTP %d).", logging.SafeText(label), logging.SafeText(platform), logging.SafeText(selfID), time.Since(started).Milliseconds(), status)
+		}
+		s.log(request.Context(), level, description)
 	}()
 	if !strings.HasPrefix(action, protocol.InternalApiPrefix) {
 		request.Body = http.MaxBytesReader(w, request.Body, s.maxRequestBytes)
@@ -1038,12 +1053,12 @@ func (s *Server) executeRoute(
 	case *Response:
 		status = typed.statusCodeOrDefault()
 		if err := writeServerResponse(w, typed, 0); err != nil {
-			s.log(request.Context(), LogLevelError, fmt.Sprintf("Satori response interrupted error_type=%T", err))
+			s.log(request.Context(), LogLevelError, fmt.Sprintf("Failed to write the response to the client: %s", logging.ErrorText(err)))
 		}
 	case Response:
 		status = typed.statusCodeOrDefault()
 		if err := writeServerResponse(w, &typed, 0); err != nil {
-			s.log(request.Context(), LogLevelError, fmt.Sprintf("Satori response interrupted error_type=%T", err))
+			s.log(request.Context(), LogLevelError, fmt.Sprintf("Failed to write the response to the client: %s", logging.ErrorText(err)))
 		}
 	default:
 		writeJSON(w, http.StatusOK, typed)
@@ -1309,7 +1324,7 @@ func (s *Server) defaultUploadCreateHandler(request *Request[UploadCreateParam])
 		s.mu.Unlock()
 		result[name] = fmt.Sprintf("internal:%s/%s/_tmp/%s", request.Platform, request.SelfID, finalName)
 	}
-	s.log(context.Background(), LogLevelDebug, fmt.Sprintf("Satori upload accepted platform=%q self_id=%q files=%d bytes=%d", request.Platform, request.SelfID, len(result), total))
+	s.log(context.Background(), LogLevelDebug, fmt.Sprintf("Accepted %d uploaded files totaling %d bytes for %s bot %s.", len(result), total, logging.SafeText(request.Platform), logging.SafeText(request.SelfID)))
 	return result, nil
 }
 
@@ -1400,7 +1415,7 @@ func (s *Server) sendWebhook(ctx context.Context, webhook WebhookEndpoint, opcod
 
 	resp, err := s.httpClient.Do(req)
 	if err != nil {
-		s.log(ctx, LogLevelError, fmt.Sprintf("Satori webhook transport failed opcode=%d error_type=%T", opcode, err))
+		s.log(ctx, LogLevelError, fmt.Sprintf("Failed to send a %s frame to Webhook client %s: %s", logging.FrameName(opcode), logging.Endpoint(webhook.URL), logging.ErrorText(err)))
 		return err
 	}
 	defer resp.Body.Close()
@@ -1411,7 +1426,17 @@ func (s *Server) sendWebhook(ctx context.Context, webhook WebhookEndpoint, opcod
 	if resp.StatusCode >= 500 {
 		level = LogLevelError
 	}
-	s.log(ctx, level, fmt.Sprintf("Satori webhook response opcode=%d status=%d", opcode, resp.StatusCode))
+	endpoint, frame := logging.Endpoint(webhook.URL), logging.FrameName(opcode)
+	description := fmt.Sprintf("Webhook client %s returned HTTP %d for the %s frame.", endpoint, resp.StatusCode, frame)
+	switch {
+	case resp.StatusCode >= 200 && resp.StatusCode < 300:
+		description = fmt.Sprintf("Webhook client %s accepted the %s frame (HTTP %d).", endpoint, frame, resp.StatusCode)
+	case resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden:
+		description = fmt.Sprintf("Webhook client %s rejected authorization for the %s frame (HTTP %d).", endpoint, frame, resp.StatusCode)
+	case resp.StatusCode >= 500:
+		description = fmt.Sprintf("Webhook client %s returned a server error for the %s frame (HTTP %d).", endpoint, frame, resp.StatusCode)
+	}
+	s.log(ctx, level, description)
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		bodyData, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
 		return fmt.Errorf("webhook response status %d: %s", resp.StatusCode, string(bodyData))
@@ -1567,14 +1592,14 @@ func (s *Server) runPreparing(ctx context.Context) error {
 	s.ensureDefaultUploadRoute()
 	handler, err := s.Handler()
 	if err != nil {
-		s.log(ctx, LogLevelError, fmt.Sprintf("build server handler failed error=%v", err))
+		s.log(ctx, LogLevelError, fmt.Sprintf("Failed to build the Satori HTTP handler: %s", logging.ErrorText(err)))
 		return err
 	}
 
 	addr := net.JoinHostPort(s.Host, strconv.Itoa(s.Port))
 	listener, err := net.Listen("tcp", addr)
 	if err != nil {
-		s.log(ctx, LogLevelError, fmt.Sprintf("listen failed address=%s error=%v", addr, err))
+		s.log(ctx, LogLevelError, fmt.Sprintf("Failed to listen on %s: %s", addr, logging.ErrorText(err)))
 		return err
 	}
 
@@ -1666,7 +1691,7 @@ func (s *Server) runBlocking(ctx context.Context) error {
 	}
 
 	if err := s.broadcastMetaToWebhooks(groupCtx); err != nil {
-		s.log(ctx, LogLevelWarn, fmt.Sprintf("Satori metadata delivery failed error_type=%T", err))
+		s.log(ctx, LogLevelWarn, fmt.Sprintf("Failed to send metadata to one or more Webhook clients: %s", logging.ErrorText(err)))
 	}
 
 	select {
@@ -1728,7 +1753,7 @@ func (s *Server) runPublisherTask(ctx context.Context, source int, stream <-chan
 				return nil
 			}
 			if err := s.postFrom(ctx, source, evt); err != nil {
-				s.log(ctx, LogLevelError, fmt.Sprintf("Satori event delivery failed source=%d error_type=%T", source, err))
+				s.log(ctx, LogLevelError, fmt.Sprintf("Failed to deliver an event from publisher %d: %s", source, logging.ErrorText(err)))
 			}
 		}
 	}

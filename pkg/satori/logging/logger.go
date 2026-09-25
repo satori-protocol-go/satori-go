@@ -40,12 +40,5 @@ func (l *stdLogger) Log(_ context.Context, level Level, v ...any) {
 		return
 	}
 
-	var builder strings.Builder
-	builder.WriteString("level=")
-	builder.WriteString(string(level))
-	if len(v) > 0 {
-		builder.WriteString(" msg=")
-		builder.WriteString(fmt.Sprint(v...))
-	}
-	l.inner.Print(builder.String())
+	l.inner.Printf("[%s] %s", strings.ToUpper(string(level)), fmt.Sprint(v...))
 }
