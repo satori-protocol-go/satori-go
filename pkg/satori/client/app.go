@@ -23,11 +23,12 @@ type NetworkFactory func(app *App, cfg Config) (clientnetwork.Runner, APIConfig,
 type networkState struct {
 	config    APIConfig
 	proxyURLs []string
-	accountID map[string]struct{}
+	logins    map[int64]*Account
 }
 
 type App struct {
-	mu sync.RWMutex
+	mu        sync.RWMutex
+	runCancel context.CancelFunc
 
 	accounts      map[string]*Account
 	networks      []clientnetwork.Runner
@@ -53,9 +54,6 @@ func NewApp(configs ...Config) (*App, error) {
 			return NewAPIProtocol(account, nil)
 		},
 	}
-	if defaultApp.Load() != nil {
-		app.log(context.Background(), logging.LevelWarn, "default app already exists and will be replaced")
-	}
 	app.registerNetworkFactoryLocked("ws", wsNetworkFactory)
 	app.registerNetworkFactoryLocked("webhook", webhookNetworkFactory)
 	for _, cfg := range configs {
@@ -73,6 +71,9 @@ func (a *App) RegisterLogger(logger logging.Logger) {
 	}
 	a.mu.Lock()
 	a.logger = logger
+	for _, account := range a.accounts {
+		account.RegisterLogger(logger)
+	}
 	networks := append([]clientnetwork.Runner(nil), a.networks...)
 	a.mu.Unlock()
 	for _, runner := range networks {
@@ -181,6 +182,11 @@ func (a *App) Apply(cfg Config) error {
 
 	networkIDRef := runner.ID()
 	a.mu.Lock()
+	if a.runCancel != nil {
+		a.mu.Unlock()
+		_ = runner.Close()
+		return errors.New("configure networks before Run")
+	}
 	a.networks = append(a.networks, runner)
 	state := a.ensureNetworkStateLocked(networkIDRef)
 	if apiCfg != nil {
@@ -380,229 +386,222 @@ func (a *App) Close() error {
 	return nil
 }
 
-func (a *App) SyncLogins(networkID string, cfg clientnetwork.APIConfig, proxyURLs []string, logins []*login.Login) {
-	var localCfg APIConfig
-	if cfg != nil {
-		localCfg = cfg
+func (a *App) SyncLogins(networkID string, cfg clientnetwork.APIConfig, proxyURLs []string, logins []*login.Login) error {
+	seen := make(map[int64]bool, len(logins))
+	for _, info := range logins {
+		if info == nil || !info.HasField("sn") || info.Sn < 0 {
+			return errors.New("invalid login sequence in snapshot")
+		}
+		if seen[info.Sn] {
+			return fmt.Errorf("duplicate login sequence %d", info.Sn)
+		}
+		seen[info.Sn] = true
 	}
+	a.mu.Lock()
+	state := a.ensureNetworkStateLocked(networkID)
+	config := state.config
+	if cfg != nil {
+		config = cfg
+	}
+	factory := a.defaultProtocolFactory
+	old := make(map[int64]*Account, len(state.logins))
+	for sn, account := range state.logins {
+		old[sn] = account
+	}
+	a.mu.Unlock()
+
+	// Reuse a live handle only by a unique platform account, never by a sequence
+	// from the previous connection. Factories run outside the registry lock.
+	targets := map[string][]*Account{}
+	for _, account := range old {
+		if target := loginTarget(account.SelfInfo()); target != "" {
+			targets[target] = append(targets[target], account)
+		}
+	}
+	next := make(map[int64]*Account, len(logins))
+	used := map[*Account]bool{}
+	for _, info := range logins {
+		var account *Account
+		matches := targets[loginTarget(info)]
+		if len(matches) == 1 && !used[matches[0]] {
+			account = matches[0]
+		}
+		if account == nil {
+			account = NewAccount(info, config, proxyURLs, factory)
+		}
+		used[account] = true
+		next[info.Sn] = account
+	}
+	removed := []*Account{}
+	a.mu.Lock()
+	state = a.ensureNetworkStateLocked(networkID)
+	for sn, account := range state.logins {
+		delete(a.accounts, accountKey(networkID, sn))
+		if !used[account] {
+			account.SetConnected(false)
+			removed = append(removed, account)
+		}
+	}
+	state.config = config
+	state.proxyURLs = append([]string(nil), proxyURLs...)
+	state.logins = next
+	for _, info := range logins {
+		account := next[info.Sn]
+		account.RegisterLogger(a.logger)
+		account.apply(info, config, proxyURLs)
+		a.accounts[accountKey(networkID, info.Sn)] = account
+	}
+	a.mu.Unlock()
+	for _, account := range removed {
+		a.accountUpdate(account, login.LoginStatusOffline)
+	}
+	for _, info := range logins {
+		a.accountUpdate(next[info.Sn], info.Status)
+	}
+	return nil
+}
+
+func (a *App) UpdateProxyURLs(networkID string, proxyURLs []string) {
+	a.mu.Lock()
+	state := a.ensureNetworkStateLocked(networkID)
+	state.proxyURLs = append([]string(nil), proxyURLs...)
+	for _, account := range state.logins {
+		account.apply(nil, nil, proxyURLs)
+	}
+	a.mu.Unlock()
+}
+
+// These keys are connection-local registry keys, not public platform identifiers.
+func accountKey(networkID string, sn int64) string { return fmt.Sprintf("%s#%d", networkID, sn) }
+func loginTarget(info *login.Login) string {
+	if info == nil || info.User == nil || info.Platform == "" || info.User.Id == "" {
+		return ""
+	}
+	return info.Platform + "\x00" + info.User.Id
+}
+
+// PostEvent applies a source-local login transition before invoking callbacks.
+func (a *App) PostEvent(networkID string, evt *event.Event) error {
+	if evt == nil || evt.Login == nil {
+		return errors.New("event has no login")
+	}
+	sn := evt.Login.Sn
+	if sn < 0 {
+		return errors.New("invalid event login sequence")
+	}
+	added := evt.Type == event.EventTypeLoginAdded
+	updated := evt.Type == event.EventTypeLoginUpdated
+	removed := evt.Type == event.EventTypeLoginRemoved
 
 	a.mu.Lock()
 	state := a.ensureNetworkStateLocked(networkID)
-	if localCfg != nil {
-		state.config = localCfg
-	}
-	state.proxyURLs = append([]string(nil), proxyURLs...)
-
-	existing := make([]*Account, 0, len(state.accountID))
-	for identity := range state.accountID {
-		if account, ok := a.accounts[identity]; ok {
-			existing = append(existing, account)
-		}
-	}
+	account := state.logins[sn]
 	config := state.config
-	proxy := append([]string(nil), state.proxyURLs...)
+	proxies := append([]string(nil), state.proxyURLs...)
+	factory := a.defaultProtocolFactory
 	a.mu.Unlock()
-
-	for _, account := range existing {
-		account.Config = config
-		account.SetProxyURLs(proxy)
-	}
-
-	for _, item := range logins {
-		_, account, ok := a.ensureAccount(item, networkID)
-		if !ok {
-			continue
+	if !added && !updated && !removed {
+		// A recovered event may refer to a login absent from the new READY.
+		// Its complete event identity is sufficient for an event-scoped account.
+		target := loginTarget(evt.Login)
+		if target != "" && (account == nil || loginTarget(account.SelfInfo()) != target) {
+			info := evt.Login.Clone()
+			info.Status = login.LoginStatusOnline
+			temporary := NewAccount(info, config, proxies, factory)
+			temporary.RegisterLogger(a.Logger())
+			temporary.SetConnected(true)
+			value := *evt
+			value.Login = info
+			return a.dispatchEvent(temporary, &value)
 		}
-		connected := item.Status == login.LoginStatusOnline || item.Status == login.LoginStatusConnect
-		account.SetConnected(connected)
-		a.accountUpdate(account, item.Status)
 	}
-}
+	// A partial offline login is still a login; it simply cannot issue account APIs.
+	var candidate *Account
+	if account == nil && (added || updated) {
+		candidate = NewAccount(evt.Login, config, proxies, factory)
+	}
 
-func (a *App) PostEvent(networkID string, evt *event.Event) {
-	a.post(evt, networkID)
+	a.mu.Lock()
+	state = a.ensureNetworkStateLocked(networkID)
+	account = state.logins[sn]
+	if account == nil {
+		account = candidate
+	}
+	if account == nil {
+		a.mu.Unlock()
+		return fmt.Errorf("unknown source login %s/%d", networkID, sn)
+	}
+	account.RegisterLogger(a.logger)
+	info := account.SelfInfo()
+	if added {
+		info = evt.Login.Clone()
+	} else if updated || removed {
+		info = info.Merge(evt.Login)
+	}
+	if removed {
+		info.Status = login.LoginStatusOffline
+	}
+	if !added && !updated && !removed {
+		expected, actual := loginTarget(info), loginTarget(evt.Login)
+		if expected != "" && actual != "" && expected != actual {
+			a.mu.Unlock()
+			return errors.New("event login identity does not match its source sequence")
+		}
+	}
+	if added || updated || removed {
+		account.apply(info, state.config, state.proxyURLs)
+	}
+	if removed {
+		delete(state.logins, sn)
+		delete(a.accounts, accountKey(networkID, sn))
+	} else {
+		state.logins[sn] = account
+		a.accounts[accountKey(networkID, sn)] = account
+	}
+	a.mu.Unlock()
+	// Keep the caller's decoded object intact; the callback gets resolved login context.
+	value := *evt
+	value.Login = info.Clone()
+	if !added && !updated && !removed {
+		value.Login.Status = login.LoginStatusOnline
+	}
+	if added || updated || removed {
+		a.accountUpdate(account, info.Status)
+	}
+	return a.dispatchEvent(account, &value)
 }
 
 func (a *App) MarkNetworkStatus(networkID string, status login.LoginStatus, remove bool) {
-	a.markNetworkStatus(networkID, status, remove)
-}
-
-func (a *App) post(evt *event.Event, networkID string) {
-	if evt == nil {
-		return
-	}
-
-	var (
-		identity string
-		account  *Account
-		ok       bool
-	)
-
-	switch evt.Type {
-	case event.EventTypeLoginAdded:
-		identity, account, ok = a.ensureAccount(evt.Login, networkID)
-		if !ok {
-			return
-		}
-		account.SetConnected(evt.Login.Status == login.LoginStatusOnline)
-		a.accountUpdate(account, evt.Login.Status)
-	case event.EventTypeLoginUpdated:
-		identity = a.accountIdentity(evt.Login, networkID)
-		if identity == "" {
-			return
-		}
-
-		a.mu.RLock()
-		account, ok = a.accounts[identity]
-		a.mu.RUnlock()
-		if !ok {
-			if evt.Login == nil || evt.Login.Status != login.LoginStatusOnline {
-				a.log(
-					context.Background(),
-					logging.LevelWarn,
-					fmt.Sprintf("received login update for unknown account event_type=%s event_sn=%d", evt.Type, evt.Sn),
-				)
-				return
-			}
-			_, account, ok = a.ensureAccount(evt.Login, networkID)
-			if !ok {
-				return
-			}
-		}
-		connected := evt.Login.Status == login.LoginStatusOnline || evt.Login.Status == login.LoginStatusConnect
-		account.SetConnected(connected)
-		a.accountUpdate(account, evt.Login.Status)
-	case event.EventTypeLoginRemoved:
-		identity = a.accountIdentity(evt.Login, networkID)
-		if identity == "" {
-			return
-		}
-		a.mu.RLock()
-		account, ok = a.accounts[identity]
-		a.mu.RUnlock()
-		if !ok {
-			a.log(
-				context.Background(),
-				logging.LevelWarn,
-				fmt.Sprintf("received login removed for unknown account event_type=%s event_sn=%d", evt.Type, evt.Sn),
-			)
-			return
-		}
-	default:
-		identity = a.accountIdentity(evt.Login, networkID)
-		if identity == "" {
-			return
-		}
-		a.mu.RLock()
-		account, ok = a.accounts[identity]
-		a.mu.RUnlock()
-		if !ok {
-			a.log(
-				context.Background(),
-				logging.LevelWarn,
-				fmt.Sprintf("received event for unknown account event_type=%s event_sn=%d", evt.Type, evt.Sn),
-			)
-			return
-		}
-	}
-
-	a.dispatchEvent(account, evt)
-
-	if evt.Type == event.EventTypeLoginRemoved {
-		account.SetConnected(false)
-		a.accountUpdate(account, login.LoginStatusOffline)
-
-		a.mu.Lock()
-		delete(a.accounts, identity)
-		if state, exists := a.networkStates[networkID]; exists {
-			delete(state.accountID, identity)
-		}
-		a.mu.Unlock()
-	}
-}
-
-func (a *App) markNetworkStatus(networkID string, status login.LoginStatus, remove bool) {
 	a.mu.Lock()
 	state, ok := a.networkStates[networkID]
 	if !ok {
 		a.mu.Unlock()
 		return
 	}
-
-	identities := make([]string, 0, len(state.accountID))
-	accounts := make([]*Account, 0, len(state.accountID))
-	for identity := range state.accountID {
-		account, exists := a.accounts[identity]
-		if !exists {
-			continue
-		}
-		identities = append(identities, identity)
+	accounts := make([]*Account, 0, len(state.logins))
+	for sn, account := range state.logins {
+		info := account.SelfInfo()
+		info.Status = status
+		account.apply(info, state.config, state.proxyURLs)
 		accounts = append(accounts, account)
-	}
-
-	if remove {
-		for _, identity := range identities {
-			delete(a.accounts, identity)
-			delete(state.accountID, identity)
+		if remove {
+			delete(a.accounts, accountKey(networkID, sn))
 		}
+	}
+	if remove {
+		state.logins = map[int64]*Account{}
 	}
 	a.mu.Unlock()
-
 	for _, account := range accounts {
-		account.SetConnected(false)
 		a.accountUpdate(account, status)
 	}
 }
 
-func (a *App) ensureAccount(info *login.Login, networkID string) (string, *Account, bool) {
-	identity := a.accountIdentity(info, networkID)
-	if identity == "" {
-		return "", nil, false
-	}
-
-	a.mu.Lock()
-	defer a.mu.Unlock()
-
-	state := a.ensureNetworkStateLocked(networkID)
-	if state.config == nil {
-		state.config = APIInfo{}
-	}
-	if account, ok := a.accounts[identity]; ok {
-		account.SelfInfo = info
-		account.Adapter = info.Adapter
-		account.Config = state.config
-		account.SetProxyURLs(state.proxyURLs)
-		state.accountID[identity] = struct{}{}
-		return identity, account, true
-	}
-
-	account := NewAccount(info, state.config, state.proxyURLs, a.defaultProtocolFactory)
-	a.accounts[identity] = account
-	state.accountID[identity] = struct{}{}
-	return identity, account, true
-}
-
-func (a *App) accountIdentity(info *login.Login, networkID string) string {
-	if info == nil || info.User == nil {
-		return ""
-	}
-	platform := info.Platform
-	if platform == "" {
-		platform = "satori"
-	}
-	return fmt.Sprintf("%s_%s@%s", platform, info.User.Id, networkID)
-}
-
 func (a *App) ensureNetworkStateLocked(networkID string) *networkState {
-	state, ok := a.networkStates[networkID]
-	if ok {
+	if state, ok := a.networkStates[networkID]; ok {
 		return state
 	}
-	state = &networkState{
-		config:    APIInfo{},
-		proxyURLs: []string{},
-		accountID: map[string]struct{}{},
-	}
+	state := &networkState{config: APIInfo{}, proxyURLs: []string{}, logins: map[int64]*Account{}}
 	a.networkStates[networkID] = state
 	return state
 }
@@ -615,7 +614,7 @@ func (a *App) log(ctx context.Context, level logging.Level, v ...any) {
 	logger.Log(ctx, level, v...)
 }
 
-func (a *App) dispatchEvent(account *Account, evt *event.Event) {
+func (a *App) dispatchEvent(account *Account, evt *event.Event) error {
 	a.mu.RLock()
 	callbacks := append([]EventCallback(nil), a.eventCallbacks...)
 	a.mu.RUnlock()
@@ -642,12 +641,15 @@ func (a *App) dispatchEvent(account *Account, evt *event.Event) {
 	wg.Wait()
 	close(errCh)
 
+	var result error
 	for err := range errCh {
-		a.log(context.Background(), logging.LevelError, fmt.Sprintf("event callback error error=%v", err))
+		result = errors.Join(result, err)
 	}
+	return result
 }
 
 func (a *App) accountUpdate(account *Account, status login.LoginStatus) {
+	a.log(context.Background(), logging.LevelInfo, fmt.Sprintf("Satori login status platform=%q self_id=%q status=%d", account.Platform(), account.SelfID(), status))
 	a.mu.RLock()
 	callbacks := append([]LifecycleCallback(nil), a.lifecycleCallbacks...)
 	a.mu.RUnlock()
@@ -680,20 +682,14 @@ func (a *App) accountUpdate(account *Account, status login.LoginStatus) {
 }
 
 func (a *App) cleanupAccounts() {
-	a.mu.Lock()
-	accounts := make([]*Account, 0, len(a.accounts))
-	for _, account := range a.accounts {
-		accounts = append(accounts, account)
+	a.mu.RLock()
+	sources := make([]string, 0, len(a.networkStates))
+	for id := range a.networkStates {
+		sources = append(sources, id)
 	}
-	a.accounts = map[string]*Account{}
-	for _, state := range a.networkStates {
-		state.accountID = map[string]struct{}{}
-	}
-	a.mu.Unlock()
-
-	for _, account := range accounts {
-		account.SetConnected(false)
-		a.accountUpdate(account, login.LoginStatusOffline)
+	a.mu.RUnlock()
+	for _, id := range sources {
+		a.MarkNetworkStatus(id, login.LoginStatusOffline, true)
 	}
 }
 

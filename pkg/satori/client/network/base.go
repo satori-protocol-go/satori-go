@@ -21,8 +21,8 @@ type APIConfig interface {
 }
 
 type AppBridge interface {
-	SyncLogins(networkID string, cfg APIConfig, proxyURLs []string, logins []*login.Login)
-	PostEvent(networkID string, evt *event.Event)
+	SyncLogins(networkID string, cfg APIConfig, proxyURLs []string, logins []*login.Login) error
+	PostEvent(networkID string, evt *event.Event) error
 	MarkNetworkStatus(networkID string, status login.LoginStatus, remove bool)
 }
 

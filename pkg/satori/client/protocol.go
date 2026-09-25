@@ -239,7 +239,7 @@ func NewAPIProtocol(account *Account, httpClient *http.Client) *APIProtocol {
 	if account == nil {
 		account = NewAccount(nil, APIInfo{}, nil, nil)
 	}
-	timeout := account.Config.TimeoutValue()
+	timeout := account.Config().TimeoutValue()
 	if timeout <= 0 {
 		timeout = protocol.DefaultRequestTimeout
 	}
@@ -371,7 +371,7 @@ func (p *APIProtocol) CallAPI(
 		return nil, errors.New("action cannot be empty")
 	}
 
-	endpoint := joinURLPath(p.account.Config.APIBase(), action)
+	endpoint := joinURLPath(p.account.Config().APIBase(), action)
 	headers := p.apiHeaders()
 
 	if multipart {
@@ -1168,7 +1168,7 @@ func cloneHTTPTransport(roundTripper http.RoundTripper) (*http.Transport, error)
 func (p *APIProtocol) apiHeaders() http.Header {
 	headers := http.Header{}
 	headers.Set("Content-Type", "application/json")
-	protocol.SetBearer(headers, p.account.Config.TokenValue())
+	protocol.SetBearer(headers, p.account.Config().TokenValue())
 	protocol.SetIdentityHeaders(headers, p.account.Platform(), p.account.SelfID())
 	return headers
 }
