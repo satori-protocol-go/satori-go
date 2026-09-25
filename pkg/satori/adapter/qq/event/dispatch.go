@@ -37,9 +37,13 @@ func (c *Converter) Convert(
 	if loginValue == nil {
 		return nil, errors.New("QQ event login could not be resolved")
 	}
+	if err := validateDispatchData(eventType, data); err != nil {
+		return nil, err
+	}
 	result := c.convertDispatchEvent(ctx, eventType, data, loginValue)
 	if result == nil {
-		return nil, nil
+		// A valid native event without a standard mapping must not disappear after ACK.
+		result = &satorievent.Event{Type: satorievent.EventTypeInternal, Login: loginValue}
 	}
 	if result.Message != nil && result.Message.Referrer != nil {
 		if result.Referrer == nil {
