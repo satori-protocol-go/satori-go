@@ -342,6 +342,7 @@ func (s *messageSender) sendQQResource(ctx context.Context, targetID string, isD
 	}
 	s.adapter.log(ctx, logging.LevelDebug, description)
 	var uploaded *dto.MediaUploadResult
+	var uploadMeta *native.ResponseMeta
 	if resource.Data != nil {
 		data := resource.Data
 		scope := media.GroupScope
@@ -352,16 +353,16 @@ func (s *messageSender) sendQQResource(ctx context.Context, targetID string, isD
 	} else {
 		request := &dto.MediaUploadRequest{FileType: fileType, URL: resource.URL, FileName: resource.FileName}
 		if isDirect {
-			uploaded, _, err = s.api.UploadC2CFile(ctx, targetID, request)
+			uploaded, uploadMeta, err = s.api.UploadC2CFile(ctx, targetID, request)
 		} else {
-			uploaded, _, err = s.api.UploadGroupFile(ctx, targetID, request)
+			uploaded, uploadMeta, err = s.api.UploadGroupFile(ctx, targetID, request)
 		}
 	}
 	if err != nil {
-		return nil, err
+		return nil, wrapQQResponse(uploadMeta, err)
 	}
 	if uploaded == nil || uploaded.FileInfo == "" {
-		return nil, errors.New("QQ upload response has no file_info")
+		return nil, wrapQQResponse(uploadMeta, errors.New("QQ upload response has no file_info"))
 	}
 	s.adapter.log(ctx, logging.LevelDebug, fmt.Sprintf("Uploaded the %s to QQ for app %s.", mediaName, logging.SafeText(s.state.appID)))
 	payload := &dto.MessageToCreate{Content: " ", MsgType: dto.RichMediaMsg, MsgID: referrer.MsgID, EventID: referrer.EventID, MessageReference: replyReference(referrer, segment.QuoteID), MsgSeq: uint32(seq), Media: &dto.MediaInfo{FileInfo: uploaded.FileInfo}}

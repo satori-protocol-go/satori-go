@@ -118,8 +118,8 @@ func (a *Adapter) acceptPayload(ctx context.Context, state *appState, payload *d
 		}
 		kind := convert.InteractionKind(&interaction)
 		if (kind == 11 || kind == 12) && !a.cfg.ManualInteractionResponse {
-			if _, err := state.api.AcknowledgeInteraction(ctx, interaction.ID, 0); err != nil {
-				return err
+			if meta, err := state.api.AcknowledgeInteraction(ctx, interaction.ID, 0); err != nil {
+				return wrapQQResponse(meta, err)
 			}
 		}
 	}

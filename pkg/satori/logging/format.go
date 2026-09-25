@@ -1,7 +1,6 @@
 package logging
 
 import (
-	"errors"
 	"fmt"
 	"net/url"
 	"regexp"
@@ -46,7 +45,13 @@ func Endpoint(raw string) string {
 }
 
 // ErrorText only formats diagnostics; the original error and its chain remain unchanged.
-func ErrorText(err error) string { return errorText(err, 0) }
+func ErrorText(err error) string {
+	text := []rune(errorText(err, 0))
+	if len(text) > 4096 {
+		return string(text[:4096]) + "..."
+	}
+	return string(text)
+}
 
 func errorText(err error, depth int) string {
 	if err == nil {
@@ -64,18 +69,29 @@ func errorText(err error, depth int) string {
 		}
 		return strings.Join(parts, "; ")
 	}
-	var response interface {
+	if response, ok := err.(interface {
 		HTTPStatus() int
 		ResponseBody() string
-	}
-	if errors.As(err, &response) {
+	}); ok {
+		if wrapped, ok := err.(interface{ Unwrap() error }); ok && wrapped.Unwrap() != nil {
+			return SafeText(err.Error()) + ": " + errorText(wrapped.Unwrap(), depth+1)
+		}
 		return fmt.Sprintf("request returned HTTP %d (response body omitted)", response.HTTPStatus())
 	}
-	var request *url.Error
-	if errors.As(err, &request) && request != nil {
+	if request, ok := err.(*url.Error); ok && request != nil {
 		return SafeText(request.Op) + " " + Endpoint(request.URL) + ": " + errorText(request.Err, depth+1)
 	}
 	text := err.Error()
+	if wrapped, ok := err.(interface{ Unwrap() error }); ok && wrapped.Unwrap() != nil {
+		cause := wrapped.Unwrap()
+		detail := errorText(cause, depth+1)
+		if original := cause.Error(); original != "" {
+			text = strings.ReplaceAll(text, original, detail)
+		}
+		if detail != "" && !strings.Contains(text, detail) {
+			text += ": " + detail
+		}
+	}
 	// sendWebhook preserves the response body in its returned error. Do not copy that body into logs.
 	if strings.HasPrefix(text, "webhook response status ") {
 		head, _, _ := strings.Cut(text, ":")

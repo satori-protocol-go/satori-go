@@ -713,10 +713,9 @@ func (s *Server) metaGetHandler(w http.ResponseWriter, request *http.Request) {
 		writeError(w, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, meta.Meta{
-		Logins:    logins,
-		ProxyUrls: proxyUrls,
-	})
+	if _, err := writeJSON(w, http.StatusOK, meta.Meta{Logins: logins, ProxyUrls: proxyUrls}); err != nil {
+		s.log(request.Context(), LogLevelError, fmt.Sprintf("Failed to deliver Satori metadata to the HTTP client: %s", logging.ErrorText(err)))
+	}
 }
 
 func (s *Server) webhookCreateHandler(w http.ResponseWriter, request *http.Request) {
@@ -1061,7 +1060,11 @@ func (s *Server) executeRoute(
 			s.log(request.Context(), LogLevelError, fmt.Sprintf("Failed to write the response to the client: %s", logging.ErrorText(err)))
 		}
 	default:
-		writeJSON(w, http.StatusOK, typed)
+		var deliveryErr error
+		status, deliveryErr = writeJSON(w, http.StatusOK, typed)
+		if deliveryErr != nil {
+			s.log(request.Context(), LogLevelError, fmt.Sprintf("Failed to deliver the JSON response for Satori request %s: %s", logging.SafeText(action), logging.ErrorText(deliveryErr)))
+		}
 	}
 }
 
@@ -2006,18 +2009,27 @@ func writeError(w http.ResponseWriter, err error) {
 		w.WriteHeader(status)
 		return
 	}
+	for key, values := range ErrorHeaders(err) {
+		for _, value := range values {
+			w.Header().Add(key, value)
+		}
+	}
 	http.Error(w, err.Error(), status)
 }
 
-func writeJSON(w http.ResponseWriter, status int, payload any) {
+func writeJSON(w http.ResponseWriter, status int, payload any) (int, error) {
 	data, err := json.Marshal(payload)
 	if err != nil {
 		writeError(w, err)
-		return
+		return statusFromError(err), err
 	}
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
-	_, _ = w.Write(data)
+	n, err := w.Write(data)
+	if err == nil && n != len(data) {
+		err = io.ErrShortWrite
+	}
+	return status, err
 }
 
 func writeServerResponse(w http.ResponseWriter, response *Response, chunkSize int) error {
@@ -2044,8 +2056,10 @@ func writeServerResponse(w http.ResponseWriter, response *Response, chunkSize in
 		for {
 			n, err := response.Stream.Read(buffer)
 			if n > 0 {
-				if _, writeErr := w.Write(buffer[:n]); writeErr != nil {
+				if written, writeErr := w.Write(buffer[:n]); writeErr != nil {
 					return writeErr
+				} else if written != n {
+					return io.ErrShortWrite
 				}
 				if flusher != nil {
 					flusher.Flush()
@@ -2070,8 +2084,10 @@ func writeServerResponse(w http.ResponseWriter, response *Response, chunkSize in
 		if end > len(response.Body) {
 			end = len(response.Body)
 		}
-		if _, err := w.Write(response.Body[offset:end]); err != nil {
+		if written, err := w.Write(response.Body[offset:end]); err != nil {
 			return err
+		} else if written != end-offset {
+			return io.ErrShortWrite
 		}
 	}
 	return nil

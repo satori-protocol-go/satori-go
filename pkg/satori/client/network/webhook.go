@@ -190,7 +190,7 @@ func (n *Webhook) fetchMeta(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	if err := validateHTTPStatus(response.StatusCode, payload); err != nil {
+	if err := validateHTTPStatus(response.StatusCode, payload, response.Header); err != nil {
 		return err
 	}
 

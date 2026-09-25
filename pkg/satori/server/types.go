@@ -66,6 +66,7 @@ type Response struct {
 	Body          []byte
 	Stream        io.ReadCloser
 	ContentLength int64
+	Cause         error `json:"-"` // Diagnostic cause for a non-success response, not a serialized error object.
 }
 
 func NewResponse(statusCode int, body []byte) *Response {
@@ -110,6 +111,7 @@ type ActionError struct {
 	Status  int
 	Message string
 	Err     error
+	Header  http.Header
 }
 
 func (e *ActionError) Error() string {
@@ -169,9 +171,15 @@ func NotFound(message string) error {
 	return NewActionError(http.StatusNotFound, message, nil)
 }
 
+// StatusFromError is shared by route diagnostics and the HTTP response writer.
+func StatusFromError(err error) int { return statusFromError(err) }
+
 func statusFromError(err error) int {
 	if err == nil {
 		return http.StatusOK
+	}
+	if direct, ok := err.(SatoriError); ok {
+		return direct.HTTPStatus()
 	}
 	switch {
 	case errors.Is(err, context.Canceled):

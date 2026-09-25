@@ -148,11 +148,14 @@ func (a *Adapter) handleGuildGet(request *server.Request[server.GuildGetParam]) 
 		if err != nil {
 			return nil, err
 		}
-		info, _, err := state.api.GetQQGroupInfo(requestContext(request.Origin), request.Params.GuildID)
+		info, meta, err := state.api.GetQQGroupInfo(requestContext(request.Origin), request.Params.GuildID)
 		if err != nil {
-			return nil, err
+			return nil, wrapQQResponse(meta, err)
 		}
-		return &guild.Guild{Id: firstNonEmpty(info.GroupOpenID, request.Params.GuildID), Name: info.GroupName}, nil
+		if info == nil || info.GroupOpenID == "" {
+			return nil, wrapQQResponse(meta, errors.New("QQ group response has no group_openid"))
+		}
+		return &guild.Guild{Id: info.GroupOpenID, Name: info.GroupName}, nil
 	}
 	if request.Platform != "qqguild" {
 		return nil, server.NotFound("guild.get is not supported in current platform")
@@ -270,11 +273,12 @@ func (a *Adapter) handleGuildMemberGet(request *server.Request[server.GuildMembe
 		if err != nil {
 			return nil, err
 		}
-		member, _, err := state.api.GetQQGroupMember(requestContext(request.Origin), request.Params.GuildID, request.Params.UserID)
+		member, meta, err := state.api.GetQQGroupMember(requestContext(request.Origin), request.Params.GuildID, request.Params.UserID)
 		if err != nil {
-			return nil, err
+			return nil, wrapQQResponse(meta, err)
 		}
-		return convert.GroupMemberFromNative(member)
+		value, convertErr := convert.GroupMemberFromNative(member)
+		return value, wrapQQResponse(meta, convertErr)
 	}
 	if request.Platform != "qqguild" {
 		return nil, server.NotFound("guild.member.get is not supported in current platform")
@@ -303,15 +307,18 @@ func (a *Adapter) handleGuildMemberList(request *server.Request[server.GuildList
 		if err != nil {
 			return nil, err
 		}
-		page, _, err := state.api.GetQQGroupMembers(requestContext(request.Origin), request.Params.GuildID, request.Params.Next.ValueOr(""))
+		page, meta, err := state.api.GetQQGroupMembers(requestContext(request.Origin), request.Params.GuildID, request.Params.Next.ValueOr(""))
 		if err != nil {
-			return nil, err
+			return nil, wrapQQResponse(meta, err)
+		}
+		if page == nil || page.Members == nil {
+			return nil, wrapQQResponse(meta, errors.New("QQ member page has no members array"))
 		}
 		values := make([]*guildmember.GuildMember, 0, len(page.Members))
 		for _, member := range page.Members {
 			value, err := convert.GroupMemberFromNative(&member)
 			if err != nil {
-				return nil, err
+				return nil, wrapQQResponse(meta, err)
 			}
 			values = append(values, value)
 		}
@@ -399,8 +406,8 @@ func (a *Adapter) handleGuildMemberMute(request *server.Request[server.GuildMemb
 			op.Op = "add"
 			op.MuteExpireAt = time.Now().UTC().Add(time.Duration(duration) * time.Millisecond).Format(time.RFC3339Nano)
 		}
-		_, err = state.api.SetQQGroupMemberMute(requestContext(request.Origin), request.Params.GuildID, &dto.QQGroupMuteRequest{Members: []dto.QQGroupMuteOperation{op}})
-		return nil, err
+		meta, err := state.api.SetQQGroupMemberMute(requestContext(request.Origin), request.Params.GuildID, &dto.QQGroupMuteRequest{Members: []dto.QQGroupMuteOperation{op}})
+		return nil, wrapQQResponse(meta, err)
 	}
 	if request.Platform != "qqguild" {
 		return nil, server.NotFound("guild.member.mute is not supported in current platform")
@@ -498,7 +505,9 @@ func (a *Adapter) handleMessageCreate(request *server.Request[server.MessageCrea
 				return nil, marshalErr
 			}
 			response := server.NewResponse(status, raw)
+			response.Header = qqErrorHeaders(cause)
 			response.Header.Set("Content-Type", "application/json")
+			response.Cause = cause
 			return response, nil
 		}
 		return nil, err
@@ -973,15 +982,13 @@ func (a *Adapter) registerRoutes() {
 			started := time.Now()
 			result, err := handle(request)
 			err = qqActionError(err)
-			status := 200
-			var coded interface{ HTTPStatus() int }
-			if errors.As(err, &coded) {
-				status = coded.HTTPStatus()
-			} else if err != nil {
-				status = 500
-			}
-			if response, ok := result.(*server.Response); ok {
+			status := server.StatusFromError(err)
+			diagnosticErr := err
+			if response, ok := result.(*server.Response); ok && response != nil {
 				status = response.StatusCode
+				if diagnosticErr == nil {
+					diagnosticErr = response.Cause
+				}
 			}
 			level := logging.LevelDebug
 			if status >= 400 {
@@ -992,14 +999,14 @@ func (a *Adapter) registerRoutes() {
 			}
 			code, trace := 0, ""
 			var apiErr *errs.APIError
-			if errors.As(err, &apiErr) {
+			if errors.As(diagnosticErr, &apiErr) {
 				code, trace = apiErr.ErrorCode, apiErr.TraceID
 			}
 			label := request.Action
 			if strings.HasPrefix(label, protocol.InternalApiPrefix) {
 				label = "internal"
 			}
-			a.log(requestContext(request.Origin), level, describeActionLog(label, request.Platform, request.SelfID, status, code, trace, time.Since(started), result, err))
+			a.log(requestContext(request.Origin), level, describeActionLog(label, request.Platform, request.SelfID, status, code, trace, time.Since(started), result, diagnosticErr))
 			return result, err
 		})
 	}
@@ -1009,26 +1016,27 @@ func qqActionError(err error) error {
 	if err == nil {
 		return nil
 	}
-	var alreadyMapped interface{ HTTPStatus() int }
-	if errors.As(err, &alreadyMapped) {
-		return err
+	status := server.StatusFromError(err)
+	var explicit interface{ HTTPStatus() int }
+	if !errors.As(err, &explicit) && !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
+		var api *errs.APIError
+		if errors.As(err, &api) {
+			status = api.StatusCode
+			if status < 400 || status > 599 {
+				status = http.StatusBadGateway
+			}
+			if api.ErrorCode == 11253 {
+				status = http.StatusForbidden
+			}
+			var pending *errs.PendingError
+			if errors.As(err, &pending) {
+				status = http.StatusServiceUnavailable
+			}
+		}
 	}
-	var apiError *errs.APIError
-	if !errors.As(err, &apiError) {
-		return err
-	}
-	status := apiError.StatusCode
-	if status < 400 || status > 599 {
-		status = http.StatusBadGateway
-	}
-	if apiError.ErrorCode == 11253 {
-		status = http.StatusForbidden
-	}
-	var pending *errs.PendingError
-	if errors.As(err, &pending) {
-		status = http.StatusServiceUnavailable
-	}
-	return server.NewActionError(status, err.Error(), err)
+	result := server.NewActionError(status, logging.ErrorText(err), err)
+	result.Header = qqErrorHeaders(err)
+	return result
 }
 
 func unsupportedRoute(action string) server.RouteCall[any, any] {
