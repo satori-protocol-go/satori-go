@@ -71,17 +71,18 @@ type Config struct {
 	APIBaseURL string
 	Sandbox    bool
 
-	Path             string
-	Adapter          string
-	EventBuffer      int
-	RequestTimeout   time.Duration
-	UseWebSocket     bool
-	WSGatewayURL     string
-	WSIntents        int64
-	WSIntentNames    []string
-	WSShardID        uint32
-	WSShardCount     uint32
-	WSReconnectDelay time.Duration
+	Path                      string
+	Adapter                   string
+	EventBuffer               int
+	RequestTimeout            time.Duration
+	ManualInteractionResponse bool // The application explicitly acknowledges QQ interactions through native APIs.
+	UseWebSocket              bool
+	WSGatewayURL              string
+	WSIntents                 int64
+	WSIntentNames             []string
+	WSShardID                 uint32
+	WSShardCount              uint32
+	WSReconnectDelay          time.Duration
 
 	TokenSource  oauth2.TokenSource
 	HTTPClient   *http.Client // Credential-free client used by the SDK token/API transports.

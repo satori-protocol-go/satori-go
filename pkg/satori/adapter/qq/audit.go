@@ -73,13 +73,16 @@ func (a *Adapter) captureAuditResult(appID, eventType string, raw json.RawMessag
 		return
 	}
 	a.auditMu.Lock()
-	entry := a.audits[auditKey{auditID: data.AuditID}]
-	if entry != nil && entry.result == nil {
+	entry, err := a.auditEntryLocked(auditKey{appID, data.AuditID}, time.Now())
+	if err == nil && entry.result == nil {
 		entry.result = &auditResult{Passed: eventType == "MESSAGE_AUDIT_PASS", MessageID: data.MessageID, ChannelID: data.ChannelID, GuildID: data.GuildID, Reason: data.Reason}
 		entry.expires = time.Now().Add(defaultAuditWait)
 		close(entry.done)
 	}
 	a.auditMu.Unlock()
+	if err != nil {
+		a.log(context.Background(), logging.LevelWarn, err.Error())
+	}
 	a.log(context.Background(), logging.LevelInfo, fmt.Sprintf("QQ audit result app_id=%q audit_id=%q outcome=%q", appID, data.AuditID, eventType))
 	// The original audit event is still published by the common event path.
 }
@@ -98,7 +101,7 @@ func (a *Adapter) waitAuditResult(ctx context.Context, appID, auditID string, ti
 		timeout = defaultAuditWait
 	}
 	a.auditMu.Lock()
-	entry, err := a.auditEntryLocked(auditKey{auditID: auditID}, time.Now())
+	entry, err := a.auditEntryLocked(auditKey{appID, auditID}, time.Now())
 	if err == nil {
 		entry.waiters++
 	}
