@@ -3,6 +3,7 @@ package message
 import (
 	"encoding/json"
 	"fmt"
+	"github.com/satori-protocol-go/satori-go/pkg/satori/types"
 	"strings"
 
 	"github.com/satori-protocol-go/satori-go/pkg/satori/internal/xhtml"
@@ -14,14 +15,17 @@ import (
 
 // Message is the Satori message payload.
 type Message struct {
+	fields types.FieldPresence
+	// Referrer is an interoperability extension for continuing passive replies.
+	Referrer map[string]any           `json:"referrer,omitempty"`
 	Id       string                   `json:"id"`
-	Content  string                   `json:"content"`
+	Content  string                   `json:"content,omitempty"`
 	Channel  *channel.Channel         `json:"channel,omitempty"`
 	Guild    *guild.Guild             `json:"guild,omitempty"`
 	Member   *guildmember.GuildMember `json:"member,omitempty"`
 	User     *user.User               `json:"user,omitempty"`
-	CreateAt int64                    `json:"create_at,omitempty"`
-	UpdateAt int64                    `json:"update_at,omitempty"`
+	CreateAt int64                    `json:"created_at,omitempty"`
+	UpdateAt int64                    `json:"updated_at,omitempty"`
 }
 
 func (m *Message) UnmarshalJSON(data []byte) error {
@@ -29,10 +33,12 @@ func (m *Message) UnmarshalJSON(data []byte) error {
 
 	// Decode regular fields first.
 	var decoded alias
-	if err := json.Unmarshal(data, &decoded); err != nil {
+	fields, err := types.DecodeFields(data, &decoded)
+	if err != nil {
 		return err
 	}
 	*m = Message(decoded)
+	m.fields = fields
 
 	// Only perform fallback when payload does not provide "content".
 	raw := map[string]json.RawMessage{}
@@ -135,4 +141,34 @@ func mapToXHTMLElement(fields map[string]any) *xhtml.Element {
 		return nil
 	}
 	return xhtml.NewElement(tag, attrs, children)
+}
+
+func (m Message) MarshalJSON() ([]byte, error) {
+	// Promote the member user in API responses without mutating the source model.
+	if m.Member != nil {
+		if m.User == nil && !m.fields.Has("user") {
+			m.User = m.Member.User
+		}
+		m.Member = m.Member.WithoutUser()
+	}
+	out := map[string]any{"id": m.Id}
+	m.fields.Put(out, "content", m.Content, m.Content != "")
+	m.fields.Put(out, "channel", m.Channel, m.Channel != nil)
+	m.fields.Put(out, "guild", m.Guild, m.Guild != nil)
+	m.fields.Put(out, "member", m.Member, m.Member != nil)
+	m.fields.Put(out, "user", m.User, m.User != nil)
+	m.fields.Put(out, "created_at", m.CreateAt, m.CreateAt != 0)
+	m.fields.Put(out, "updated_at", m.UpdateAt, m.UpdateAt != 0)
+	m.fields.Put(out, "referrer", m.Referrer, m.Referrer != nil)
+	return json.Marshal(out)
+}
+
+// WithoutResources returns the message wire copy after resources are promoted to an event.
+func (m Message) WithoutResources() *Message {
+	m.Channel = nil
+	m.Guild = nil
+	m.Member = nil
+	m.User = nil
+	m.fields = m.fields.Without("channel", "guild", "member", "user")
+	return &m
 }

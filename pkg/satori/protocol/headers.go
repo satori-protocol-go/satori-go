@@ -36,17 +36,17 @@ func SetIdentityHeaders(header http.Header, platform string, selfID string) {
 }
 
 func ExtractIdentityHeaders(header http.Header) (string, string, error) {
-	platform := strings.TrimSpace(header.Get(HeaderPlatform))
+	platform := header.Get(HeaderSatoriPlatform)
 	if platform == "" {
-		platform = strings.TrimSpace(header.Get(HeaderSatoriPlatform))
+		platform = header.Get(HeaderPlatform)
 	}
 	if platform == "" {
 		return "", "", ErrMissingPlatformHeader
 	}
 
-	selfID := strings.TrimSpace(header.Get(HeaderSelfID))
+	selfID := header.Get(HeaderSatoriUserID)
 	if selfID == "" {
-		selfID = strings.TrimSpace(header.Get(HeaderSatoriUserID))
+		selfID = header.Get(HeaderSelfID)
 	}
 	if selfID == "" {
 		return "", "", ErrMissingSelfIDHeader
@@ -99,4 +99,27 @@ func ParseOpcode(value string) (int, error) {
 		return 0, nil
 	}
 	return strconv.Atoi(value)
+}
+
+// ForwardHeaders retains end-to-end headers, removing connection-specific fields.
+func ForwardHeaders(header http.Header) http.Header {
+	out := header.Clone()
+	for _, value := range header.Values("Connection") {
+		for _, name := range strings.Split(value, ",") {
+			out.Del(strings.TrimSpace(name))
+		}
+	}
+	for _, name := range []string{"Connection", "Proxy-Connection", "Keep-Alive", "Proxy-Authenticate", "Proxy-Authorization", "Te", "Trailer", "Transfer-Encoding", "Upgrade"} {
+		out.Del(name)
+	}
+	return out
+}
+
+// NativeRequestHeaders replaces local Satori authorization at the upstream boundary.
+func NativeRequestHeaders(header http.Header) http.Header {
+	out := ForwardHeaders(header)
+	for _, name := range []string{"Authorization", HeaderPlatform, HeaderSelfID, HeaderSatoriPlatform, HeaderSatoriUserID} {
+		out.Del(name)
+	}
+	return out
 }

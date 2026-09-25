@@ -4,7 +4,6 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
-	"strings"
 )
 
 type SatoriError interface {
@@ -132,7 +131,7 @@ func IsStatus(err error, statusCode int) bool {
 }
 
 func errorFromStatusCode(statusCode int, payload []byte) error {
-	body := strings.TrimSpace(string(payload))
+	body := string(payload)
 	switch statusCode {
 	case http.StatusBadRequest:
 		return NewBadRequestError(body)
@@ -157,6 +156,6 @@ func errorFromStatusCode(statusCode int, payload []byte) error {
 func newRequestError(statusCode int, body string) *RequestError {
 	return &RequestError{
 		StatusCode: statusCode,
-		Body:       strings.TrimSpace(body),
+		Body:       body,
 	}
 }
