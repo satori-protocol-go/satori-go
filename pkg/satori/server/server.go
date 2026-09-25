@@ -76,6 +76,15 @@ type staticResourceMount struct {
 	html       bool
 }
 
+type providerLoginKey struct {
+	source int
+	sn     int64
+}
+type loginBinding struct {
+	sn   int64
+	info *login.Login
+}
+
 type Server struct {
 	RouterMixin
 
@@ -97,8 +106,10 @@ type Server struct {
 	webhooks    []WebhookEndpoint
 	connections map[*websocketConnection]struct{}
 
-	sequence   int64
-	eventCache eventDeque
+	sequence      int64
+	eventCache    eventDeque
+	loginSequence int64
+	loginMappings map[providerLoginKey]*loginBinding
 
 	tempDir string
 
@@ -182,6 +193,7 @@ func NewServer(cfg Config) (*Server, error) {
 		connections:            map[*websocketConnection]struct{}{},
 		webhooks:               append([]WebhookEndpoint(nil), cfg.Webhooks...),
 		eventCache:             newEventDeque(eventCacheSize),
+		loginMappings:          map[providerLoginKey]*loginBinding{},
 		tempDir:                tempDir,
 		httpClient:             httpClient,
 		logger:                 logger,
@@ -515,12 +527,34 @@ func (s *Server) Post(evt *event.Event) error {
 	if evt == nil {
 		return nil
 	}
+	if evt.Login == nil {
+		return errors.New("event login is required")
+	}
+	source, err := s.eventSource(evt.Login)
+	if err != nil {
+		return err
+	}
+	return s.postFrom(context.Background(), source, evt)
+}
 
+func (s *Server) postFrom(ctx context.Context, source int, evt *event.Event) error {
+	if evt == nil {
+		return nil
+	}
+	if evt.Login == nil || evt.Login.Sn < 0 {
+		return errors.New("invalid event login")
+	}
+	owned := *evt
 	s.mu.Lock()
-	evt.Sn = s.sequence
+	binding := s.bindLoginLocked(source, evt.Login)
+	if isLoginEventType(evt.Type) {
+		binding.info = binding.info.Merge(evt.Login)
+	}
+	owned.Login = binding.info.Merge(evt.Login)
+	owned.Login.Sn = binding.sn
+	owned.Sn = s.sequence
 	s.sequence++
-	s.eventCache.Append(evt)
-
+	s.eventCache.Append(&owned)
 	connections := make([]*websocketConnection, 0, len(s.connections))
 	for connection := range s.connections {
 		connections = append(connections, connection)
@@ -528,32 +562,71 @@ func (s *Server) Post(evt *event.Event) error {
 	webhooks := append([]WebhookEndpoint(nil), s.webhooks...)
 	s.mu.Unlock()
 
-	payload := map[string]any{"op": operation.OpcodeEvent, "body": evt}
+	payload := map[string]any{"op": operation.OpcodeEvent, "body": &owned}
 	for _, connection := range connections {
 		if !connection.Alive() {
 			continue
 		}
 		if err := connection.Send(payload); err != nil {
-			s.log(
-				context.Background(),
-				LogLevelWarn,
-				fmt.Sprintf("websocket broadcast failed connection_id=%s remote_addr=%s error=%v", connection.ID(), connection.RemoteAddr(), err),
-			)
+			s.log(ctx, LogLevelWarn, fmt.Sprintf("websocket broadcast failed connection_id=%s error=%v", connection.ID(), err))
 			_ = connection.Close()
 			s.removeConnection(connection)
 		}
 	}
-
 	for _, webhook := range webhooks {
-		if err := s.sendWebhook(webhook, operation.OpcodeEvent, evt); err != nil {
-			s.log(
-				context.Background(),
-				LogLevelError,
-				fmt.Sprintf("webhook event delivery failed url=%s opcode=%d error=%v", webhook.URL, operation.OpcodeEvent, err),
-			)
+		if err := s.sendWebhook(webhook, operation.OpcodeEvent, &owned); err != nil {
+			s.log(ctx, LogLevelError, fmt.Sprintf("webhook event delivery failed error=%v", err))
 		}
 	}
 	return nil
+}
+
+func (s *Server) bindLoginLocked(source int, info *login.Login) *loginBinding {
+	key := providerLoginKey{source: source, sn: info.Sn}
+	if binding := s.loginMappings[key]; binding != nil {
+		return binding
+	}
+	binding := &loginBinding{sn: s.loginSequence, info: info.Clone()}
+	s.loginSequence++
+	s.loginMappings[key] = binding
+	return binding
+}
+
+func (s *Server) eventSource(info *login.Login) (int, error) {
+	for attempt := 0; attempt < 2; attempt++ {
+		s.mu.RLock()
+		if len(s.providers) == 0 {
+			s.mu.RUnlock()
+			return 0, nil
+		}
+		source, count := 0, 0
+		for key, binding := range s.loginMappings {
+			if key.source == 0 {
+				continue
+			}
+			match := key.sn == info.Sn
+			if info.User != nil && info.Platform != "" {
+				match = binding.info.User != nil && binding.info.Platform == info.Platform && binding.info.User.Id == info.User.Id
+			}
+			if match {
+				source = key.source
+				count++
+			}
+		}
+		s.mu.RUnlock()
+		if count == 1 {
+			return source, nil
+		}
+		if count > 1 {
+			return 0, errors.New("ambiguous event source; use the provider publisher")
+		}
+		if attempt == 0 {
+			if _, err := s.collectLogins(context.Background()); err != nil {
+				return 0, err
+			}
+		}
+	}
+	return 0, errors.New("event source login is not registered")
 }
 
 func (s *Server) GetLocalFile(rawURL string) ([]byte, error) {
@@ -1130,16 +1203,35 @@ func (s *Server) defaultUploadCreateHandler(request *Request[UploadCreateParam])
 }
 
 func (s *Server) collectLogins(ctx context.Context) ([]*login.Login, error) {
-	logins := make([]*login.Login, 0)
-
-	for _, provider := range s.snapshotProviders() {
-		items, err := provider.GetLogins(ctx)
+	providers := s.snapshotProviders()
+	snapshots := make([][]*login.Login, len(providers))
+	for index, provider := range providers {
+		values, err := provider.GetLogins(ctx)
 		if err != nil {
 			return nil, err
 		}
-		logins = append(logins, items...)
+		seen := map[int64]bool{}
+		for _, info := range values {
+			if info == nil || info.Sn < 0 || seen[info.Sn] {
+				return nil, errors.New("invalid or duplicate provider login sequence")
+			}
+			seen[info.Sn] = true
+			snapshots[index] = append(snapshots[index], info.Clone())
+		}
 	}
-	return logins, nil
+	result := make([]*login.Login, 0)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for index, values := range snapshots {
+		for _, info := range values {
+			binding := s.bindLoginLocked(index+1, info)
+			binding.info = info.Clone()
+			value := info.Clone()
+			value.Sn = binding.sn
+			result = append(result, value)
+		}
+	}
+	return result, nil
 }
 
 func (s *Server) getProxyURLs() []string {
@@ -1423,14 +1515,15 @@ func (s *Server) runBlocking(ctx context.Context) error {
 		return err
 	})
 
-	for _, provider := range s.snapshotProviders() {
+	for index, provider := range s.snapshotProviders() {
+		source := index + 1
 		publisher, ok := provider.(EventPublisher)
 		if !ok {
 			continue
 		}
 		stream := publisher.Publisher(groupCtx)
 		group.Go(func() error {
-			err := s.runPublisherTask(groupCtx, stream)
+			err := s.runPublisherTask(groupCtx, source, stream)
 			recordFirst(err)
 			return err
 		})
@@ -1508,7 +1601,7 @@ func (s *Server) runHTTPServerTask(ctx context.Context, httpServer *http.Server,
 	}
 }
 
-func (s *Server) runPublisherTask(ctx context.Context, stream <-chan *event.Event) error {
+func (s *Server) runPublisherTask(ctx context.Context, source int, stream <-chan *event.Event) error {
 	if stream == nil {
 		<-ctx.Done()
 		return ctx.Err()
@@ -1521,7 +1614,7 @@ func (s *Server) runPublisherTask(ctx context.Context, stream <-chan *event.Even
 			if !ok {
 				return nil
 			}
-			if err := s.Post(evt); err != nil {
+			if err := s.postFrom(ctx, source, evt); err != nil {
 				return err
 			}
 		}
