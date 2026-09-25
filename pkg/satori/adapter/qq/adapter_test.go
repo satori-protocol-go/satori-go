@@ -6,14 +6,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"github.com/WindowsSov8forUs/botgo-plus/interaction/signature"
-	"github.com/go-chi/chi/v5"
-	"github.com/gorilla/websocket"
-	"github.com/satori-protocol-go/satori-go/pkg/satori/model"
-	"github.com/satori-protocol-go/satori-go/pkg/satori/model/event"
-	"github.com/satori-protocol-go/satori-go/pkg/satori/model/login"
-	"github.com/satori-protocol-go/satori-go/pkg/satori/model/message"
-	"golang.org/x/oauth2"
 	"io"
 	"mime/multipart"
 	"net/http"
@@ -26,9 +18,19 @@ import (
 	"time"
 
 	"github.com/WindowsSov8forUs/botgo-plus/dto"
+	"github.com/WindowsSov8forUs/botgo-plus/interaction/signature"
 	sdklog "github.com/WindowsSov8forUs/botgo-plus/log"
+	"github.com/go-chi/chi/v5"
+	"github.com/gorilla/websocket"
 	"github.com/satori-protocol-go/satori-go/pkg/satori/logging"
+	"github.com/satori-protocol-go/satori-go/pkg/satori/model"
+	"github.com/satori-protocol-go/satori-go/pkg/satori/model/event"
+	"github.com/satori-protocol-go/satori-go/pkg/satori/model/guild"
+	"github.com/satori-protocol-go/satori-go/pkg/satori/model/guildmember"
+	"github.com/satori-protocol-go/satori-go/pkg/satori/model/login"
+	"github.com/satori-protocol-go/satori-go/pkg/satori/model/message"
 	"github.com/satori-protocol-go/satori-go/pkg/satori/server"
+	"golang.org/x/oauth2"
 )
 
 type qqRequest struct {
@@ -388,45 +390,6 @@ func signedQQRequest(t *testing.T, raw []byte, appID, secret string) *http.Reque
 	return r
 }
 
-func TestQQWebhookDelivery(t *testing.T) {
-	f := newQQFixture(t, func(cfg *Config) { cfg.EventBuffer = 1 })
-	payload := func(id string) []byte {
-		return []byte(fmt.Sprintf(`{"op":0,"s":1,"t":"GROUP_AT_MESSAGE_CREATE","d":{"id":%q,"content":"hello","group_openid":"g","author":{"member_openid":"u"}}}`, id))
-	}
-	first := httptest.NewRecorder()
-	f.adapter.handleWebhookRequest(first, signedQQRequest(t, payload("first"), "123", "fixture-secret"))
-	if first.Code != 200 {
-		t.Fatalf("first response=%d %s", first.Code, first.Body.String())
-	}
-	done := make(chan *httptest.ResponseRecorder, 1)
-	go func() {
-		second := httptest.NewRecorder()
-		f.adapter.handleWebhookRequest(second, signedQQRequest(t, payload("second"), "123", "fixture-secret"))
-		done <- second
-	}()
-	select {
-	case result := <-done:
-		t.Fatalf("callback acknowledged before queue delivery: %d", result.Code)
-	case <-time.After(30 * time.Millisecond):
-	}
-	firstEvent := <-f.adapter.eventCh
-	if firstEvent.Message == nil || firstEvent.Message.Id != "first" {
-		t.Fatalf("first event=%+v", firstEvent)
-	}
-	select {
-	case result := <-done:
-		if result.Code != 200 {
-			t.Fatalf("second response=%d %s", result.Code, result.Body.String())
-		}
-	case <-time.After(time.Second):
-		t.Fatal("callback did not finish after queue became available")
-	}
-	secondEvent := <-f.adapter.eventCh
-	if secondEvent.Message == nil || secondEvent.Message.Id != "second" {
-		t.Fatalf("second event=%+v", secondEvent)
-	}
-}
-
 func TestQQWebhook(t *testing.T) {
 	f := newQQFixture(t, nil)
 	router := chi.NewRouter()
@@ -514,6 +477,45 @@ func TestQQWebhook(t *testing.T) {
 	}
 }
 
+func TestQQWebhookDelivery(t *testing.T) {
+	f := newQQFixture(t, func(cfg *Config) { cfg.EventBuffer = 1 })
+	payload := func(id string) []byte {
+		return []byte(fmt.Sprintf(`{"op":0,"s":1,"t":"GROUP_AT_MESSAGE_CREATE","d":{"id":%q,"content":"hello","group_openid":"g","author":{"member_openid":"u"}}}`, id))
+	}
+	first := httptest.NewRecorder()
+	f.adapter.handleWebhookRequest(first, signedQQRequest(t, payload("first"), "123", "fixture-secret"))
+	if first.Code != 200 {
+		t.Fatalf("first response=%d %s", first.Code, first.Body.String())
+	}
+	done := make(chan *httptest.ResponseRecorder, 1)
+	go func() {
+		second := httptest.NewRecorder()
+		f.adapter.handleWebhookRequest(second, signedQQRequest(t, payload("second"), "123", "fixture-secret"))
+		done <- second
+	}()
+	select {
+	case result := <-done:
+		t.Fatalf("callback acknowledged before queue delivery: %d", result.Code)
+	case <-time.After(30 * time.Millisecond):
+	}
+	firstEvent := <-f.adapter.eventCh
+	if firstEvent.Message == nil || firstEvent.Message.Id != "first" {
+		t.Fatalf("first event=%+v", firstEvent)
+	}
+	select {
+	case result := <-done:
+		if result.Code != 200 {
+			t.Fatalf("second response=%d %s", result.Code, result.Body.String())
+		}
+	case <-time.After(time.Second):
+		t.Fatal("callback did not finish after queue became available")
+	}
+	secondEvent := <-f.adapter.eventCh
+	if secondEvent.Message == nil || secondEvent.Message.Id != "second" {
+		t.Fatalf("second event=%+v", secondEvent)
+	}
+}
+
 func TestQQNativeResponses(t *testing.T) {
 	f := newQQFixture(t, nil)
 	f.extra = func(w http.ResponseWriter, r *http.Request, item qqRequest) bool {
@@ -569,141 +571,6 @@ func TestQQNativeResponses(t *testing.T) {
 	handler.ServeHTTP(rec, req)
 	if rec.Code != 200 || rec.Body.String() != "binary-content" || rec.Header().Get("Content-Type") != "application/octet-stream" {
 		t.Fatalf("proxied native response=%d %q", rec.Code, rec.Body.String())
-	}
-}
-
-func TestQQMultiAppOwnershipAndShardStatus(t *testing.T) {
-	f := newQQFixture(t, func(cfg *Config) {
-		cfg.Apps = []AppConfig{{AppID: 123, Secret: "fixture-secret"}, {AppID: 456, Secret: "fixture-secret"}}
-		cfg.UseWebSocket = true
-	})
-	ctx := context.Background()
-	if err := f.adapter.Prepare(ctx); err != nil {
-		t.Fatal(err)
-	}
-	if state := f.adapter.stateFromContextOrEvent(ctx, ""); state != nil {
-		t.Fatalf("ambiguous event state=%+v", state)
-	}
-	if _, err := f.adapter.resolveStateBySelfID(ctx, ""); err == nil {
-		t.Fatal("empty identity selected an App")
-	}
-	state, err := f.adapter.resolveStateBySelfID(ctx, "bot-456")
-	if err != nil || state.appID != "456" {
-		t.Fatalf("owner=%+v error=%v", state, err)
-	}
-	primary := f.adapter.appStates["123"]
-	primary.expectedShards = 2
-	check := func(want123, want456 login.LoginStatus) {
-		t.Helper()
-		items, err := f.adapter.GetLogins(ctx)
-		if err != nil {
-			t.Fatal(err)
-		}
-		for _, item := range items {
-			want := want123
-			if item.User.Id == "bot-456" {
-				want = want456
-			}
-			if item.Status != want {
-				t.Fatalf("login=%+v want status=%d", item, want)
-			}
-		}
-	}
-	check(login.LoginStatusConnect, login.LoginStatusConnect)
-	if err := f.adapter.updateShardStatus(ctx, primary, 0, true); err != nil {
-		t.Fatal(err)
-	}
-	check(login.LoginStatusReconnect, login.LoginStatusConnect)
-	if err := f.adapter.updateShardStatus(ctx, primary, 1, true); err != nil {
-		t.Fatal(err)
-	}
-	check(login.LoginStatusOnline, login.LoginStatusConnect)
-	if err := f.adapter.updateShardStatus(ctx, primary, 0, false); err != nil {
-		t.Fatal(err)
-	}
-	check(login.LoginStatusReconnect, login.LoginStatusConnect)
-}
-
-func TestQQOwnedMediaPipeline(t *testing.T) {
-	f := newQQFixture(t, nil)
-	owner, err := server.NewServer(server.Config{Token: "satori-token"})
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer owner.Close()
-	if err := owner.Apply(f.adapter); err != nil {
-		t.Fatal(err)
-	}
-	handler, err := owner.Handler()
-	if err != nil {
-		t.Fatal(err)
-	}
-	image := []byte("\x89PNG\r\n\x1a\nimage-body")
-	for _, tc := range []struct{ platform, target, prepare string }{
-		{"qq", "group", "/v2/groups/group/upload_prepare"},
-		{"qq", "private:user", "/v2/users/user/upload_prepare"},
-		{"qqguild", "channel", ""},
-	} {
-		t.Run(tc.target, func(t *testing.T) {
-			body := bytes.NewBuffer(nil)
-			form := multipart.NewWriter(body)
-			part, err := form.CreateFormFile("image", "fixture.png")
-			if err != nil {
-				t.Fatal(err)
-			}
-			part.Write(image)
-			form.Close()
-			r := httptest.NewRequest("POST", "/v1/upload.create", body)
-			r.Header.Set("Content-Type", form.FormDataContentType())
-			r.Header.Set("Authorization", "Bearer satori-token")
-			r.Header.Set("Satori-Platform", tc.platform)
-			r.Header.Set("Satori-User-ID", "bot-123")
-			uploaded := httptest.NewRecorder()
-			handler.ServeHTTP(uploaded, r)
-			var urls map[string]string
-			if err := json.Unmarshal(uploaded.Body.Bytes(), &urls); err != nil || uploaded.Code != 200 {
-				t.Fatalf("upload=%d %s err=%v", uploaded.Code, uploaded.Body, err)
-			}
-			before := len(f.requests())
-			data, _ := json.Marshal(map[string]any{"channel_id": tc.target, "content": `<img title="fixture.png" src="` + urls["image"] + `"/>`})
-			r = httptest.NewRequest("POST", "/v1/message.create", bytes.NewReader(data))
-			r.Header.Set("Content-Type", "application/json")
-			r.Header.Set("Authorization", "Bearer satori-token")
-			r.Header.Set("Satori-Platform", tc.platform)
-			r.Header.Set("Satori-User-ID", "bot-123")
-			sent := httptest.NewRecorder()
-			handler.ServeHTTP(sent, r)
-			var messages []message.Message
-			if err := json.Unmarshal(sent.Body.Bytes(), &messages); err != nil || sent.Code != 200 || len(messages) != 1 {
-				t.Fatalf("send=%d %s err=%v", sent.Code, sent.Body, err)
-			}
-			calls := f.requests()[before:]
-			if tc.prepare != "" {
-				if len(calls) != 5 || calls[0].Path != tc.prepare || calls[1].Method != "PUT" || !bytes.Equal(calls[1].Raw, image) || string(calls[0].Fields["file_name"]) != `"fixture.png"` {
-					t.Fatalf("media pipeline=%+v", calls)
-				}
-				if !strings.HasSuffix(calls[2].Path, "/upload_part_finish") || !strings.HasSuffix(calls[3].Path, "/files") || !bytes.Contains(calls[4].Fields["media"], []byte("opaque!file-info")) {
-					t.Fatalf("media confirmation/message=%+v", calls)
-				}
-			} else if len(calls) != 1 || !bytes.Equal(calls[0].Image, image) {
-				t.Fatalf("channel image=%+v", calls)
-			}
-		})
-	}
-	f.mu.Lock()
-	f.extra = func(w http.ResponseWriter, r *http.Request, _ qqRequest) bool {
-		if r.URL.Path == "/v2/groups/failure/upload_prepare" {
-			w.WriteHeader(403)
-			w.Write([]byte(`{"err_code":11253}`))
-			return true
-		}
-		return false
-	}
-	f.mu.Unlock()
-	_, err = f.call("message.create", "qq", "bot-123", map[string]any{"channel_id": "failure", "content": `<img src="data:image/png;base64,aW1hZ2U="/>`})
-	var status interface{ HTTPStatus() int }
-	if !errors.As(err, &status) || status.HTTPStatus() != 403 || !strings.Contains(err.Error(), "prepare") {
-		t.Fatalf("upload stage failure=%v", err)
 	}
 }
 
@@ -850,6 +717,141 @@ func TestQQMultiAppGateway(t *testing.T) {
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("gateway shutdown timed out")
+	}
+}
+
+func TestQQMultiAppOwnershipAndShardStatus(t *testing.T) {
+	f := newQQFixture(t, func(cfg *Config) {
+		cfg.Apps = []AppConfig{{AppID: 123, Secret: "fixture-secret"}, {AppID: 456, Secret: "fixture-secret"}}
+		cfg.UseWebSocket = true
+	})
+	ctx := context.Background()
+	if err := f.adapter.Prepare(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if state := f.adapter.stateFromContextOrEvent(ctx, ""); state != nil {
+		t.Fatalf("ambiguous event state=%+v", state)
+	}
+	if _, err := f.adapter.resolveStateBySelfID(ctx, ""); err == nil {
+		t.Fatal("empty identity selected an App")
+	}
+	state, err := f.adapter.resolveStateBySelfID(ctx, "bot-456")
+	if err != nil || state.appID != "456" {
+		t.Fatalf("owner=%+v error=%v", state, err)
+	}
+	primary := f.adapter.appStates["123"]
+	primary.expectedShards = 2
+	check := func(want123, want456 login.LoginStatus) {
+		t.Helper()
+		items, err := f.adapter.GetLogins(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, item := range items {
+			want := want123
+			if item.User.Id == "bot-456" {
+				want = want456
+			}
+			if item.Status != want {
+				t.Fatalf("login=%+v want status=%d", item, want)
+			}
+		}
+	}
+	check(login.LoginStatusConnect, login.LoginStatusConnect)
+	if err := f.adapter.updateShardStatus(ctx, primary, 0, true); err != nil {
+		t.Fatal(err)
+	}
+	check(login.LoginStatusReconnect, login.LoginStatusConnect)
+	if err := f.adapter.updateShardStatus(ctx, primary, 1, true); err != nil {
+		t.Fatal(err)
+	}
+	check(login.LoginStatusOnline, login.LoginStatusConnect)
+	if err := f.adapter.updateShardStatus(ctx, primary, 0, false); err != nil {
+		t.Fatal(err)
+	}
+	check(login.LoginStatusReconnect, login.LoginStatusConnect)
+}
+
+func TestQQOwnedMediaPipeline(t *testing.T) {
+	f := newQQFixture(t, nil)
+	owner, err := server.NewServer(server.Config{Token: "satori-token"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer owner.Close()
+	if err := owner.Apply(f.adapter); err != nil {
+		t.Fatal(err)
+	}
+	handler, err := owner.Handler()
+	if err != nil {
+		t.Fatal(err)
+	}
+	image := []byte("\x89PNG\r\n\x1a\nimage-body")
+	for _, tc := range []struct{ platform, target, prepare string }{
+		{"qq", "group", "/v2/groups/group/upload_prepare"},
+		{"qq", "private:user", "/v2/users/user/upload_prepare"},
+		{"qqguild", "channel", ""},
+	} {
+		t.Run(tc.target, func(t *testing.T) {
+			body := bytes.NewBuffer(nil)
+			form := multipart.NewWriter(body)
+			part, err := form.CreateFormFile("image", "fixture.png")
+			if err != nil {
+				t.Fatal(err)
+			}
+			part.Write(image)
+			form.Close()
+			r := httptest.NewRequest("POST", "/v1/upload.create", body)
+			r.Header.Set("Content-Type", form.FormDataContentType())
+			r.Header.Set("Authorization", "Bearer satori-token")
+			r.Header.Set("Satori-Platform", tc.platform)
+			r.Header.Set("Satori-User-ID", "bot-123")
+			uploaded := httptest.NewRecorder()
+			handler.ServeHTTP(uploaded, r)
+			var urls map[string]string
+			if err := json.Unmarshal(uploaded.Body.Bytes(), &urls); err != nil || uploaded.Code != 200 {
+				t.Fatalf("upload=%d %s err=%v", uploaded.Code, uploaded.Body, err)
+			}
+			before := len(f.requests())
+			data, _ := json.Marshal(map[string]any{"channel_id": tc.target, "content": `<img title="fixture.png" src="` + urls["image"] + `"/>`})
+			r = httptest.NewRequest("POST", "/v1/message.create", bytes.NewReader(data))
+			r.Header.Set("Content-Type", "application/json")
+			r.Header.Set("Authorization", "Bearer satori-token")
+			r.Header.Set("Satori-Platform", tc.platform)
+			r.Header.Set("Satori-User-ID", "bot-123")
+			sent := httptest.NewRecorder()
+			handler.ServeHTTP(sent, r)
+			var messages []message.Message
+			if err := json.Unmarshal(sent.Body.Bytes(), &messages); err != nil || sent.Code != 200 || len(messages) != 1 {
+				t.Fatalf("send=%d %s err=%v", sent.Code, sent.Body, err)
+			}
+			calls := f.requests()[before:]
+			if tc.prepare != "" {
+				if len(calls) != 5 || calls[0].Path != tc.prepare || calls[1].Method != "PUT" || !bytes.Equal(calls[1].Raw, image) || string(calls[0].Fields["file_name"]) != `"fixture.png"` {
+					t.Fatalf("media pipeline=%+v", calls)
+				}
+				if !strings.HasSuffix(calls[2].Path, "/upload_part_finish") || !strings.HasSuffix(calls[3].Path, "/files") || !bytes.Contains(calls[4].Fields["media"], []byte("opaque!file-info")) {
+					t.Fatalf("media confirmation/message=%+v", calls)
+				}
+			} else if len(calls) != 1 || !bytes.Equal(calls[0].Image, image) {
+				t.Fatalf("channel image=%+v", calls)
+			}
+		})
+	}
+	f.mu.Lock()
+	f.extra = func(w http.ResponseWriter, r *http.Request, _ qqRequest) bool {
+		if r.URL.Path == "/v2/groups/failure/upload_prepare" {
+			w.WriteHeader(403)
+			w.Write([]byte(`{"err_code":11253}`))
+			return true
+		}
+		return false
+	}
+	f.mu.Unlock()
+	_, err = f.call("message.create", "qq", "bot-123", map[string]any{"channel_id": "failure", "content": `<img src="data:image/png;base64,aW1hZ2U="/>`})
+	var status interface{ HTTPStatus() int }
+	if !errors.As(err, &status) || status.HTTPStatus() != 403 || !strings.Contains(err.Error(), "prepare") {
+		t.Fatalf("upload stage failure=%v", err)
 	}
 }
 
@@ -1019,6 +1021,141 @@ func TestQQInteractionResponses(t *testing.T) {
 		t.Fatalf("manual interaction replies=%d", replies)
 	}
 
+}
+
+func TestQQGroupManagement(t *testing.T) {
+	f := newQQFixture(t, nil)
+	f.extra = func(w http.ResponseWriter, r *http.Request, item qqRequest) bool {
+		switch r.Method + " " + r.URL.Path {
+		case "GET /v2/groups/group/info":
+			w.Write([]byte(`{"group_openid":"group","group_name":"Group name"}`))
+		case "GET /v2/groups/group/members/member":
+			w.Write([]byte(`{"member_openid":"member","username":"Member name","member_role":"admin","joined_at":"2026-09-24T01:02:03.004Z","union_openid":"not-member-id"}`))
+		case "GET /v2/groups/group/members":
+			switch r.URL.Query().Get("cursor") {
+			case "":
+				w.Write([]byte(`{"members":[{"member_openid":"one","member_role":"owner"}],"next_cursor":" next+/== "}`))
+			case " next+/== ":
+				w.Write([]byte(`{"members":[{"member_openid":"two","member_role":"member"}],"next_cursor":""}`))
+			default:
+				t.Errorf("cursor changed: %q", r.URL.Query().Get("cursor"))
+				w.WriteHeader(400)
+			}
+		case "POST /v2/groups/group/batch_remove_members":
+			var value dto.QQGroupRemoveRequest
+			if err := json.Unmarshal(item.Raw, &value); err != nil {
+				t.Error(err)
+			}
+			if len(value.MemberOpenIDs) != 1 || value.MemberOpenIDs[0] != "member" {
+				t.Errorf("remove=%+v", value)
+			}
+			if value.AddToMemberBlacklist {
+				w.Write([]byte(`{"remove_members_result":"success","add_to_member_blacklist_fail_openids":["member"]}`))
+			} else {
+				w.Write([]byte(`{"remove_members_result":"success","add_to_member_blacklist_fail_openids":[]}`))
+			}
+		case "POST /v2/groups/group/restrict_chat_setting":
+			var value dto.QQGroupMuteRequest
+			if err := json.Unmarshal(item.Raw, &value); err != nil {
+				t.Error(err)
+			}
+			if len(value.Members) != 1 || value.Members[0].MemberOpenID != "member" {
+				t.Errorf("mute=%+v", value)
+				w.WriteHeader(400)
+				return true
+			}
+			op := value.Members[0]
+			if op.Op == "add" {
+				expiry, err := time.Parse(time.RFC3339Nano, op.MuteExpireAt)
+				if err != nil || time.Until(expiry) < 8*time.Second || time.Until(expiry) > 11*time.Second {
+					t.Errorf("mute expiry=%s error=%v", op.MuteExpireAt, err)
+				}
+			} else if op.Op != "del" {
+				t.Errorf("mute operation=%s", op.Op)
+			}
+			w.Write([]byte(`{}`))
+		case "GET /guilds/guild":
+			w.Write([]byte(`{"id":"guild","name":"Guild name"}`))
+		case "GET /guilds/guild/members/member":
+			w.Write([]byte(`{"user":{"id":"member"},"roles":["role"],"joined_at":"2026-09-24T01:02:03Z"}`))
+		case "GET /guilds/guild/members":
+			w.Write([]byte(`[{"user":{"id":"member"},"roles":["role"]}]`))
+		case "DELETE /guilds/guild/members/member":
+			w.WriteHeader(204)
+		case "PATCH /guilds/guild/members/member/mute":
+			if string(item.Fields["mute_seconds"]) != `"10"` {
+				t.Errorf("guild mute=%s", item.Raw)
+			}
+			w.WriteHeader(204)
+		case "GET /v2/groups/denied/info":
+			w.WriteHeader(403)
+			w.Write([]byte(`{"err_code":11253}`))
+		default:
+			return false
+		}
+		return true
+	}
+	result, err := f.call("guild.get", "qq", "bot-123", map[string]any{"guild_id": "group"})
+	if err != nil || result.(*guild.Guild).Name != "Group name" {
+		t.Fatalf("group=%+v error=%v", result, err)
+	}
+	result, err = f.call("guild.member.get", "qq", "bot-123", map[string]any{"guild_id": "group", "user_id": "member"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	member := result.(*guildmember.GuildMember)
+	expected, _ := time.Parse(time.RFC3339Nano, "2026-09-24T01:02:03.004Z")
+	if member.User.Id != "member" || member.JoinedAt != expected.UnixMilli() || len(member.Roles) != 1 || member.Roles[0].Id != "admin" {
+		t.Fatalf("member=%+v", member)
+	}
+	cursor := ""
+	for _, id := range []string{"one", "two"} {
+		result, err = f.call("guild.member.list", "qq", "bot-123", map[string]any{"guild_id": "group", "next": cursor})
+		if err != nil {
+			t.Fatal(err)
+		}
+		page := result.(*model.Paginated[*guildmember.GuildMember])
+		if len(page.Data) != 1 || page.Data[0].User.Id != id || len(page.Data[0].Roles) != 1 {
+			t.Fatalf("members=%+v", page)
+		}
+		cursor = page.Next
+	}
+	if cursor != "" {
+		t.Fatalf("terminal cursor=%q", cursor)
+	}
+	for _, permanent := range []bool{false, true} {
+		result, err = f.call("guild.member.kick", "qq", "bot-123", map[string]any{"guild_id": "group", "user_id": "member", "permanent": permanent})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if permanent {
+			partial := result.(*server.Response)
+			if partial.StatusCode != 502 || !bytes.Contains(partial.Body, []byte(`"add_to_member_blacklist_fail_openids":["member"]`)) {
+				t.Fatalf("partial removal=%+v", partial)
+			}
+		}
+	}
+	for _, duration := range []int64{10000, 0} {
+		if _, err := f.call("guild.member.mute", "qq", "bot-123", map[string]any{"guild_id": "group", "user_id": "member", "duration": duration}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, action := range []string{"guild.get", "guild.member.get", "guild.member.list", "guild.member.kick", "guild.member.mute"} {
+		before := len(f.requests())
+		_, err := f.call(action, "qqguild", "bot-123", map[string]any{"guild_id": "guild", "user_id": "member", "duration": 10000})
+		if err != nil {
+			t.Fatalf("guild action %s: %v", action, err)
+		}
+		calls := f.requests()[before:]
+		if len(calls) != 1 || !strings.HasPrefix(calls[0].Path, "/guilds/") {
+			t.Fatalf("guild request path=%+v", calls)
+		}
+	}
+	_, err = f.call("guild.get", "qq", "bot-123", map[string]any{"guild_id": "denied"})
+	var status interface{ HTTPStatus() int }
+	if !errors.As(err, &status) || status.HTTPStatus() != 403 || !strings.Contains(err.Error(), "11253") {
+		t.Fatalf("permissions=%v", err)
+	}
 }
 
 type capturedQQLog struct {

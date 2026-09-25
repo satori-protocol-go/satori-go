@@ -20,6 +20,8 @@ import (
 	"github.com/satori-protocol-go/satori-go/pkg/satori/model"
 	"github.com/satori-protocol-go/satori-go/pkg/satori/model/channel"
 	"github.com/satori-protocol-go/satori-go/pkg/satori/model/guild"
+	"github.com/satori-protocol-go/satori-go/pkg/satori/model/guildmember"
+	"github.com/satori-protocol-go/satori-go/pkg/satori/model/guildrole"
 	"github.com/satori-protocol-go/satori-go/pkg/satori/model/message"
 	"github.com/satori-protocol-go/satori-go/pkg/satori/model/user"
 	"github.com/satori-protocol-go/satori-go/pkg/satori/protocol"
@@ -260,6 +262,203 @@ func (a *Adapter) handleLoginGet(request *server.Request[server.LoginGetParam]) 
 		return nil, server.NotFound("login not found")
 	}
 	return login, nil
+}
+
+func (a *Adapter) handleGuildMemberGet(request *server.Request[server.GuildMemberGetParam]) (any, error) {
+	if request.Platform == "qq" {
+		state, err := a.resolveRequestState(request.Origin, request.SelfID)
+		if err != nil {
+			return nil, err
+		}
+		member, _, err := state.api.GetQQGroupMember(requestContext(request.Origin), request.Params.GuildID, request.Params.UserID)
+		if err != nil {
+			return nil, err
+		}
+		return convert.GroupMemberFromNative(member)
+	}
+	if request.Platform != "qqguild" {
+		return nil, server.NotFound("guild.member.get is not supported in current platform")
+	}
+	state, err := a.resolveRequestState(request.Origin, request.SelfID)
+	if err != nil {
+		return nil, err
+	}
+	api := state.api
+	guildID := request.Params.GuildID
+	userID := request.Params.UserID
+
+	member, err := api.GuildMember(requestContext(request.Origin), convert.SplitGuildCompositeID(guildID), userID)
+	if err != nil {
+		return nil, err
+	}
+	if member == nil {
+		return nil, server.NotFound("member not found")
+	}
+	return convert.MemberFromDTO(member), nil
+}
+
+func (a *Adapter) handleGuildMemberList(request *server.Request[server.GuildListByGuildParam]) (any, error) {
+	if request.Platform == "qq" {
+		state, err := a.resolveRequestState(request.Origin, request.SelfID)
+		if err != nil {
+			return nil, err
+		}
+		page, _, err := state.api.GetQQGroupMembers(requestContext(request.Origin), request.Params.GuildID, request.Params.Next.ValueOr(""))
+		if err != nil {
+			return nil, err
+		}
+		values := make([]*guildmember.GuildMember, 0, len(page.Members))
+		for _, member := range page.Members {
+			value, err := convert.GroupMemberFromNative(&member)
+			if err != nil {
+				return nil, err
+			}
+			values = append(values, value)
+		}
+		return &model.Paginated[*guildmember.GuildMember]{Data: values, Next: page.NextCursor}, nil
+	}
+	if request.Platform != "qqguild" {
+		return nil, server.NotFound("guild.member.list is not supported in current platform")
+	}
+	state, err := a.resolveRequestState(request.Origin, request.SelfID)
+	if err != nil {
+		return nil, err
+	}
+	api := state.api
+	guildID := request.Params.GuildID
+
+	pager := &dto.GuildMembersPager{After: "0", Limit: "400"}
+	if nextValue, ok := request.Params.Next.Get(); ok {
+		next := nextValue
+		if next != "" {
+			pager.After = next
+		}
+	}
+
+	items, err := api.GuildMembers(requestContext(request.Origin), convert.SplitGuildCompositeID(guildID), pager)
+	if err != nil {
+		return nil, err
+	}
+	data := make([]*guildmember.GuildMember, 0, len(items))
+	for _, item := range items {
+		data = append(data, convert.MemberFromDTO(item))
+	}
+	response := &model.Paginated[*guildmember.GuildMember]{Data: data}
+	if len(data) > 0 && data[len(data)-1] != nil && data[len(data)-1].User != nil {
+		response.Next = data[len(data)-1].User.Id
+	}
+	return response, nil
+}
+
+func (a *Adapter) handleGuildMemberKick(request *server.Request[server.GuildMemberKickParam]) (any, error) {
+	if request.Platform == "qq" {
+		state, err := a.resolveRequestState(request.Origin, request.SelfID)
+		if err != nil {
+			return nil, err
+		}
+		result, meta, err := state.api.RemoveQQGroupMembers(requestContext(request.Origin), request.Params.GuildID, &dto.QQGroupRemoveRequest{MemberOpenIDs: []string{request.Params.UserID}, AddToMemberBlacklist: request.Params.Permanent.ValueOr(false)})
+		if err != nil {
+			return nil, err
+		}
+		if result.RemoveMembersResult != "success" || len(result.BlacklistFailedOpenIDs) > 0 {
+			response := server.NewResponse(502, meta.Raw)
+			response.Header = meta.Header.Clone()
+			return response, nil
+		}
+		return nil, nil
+	}
+	if request.Platform != "qqguild" {
+		return nil, server.NotFound("guild.member.kick is not supported in current platform")
+	}
+	state, err := a.resolveRequestState(request.Origin, request.SelfID)
+	if err != nil {
+		return nil, err
+	}
+	api := state.api
+	guildID := request.Params.GuildID
+	userID := request.Params.UserID
+
+	if err := api.DeleteGuildMember(requestContext(request.Origin), convert.SplitGuildCompositeID(guildID), userID); err != nil {
+		return nil, err
+	}
+	return map[string]any{}, nil
+}
+
+func (a *Adapter) handleGuildMemberMute(request *server.Request[server.GuildMemberMuteParam]) (any, error) {
+	if request.Platform == "qq" {
+		duration := request.Params.Duration
+		if duration < 0 || duration > math.MaxInt64/int64(time.Millisecond) {
+			return nil, server.BadRequest("mute duration is outside the supported millisecond range")
+		}
+		state, err := a.resolveRequestState(request.Origin, request.SelfID)
+		if err != nil {
+			return nil, err
+		}
+		op := dto.QQGroupMuteOperation{Op: "del", MemberOpenID: request.Params.UserID}
+		if duration > 0 {
+			op.Op = "add"
+			op.MuteExpireAt = time.Now().UTC().Add(time.Duration(duration) * time.Millisecond).Format(time.RFC3339Nano)
+		}
+		_, err = state.api.SetQQGroupMemberMute(requestContext(request.Origin), request.Params.GuildID, &dto.QQGroupMuteRequest{Members: []dto.QQGroupMuteOperation{op}})
+		return nil, err
+	}
+	if request.Platform != "qqguild" {
+		return nil, server.NotFound("guild.member.mute is not supported in current platform")
+	}
+	state, err := a.resolveRequestState(request.Origin, request.SelfID)
+	if err != nil {
+		return nil, err
+	}
+	api := state.api
+	guildID := request.Params.GuildID
+	userID := request.Params.UserID
+
+	seconds := int64(0)
+	if request.Params.Duration > 0 {
+		seconds = request.Params.Duration / 1000
+	}
+	mute := &dto.UpdateGuildMute{MuteSeconds: strconv.FormatInt(seconds, 10)}
+	if err := api.MemberMute(requestContext(request.Origin), convert.SplitGuildCompositeID(guildID), userID, mute); err != nil {
+		return nil, err
+	}
+	return map[string]any{}, nil
+}
+
+func (a *Adapter) handleGuildMemberRoleSet(request *server.Request[server.GuildMemberRoleParam]) (any, error) {
+	return a.handleGuildMemberRoleChange(request, true)
+}
+
+func (a *Adapter) handleGuildMemberRoleUnset(request *server.Request[server.GuildMemberRoleParam]) (any, error) {
+	return a.handleGuildMemberRoleChange(request, false)
+}
+
+func (a *Adapter) handleGuildMemberRoleChange(
+	request *server.Request[server.GuildMemberRoleParam],
+	set bool,
+) (any, error) {
+	if request.Platform != "qqguild" {
+		return nil, server.NotFound("guild.member.role action is not supported in current platform")
+	}
+	state, err := a.resolveRequestState(request.Origin, request.SelfID)
+	if err != nil {
+		return nil, err
+	}
+	api := state.api
+	guildID := request.Params.GuildID
+	userID := request.Params.UserID
+	roleID := request.Params.RoleID
+
+	ctx := requestContext(request.Origin)
+	if set {
+		if callErr := api.MemberAddRole(ctx, convert.SplitGuildCompositeID(guildID), dto.RoleID(roleID), userID, nil); callErr != nil {
+			return nil, callErr
+		}
+	} else {
+		if callErr := api.MemberDeleteRole(ctx, convert.SplitGuildCompositeID(guildID), dto.RoleID(roleID), userID, nil); callErr != nil {
+			return nil, callErr
+		}
+	}
+	return map[string]any{}, nil
 }
 
 func (a *Adapter) handleMessageCreate(request *server.Request[server.MessageCreateParam]) (any, error) {
@@ -743,18 +942,18 @@ func (a *Adapter) registerRoutes() {
 	a.RouterMixin.Route(protocol.ApiGuildList, server.Wrapper(a.handleGuildList))
 	a.RouterMixin.Route(protocol.ApiGuildApprove, unsupportedRoute("guild.approve"))
 
-	a.RouterMixin.Route(protocol.ApiGuildMemberGet, unsupportedRoute("guild.member.get"))
-	a.RouterMixin.Route(protocol.ApiGuildMemberList, unsupportedRoute("guild.member.list"))
-	a.RouterMixin.Route(protocol.ApiGuildMemberKick, unsupportedRoute("guild.member.kick"))
-	a.RouterMixin.Route(protocol.ApiGuildMemberMute, unsupportedRoute("guild.member.mute"))
-	a.RouterMixin.Route(protocol.ApiGuildMemberRoleSet, unsupportedRoute("guild.member.role.set"))
-	a.RouterMixin.Route(protocol.ApiGuildMemberRoleUnset, unsupportedRoute("guild.member.role.unset"))
+	a.RouterMixin.Route(protocol.ApiGuildMemberGet, server.Wrapper(a.handleGuildMemberGet))
+	a.RouterMixin.Route(protocol.ApiGuildMemberList, server.Wrapper(a.handleGuildMemberList))
+	a.RouterMixin.Route(protocol.ApiGuildMemberKick, server.Wrapper(a.handleGuildMemberKick))
+	a.RouterMixin.Route(protocol.ApiGuildMemberMute, server.Wrapper(a.handleGuildMemberMute))
+	a.RouterMixin.Route(protocol.ApiGuildMemberRoleSet, server.Wrapper(a.handleGuildMemberRoleSet))
+	a.RouterMixin.Route(protocol.ApiGuildMemberRoleUnset, server.Wrapper(a.handleGuildMemberRoleUnset))
 	a.RouterMixin.Route(protocol.ApiGuildMemberApprove, unsupportedRoute("guild.member.approve"))
 
-	a.RouterMixin.Route(protocol.ApiGuildRoleList, unsupportedRoute("guild.role.list"))
-	a.RouterMixin.Route(protocol.ApiGuildRoleCreate, unsupportedRoute("guild.role.create"))
-	a.RouterMixin.Route(protocol.ApiGuildRoleUpdate, unsupportedRoute("guild.role.update"))
-	a.RouterMixin.Route(protocol.ApiGuildRoleDelete, unsupportedRoute("guild.role.delete"))
+	a.RouterMixin.Route(protocol.ApiGuildRoleList, server.Wrapper(a.handleGuildRoleList))
+	a.RouterMixin.Route(protocol.ApiGuildRoleCreate, server.Wrapper(a.handleGuildRoleCreate))
+	a.RouterMixin.Route(protocol.ApiGuildRoleUpdate, server.Wrapper(a.handleGuildRoleUpdate))
+	a.RouterMixin.Route(protocol.ApiGuildRoleDelete, server.Wrapper(a.handleGuildRoleDelete))
 
 	a.RouterMixin.Route(protocol.ApiReactionCreate, server.Wrapper(a.handleReactionCreate))
 	a.RouterMixin.Route(protocol.ApiReactionDelete, server.Wrapper(a.handleReactionDelete))
@@ -839,6 +1038,105 @@ func unsupportedRoute(action string) server.RouteCall[any, any] {
 		}
 		return nil, server.NotFound(action + " is not supported")
 	}
+}
+
+func (a *Adapter) handleGuildRoleList(request *server.Request[server.GuildListByGuildParam]) (any, error) {
+	if request.Platform != "qqguild" {
+		return nil, server.NotFound("guild.role.list is not supported in current platform")
+	}
+	state, err := a.resolveRequestState(request.Origin, request.SelfID)
+	if err != nil {
+		return nil, err
+	}
+	api := state.api
+	guildID := request.Params.GuildID
+
+	roles, err := api.Roles(requestContext(request.Origin), convert.SplitGuildCompositeID(guildID))
+	if err != nil {
+		return nil, err
+	}
+	if roles == nil {
+		return &model.Paginated[*guildrole.GuildRole]{Data: []*guildrole.GuildRole{}}, nil
+	}
+	return &model.Paginated[*guildrole.GuildRole]{Data: convert.RolesFromDTO(roles.Roles)}, nil
+}
+
+func (a *Adapter) handleGuildRoleCreate(request *server.Request[server.GuildRoleCreateParam]) (any, error) {
+	if request.Platform != "qqguild" {
+		return nil, server.NotFound("guild.role.create is not supported in current platform")
+	}
+	state, err := a.resolveRequestState(request.Origin, request.SelfID)
+	if err != nil {
+		return nil, err
+	}
+	api := state.api
+	guildID := request.Params.GuildID
+
+	updated, err := api.PostRole(
+		requestContext(request.Origin),
+		convert.SplitGuildCompositeID(guildID),
+		convert.ParseRole(request.Params.Role),
+	)
+	if err != nil {
+		return nil, err
+	}
+	if updated == nil || updated.Role == nil {
+		return nil, server.NotFound("role not created")
+	}
+	items := convert.RolesFromDTO([]*dto.Role{updated.Role})
+	if len(items) == 0 {
+		return nil, server.NotFound("role not created")
+	}
+	return items[0], nil
+}
+
+func (a *Adapter) handleGuildRoleUpdate(request *server.Request[server.GuildRoleUpdateParam]) (any, error) {
+	if request.Platform != "qqguild" {
+		return nil, server.NotFound("guild.role.update is not supported in current platform")
+	}
+	state, err := a.resolveRequestState(request.Origin, request.SelfID)
+	if err != nil {
+		return nil, err
+	}
+	api := state.api
+	guildID := request.Params.GuildID
+	roleID := request.Params.RoleID
+
+	updated, err := api.PatchRole(
+		requestContext(request.Origin),
+		convert.SplitGuildCompositeID(guildID),
+		dto.RoleID(roleID),
+		convert.ParseRole(request.Params.Role),
+	)
+	if err != nil {
+		return nil, err
+	}
+	if updated == nil || updated.Role == nil {
+		return map[string]any{}, nil
+	}
+	items := convert.RolesFromDTO([]*dto.Role{updated.Role})
+	if len(items) == 0 {
+		return map[string]any{}, nil
+	}
+	return items[0], nil
+}
+
+func (a *Adapter) handleGuildRoleDelete(request *server.Request[server.GuildRoleDeleteParam]) (any, error) {
+	if request.Platform != "qqguild" {
+		return nil, server.NotFound("guild.role.delete is not supported in current platform")
+	}
+	state, err := a.resolveRequestState(request.Origin, request.SelfID)
+	if err != nil {
+		return nil, err
+	}
+	api := state.api
+	guildID := request.Params.GuildID
+	roleID := request.Params.RoleID
+
+	if err := api.DeleteRole(requestContext(request.Origin), convert.SplitGuildCompositeID(guildID), dto.RoleID(roleID)); err != nil {
+		return nil, err
+	}
+	return map[string]any{}, nil
 }
 
 func requestContext(request *http.Request) context.Context {
