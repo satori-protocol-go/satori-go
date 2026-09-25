@@ -14,10 +14,10 @@ func (c *Converter) makeGroupRobotEvent(
 	data map[string]any,
 	eventType satorievent.EventType,
 ) *satorievent.Event {
-	groupEvent := &dto.GroupAddBotEvent{}
+	groupEvent := &dto.GroupRobotEvent{}
 	_ = decodeInto(data, groupEvent)
 	guildID := firstNonEmpty(groupEvent.GroupOpenID, valueAsString(data["group_openid"]), valueAsString(data["guild_id"]))
-	operatorID := firstNonEmpty(groupEvent.OpMemberOpenID, valueAsString(data["op_member_openid"]))
+	operatorID := firstNonEmpty(groupEvent.OperatorOpenID, valueAsString(data["op_member_openid"]))
 	operatorValue := &user.User{Id: operatorID}
 	if operatorID == "" {
 		operatorValue = nil

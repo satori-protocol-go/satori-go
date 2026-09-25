@@ -3,205 +3,162 @@ package qq
 import (
 	"context"
 	"errors"
+	"net/http"
 	"sort"
 	"strconv"
-	"strings"
 	"time"
 
-	"github.com/WindowsSov8forUs/botgo-plus/openapi"
+	botgo "github.com/WindowsSov8forUs/botgo-plus"
+	"github.com/WindowsSov8forUs/botgo-plus/constant"
+	"github.com/WindowsSov8forUs/botgo-plus/media"
+	native "github.com/WindowsSov8forUs/botgo-plus/openapi/v1"
 	"github.com/WindowsSov8forUs/botgo-plus/token"
 	"github.com/satori-protocol-go/satori-go/pkg/satori/server"
+	"golang.org/x/oauth2"
 )
 
 type appState struct {
-	appID       string
-	secret      string
-	token       *token.Token
-	apiV1       openapi.OpenAPI
-	apiV2       openapi.OpenAPI
-	directToken string
-	selfID      string
+	appID          string
+	credentials    token.QQBotCredentials
+	token          oauth2.TokenSource
+	api            *native.Client
+	uploader       *media.Uploader
+	webhook        http.Handler
+	selfID         string
+	readyShards    map[uint32]bool // Protected by Adapter.mu.
+	expectedShards int
 }
 
 type appContextKey struct{}
+type nativeHeadersKey struct{}
 
 func withAppID(ctx context.Context, appID string) context.Context {
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	return context.WithValue(ctx, appContextKey{}, strings.TrimSpace(appID))
+	return context.WithValue(ctx, appContextKey{}, appID)
 }
-
 func appIDFromContext(ctx context.Context) string {
 	if ctx == nil {
 		return ""
 	}
 	value, _ := ctx.Value(appContextKey{}).(string)
-	return strings.TrimSpace(value)
+	return value
 }
 
-func buildAppStates(cfg Config, requestTimeout time.Duration) (map[string]*appState, string, error) {
-	timeout := defaultRequestTimeout
-	if requestTimeout > 0 {
-		timeout = requestTimeout
-	}
+// Native request headers are applied at the SDK's configurable HTTP boundary.
+// Authentication, retries and response classification remain owned by the SDK.
+type nativeTransport struct{ http.RoundTripper }
 
-	apps := make([]AppConfig, 0, len(cfg.Apps))
-	if len(cfg.Apps) > 0 {
-		apps = append(apps, cfg.Apps...)
-	} else {
-		apps = append(apps, AppConfig{
-			AppID:         cfg.AppID,
-			Secret:        cfg.Secret,
-			Token:         cfg.Token,
-			TokenURL:      cfg.TokenURL,
-			TokenInstance: cfg.TokenInstance,
-			APIV1:         cfg.APIV1,
-			APIV2:         cfg.APIV2,
-		})
+func (t nativeTransport) RoundTrip(request *http.Request) (*http.Response, error) {
+	if headers, ok := request.Context().Value(nativeHeadersKey{}).(http.Header); ok {
+		request = request.Clone(request.Context())
+		for key, values := range headers {
+			request.Header[key] = append([]string(nil), values...)
+		}
 	}
+	return t.RoundTripper.RoundTrip(request)
+}
 
-	result := map[string]*appState{}
-	order := make([]string, 0, len(apps))
+func buildAppStates(cfg Config, timeout time.Duration) (map[string]*appState, string, error) {
+	apps := append([]AppConfig(nil), cfg.Apps...)
+	if len(apps) == 0 {
+		apps = []AppConfig{{AppID: cfg.AppID, Secret: cfg.Secret, TokenURL: cfg.TokenURL, APIBaseURL: cfg.APIBaseURL, TokenSource: cfg.TokenSource}}
+	}
+	states := map[string]*appState{}
 	for _, app := range apps {
 		if app.AppID == 0 {
-			return nil, "", errors.New("qq adapter requires app_id")
+			return nil, "", errors.New("QQ AppID is required")
 		}
-		if strings.TrimSpace(app.Secret) == "" {
-			return nil, "", errors.New("qq adapter requires secret")
+		if app.Secret == "" && (app.TokenSource == nil || !cfg.UseWebSocket) {
+			return nil, "", errors.New("QQ Secret is required for token retrieval or Webhook signatures")
 		}
-
-		appID := strconv.FormatUint(app.AppID, 10)
-		if _, exists := result[appID]; exists {
-			return nil, "", errors.New("qq adapter app_id duplicated: " + appID)
+		id := strconv.FormatUint(app.AppID, 10)
+		if states[id] != nil {
+			return nil, "", errors.New("duplicate QQ AppID: " + id)
 		}
-
-		tokenInstance := app.TokenInstance
-		if tokenInstance == nil {
-			tokenInstance = token.BotToken(app.AppID, app.Secret, app.Token, token.TypeQQBot)
-			if strings.TrimSpace(app.TokenURL) != "" {
-				tokenInstance.SetTokenURL(strings.TrimSpace(app.TokenURL))
+		credentials := token.QQBotCredentials{AppID: id, AppSecret: app.Secret}
+		source := app.TokenSource
+		if source == nil {
+			options := []token.Option{token.WithRequestTimeout(timeout)}
+			if cfg.HTTPClient != nil {
+				options = append(options, token.WithHTTPClient(cfg.HTTPClient))
+			}
+			endpoint := app.TokenURL
+			if endpoint == "" {
+				endpoint = cfg.TokenURL
+			}
+			if endpoint != "" {
+				options = append(options, token.WithEndpoint(endpoint))
+			}
+			source = token.NewQQBotTokenSource(&credentials, options...)
+		}
+		base := app.APIBaseURL
+		if base == "" {
+			base = cfg.APIBaseURL
+		}
+		if base == "" {
+			base = constant.APIDomain
+			if cfg.Sandbox {
+				base = constant.SandBoxAPIDomain
 			}
 		}
-		if !cfg.SkipTokenInit {
-			_ = tokenInstance.InitToken(context.Background())
+		transport := http.DefaultTransport
+		if cfg.HTTPClient != nil && cfg.HTTPClient.Transport != nil {
+			transport = cfg.HTTPClient.Transport
 		}
-
-		apiV1 := app.APIV1
-		apiV2 := app.APIV2
-		if apiV1 == nil || apiV2 == nil {
-			createdV1, createdV2, err := createOpenAPIClients(tokenInstance, cfg.Sandbox, timeout)
-			if err != nil {
-				return nil, "", err
-			}
-			if apiV1 == nil {
-				apiV1 = createdV1
-			}
-			if apiV2 == nil {
-				apiV2 = createdV2
-			}
+		api, err := botgo.NewClient(id, source, native.WithBaseURL(base), native.WithRequestTimeout(timeout), native.WithHTTPTransport(nativeTransport{transport}))
+		if err != nil {
+			return nil, "", err
 		}
-
-		result[appID] = &appState{
-			appID:       appID,
-			secret:      app.Secret,
-			token:       tokenInstance,
-			apiV1:       apiV1,
-			apiV2:       apiV2,
-			directToken: strings.TrimSpace(app.Token),
+		uploadConfig := cfg.UploadConfig
+		if uploadConfig.HTTPClient == nil {
+			uploadConfig.HTTPClient = cfg.HTTPClient
 		}
-		order = append(order, appID)
+		uploader, err := media.NewUploader(api, uploadConfig)
+		if err != nil {
+			return nil, "", err
+		}
+		states[id] = &appState{appID: id, credentials: credentials, token: source, api: api, uploader: uploader}
 	}
-
-	sort.Strings(order)
-	if len(order) == 0 {
-		return nil, "", errors.New("qq adapter has no app config")
+	ids := make([]string, 0, len(states))
+	for id := range states {
+		ids = append(ids, id)
 	}
-	return result, order[0], nil
+	sort.Strings(ids)
+	return states, ids[0], nil
 }
 
 func (a *Adapter) sortedAppIDs() []string {
 	ids := make([]string, 0, len(a.appStates))
-	for appID := range a.appStates {
-		ids = append(ids, appID)
+	for id := range a.appStates {
+		ids = append(ids, id)
 	}
 	sort.Strings(ids)
 	return ids
 }
-
-func (a *Adapter) primaryState() *appState {
-	if state, ok := a.appStates[a.primaryAppID]; ok {
-		return state
-	}
-	for _, appID := range a.sortedAppIDs() {
-		if state, ok := a.appStates[appID]; ok {
-			return state
-		}
-	}
-	return nil
-}
-
-func (a *Adapter) stateByAppID(appID string) *appState {
-	if strings.TrimSpace(appID) == "" {
-		return a.primaryState()
-	}
-	state, ok := a.appStates[appID]
-	if !ok {
-		return nil
-	}
-	return state
-}
+func (a *Adapter) primaryState() *appState             { return a.appStates[a.primaryAppID] }
+func (a *Adapter) stateByAppID(appID string) *appState { return a.appStates[appID] }
 
 func (a *Adapter) resolveStateBySelfID(ctx context.Context, selfID string) (*appState, error) {
-	if len(a.appStates) == 0 {
-		return nil, server.NotFound("qq app state not found")
-	}
 	if err := a.ensureLogins(ctx); err != nil {
 		return nil, err
 	}
-	selfID = strings.TrimSpace(selfID)
 	if selfID == "" {
-		state := a.primaryState()
-		if state == nil {
-			return nil, server.NotFound("qq app state not found")
-		}
-		return state, nil
+		return a.primaryState(), nil
 	}
-
 	a.mu.RLock()
-	appID := a.selfToApp[selfID]
+	id := a.selfToApp[selfID]
 	a.mu.RUnlock()
-	if appID == "" {
-		return nil, server.NotFound("login not found")
+	if id == "" {
+		return nil, server.NotFound("QQ login not found")
 	}
-	state := a.stateByAppID(appID)
-	if state == nil {
-		return nil, server.NotFound("qq app state not found")
-	}
-	return state, nil
+	return a.appStates[id], nil
 }
 
-func (a *Adapter) stateFromContextOrEvent(ctx context.Context, eventType string) *appState {
-	if appID := appIDFromContext(ctx); appID != "" {
-		if state := a.stateByAppID(appID); state != nil {
-			return state
-		}
-	}
-	platform := platformByEventType(eventType)
-	if err := a.ensureLogins(ctx); err == nil {
-		a.mu.RLock()
-		for _, item := range a.logins {
-			if item == nil || item.User == nil || item.Platform != platform {
-				continue
-			}
-			if appID := a.selfToApp[item.User.Id]; appID != "" {
-				if state := a.stateByAppID(appID); state != nil {
-					a.mu.RUnlock()
-					return state
-				}
-			}
-		}
-		a.mu.RUnlock()
+func (a *Adapter) stateFromContextOrEvent(ctx context.Context, _ string) *appState {
+	if id := appIDFromContext(ctx); id != "" {
+		return a.appStates[id]
 	}
 	return a.primaryState()
 }

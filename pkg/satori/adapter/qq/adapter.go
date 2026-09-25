@@ -9,8 +9,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/WindowsSov8forUs/botgo-plus/openapi"
-	"github.com/WindowsSov8forUs/botgo-plus/token"
+	"github.com/WindowsSov8forUs/botgo-plus/dto"
+	"github.com/WindowsSov8forUs/botgo-plus/interaction/webhook"
 	"github.com/WindowsSov8forUs/botgo-plus/websocket"
 	"github.com/satori-protocol-go/satori-go/pkg/satori/adapter/qq/convert"
 	qqevent "github.com/satori-protocol-go/satori-go/pkg/satori/adapter/qq/event"
@@ -20,55 +20,47 @@ import (
 	"github.com/satori-protocol-go/satori-go/pkg/satori/server"
 )
 
-const (
-	qqAPIBaseURL        = "https://api.sgroup.qq.com"
-	qqSandboxAPIBaseURL = "https://sandbox.api.sgroup.qq.com"
-)
-
 type Adapter struct {
 	server.RouterMixin
 
 	cfg Config
 	srv *server.Server
 
-	path               string
-	appID              string
-	adapterName        string
-	skipSignatureCheck bool
-	httpClient         *http.Client
-	requestTimeout     time.Duration
-	logger             logging.Logger
+	path           string
+	appID          string
+	adapterName    string
+	httpClient     *http.Client
+	requestTimeout time.Duration
+	logger         logging.Logger
 
 	appStates    map[string]*appState
 	primaryAppID string
 
-	apiV1 openapi.OpenAPI
-	apiV2 openapi.OpenAPI
-	token *token.Token
-
 	qqFeatures      []string
 	qqGuildFeatures []string
 
-	eventCh       chan *event.Event
-	publisherOnce sync.Once
-	converter     *qqevent.Converter
-	wsEnabled     bool
-	wsGatewayURL  string
-	wsIntents     int64
-	wsShardID     uint32
-	wsShardCount  uint32
-	wsReconnect   time.Duration
+	eventContext context.Context
+	cancelEvents context.CancelFunc
+	eventCh      chan *event.Event
+	converter    *qqevent.Converter
+	wsEnabled    bool
+	wsGatewayURL string
+	wsIntents    int64
+	wsShardID    uint32
+	wsShardCount uint32
+	wsReconnect  time.Duration
 
 	wsConnMu  sync.RWMutex
 	wsClients map[string]websocket.WebSocket
 
-	auditMu      sync.Mutex
-	auditWaiters map[string][]chan string
+	auditMu sync.Mutex
+	audits  map[auditKey]*auditEntry
 
-	mu        sync.RWMutex
-	logins    []*login.Login
-	selfID    string
-	selfToApp map[string]string
+	loginInitMu sync.Mutex
+	mu          sync.RWMutex
+	logins      []*login.Login
+	nextLoginSN int64
+	selfToApp   map[string]string
 }
 
 func New(cfg Config) (*Adapter, error) {
@@ -89,7 +81,6 @@ func New(cfg Config) (*Adapter, error) {
 	if logger == nil {
 		logger = logging.NewStdLogger()
 	}
-	registerQQLogger(logger)
 	wsIntents := cfg.WSIntents
 	if wsIntents == 0 {
 		wsIntents = parseWSIntentNames(cfg.WSIntentNames, logger)
@@ -117,32 +108,31 @@ func New(cfg Config) (*Adapter, error) {
 		return nil, errors.New("qq adapter primary app state not found")
 	}
 
+	eventContext, cancelEvents := context.WithCancel(context.Background())
 	adapter := &Adapter{
-		cfg:                cfg,
-		path:               normalizeWebhookPath(cfg.Path),
-		appID:              primary.appID,
-		adapterName:        adapterName,
-		skipSignatureCheck: cfg.SkipSignatureCheck,
-		httpClient:         httpClient,
-		requestTimeout:     requestTimeout,
-		logger:             logger,
-		appStates:          appStates,
-		primaryAppID:       primaryAppID,
-		apiV1:              primary.apiV1,
-		apiV2:              primary.apiV2,
-		token:              primary.token,
-		qqFeatures:         valueOrDefaultFeatures(cfg.QQFeatures, defaultQQFeatures),
-		qqGuildFeatures:    valueOrDefaultFeatures(cfg.QQGuildFeatures, defaultQQGuildFeatures),
-		eventCh:            make(chan *event.Event, buffer),
-		wsEnabled:          cfg.UseWebSocket,
-		wsGatewayURL:       strings.TrimSpace(cfg.WSGatewayURL),
-		wsIntents:          wsIntents,
-		wsShardID:          cfg.WSShardID,
-		wsShardCount:       cfg.WSShardCount,
-		wsReconnect:        wsReconnect,
-		selfToApp:          map[string]string{},
-		wsClients:          map[string]websocket.WebSocket{},
-		auditWaiters:       map[string][]chan string{},
+		cfg:             cfg,
+		eventContext:    eventContext,
+		cancelEvents:    cancelEvents,
+		path:            normalizeWebhookPath(cfg.Path),
+		appID:           primary.appID,
+		adapterName:     adapterName,
+		httpClient:      httpClient,
+		requestTimeout:  requestTimeout,
+		logger:          logger,
+		appStates:       appStates,
+		primaryAppID:    primaryAppID,
+		qqFeatures:      valueOrDefaultFeatures(cfg.QQFeatures, defaultQQFeatures),
+		qqGuildFeatures: valueOrDefaultFeatures(cfg.QQGuildFeatures, defaultQQGuildFeatures),
+		eventCh:         make(chan *event.Event, buffer),
+		wsEnabled:       cfg.UseWebSocket,
+		wsGatewayURL:    strings.TrimSpace(cfg.WSGatewayURL),
+		wsIntents:       wsIntents,
+		wsShardID:       cfg.WSShardID,
+		wsShardCount:    cfg.WSShardCount,
+		wsReconnect:     wsReconnect,
+		selfToApp:       map[string]string{},
+		wsClients:       map[string]websocket.WebSocket{},
+		audits:          map[auditKey]*auditEntry{},
 	}
 	adapter.converter = qqevent.New(qqevent.Dependencies{
 		MessageFromDTO: convert.MessageFromDTO,
@@ -158,17 +148,26 @@ func New(cfg Config) (*Adapter, error) {
 		},
 	})
 
+	if !adapter.wsEnabled {
+		for _, state := range appStates {
+			handler, err := webhook.NewHandler(&state.credentials, webhook.WithEventHandler(func(ctx context.Context, payload *dto.WSPayload) error {
+				return adapter.acceptPayload(withAppID(ctx, state.appID), state, payload)
+			}))
+			if err != nil {
+				cancelEvents()
+				return nil, err
+			}
+			state.webhook = handler
+		}
+	}
 	adapter.registerRoutes()
 
 	return adapter, nil
 }
 
-func (a *Adapter) Publisher(ctx context.Context) <-chan *event.Event {
-	a.publisherOnce.Do(func() {
-		go a.bootstrap(ctx)
-	})
-	return a.eventCh
-}
+func (a *Adapter) Publisher(_ context.Context) <-chan *event.Event { return a.eventCh }
+
+func (a *Adapter) Prepare(ctx context.Context) error { return a.ensureLogins(ctx) }
 
 func (a *Adapter) GetLogins(ctx context.Context) ([]*login.Login, error) {
 	if err := a.ensureLogins(ctx); err != nil {
@@ -178,12 +177,11 @@ func (a *Adapter) GetLogins(ctx context.Context) ([]*login.Login, error) {
 	defer a.mu.RUnlock()
 
 	result := make([]*login.Login, 0, len(a.logins))
-	for index, item := range a.logins {
+	for _, item := range a.logins {
 		if item == nil {
 			continue
 		}
 		cloned := cloneLogin(item)
-		cloned.Sn = int64(index)
 		result = append(result, cloned)
 	}
 	return result, nil
@@ -213,7 +211,7 @@ func (a *Adapter) Ensure(platform string, selfID string) bool {
 	return false
 }
 
-func (a *Adapter) HandleProxied(_ context.Context, prefix string, rawURL string) (*server.Response, error) {
+func (a *Adapter) HandleProxied(ctx context.Context, prefix string, rawURL string) (*server.Response, error) {
 	_ = prefix
 	_ = rawURL
 	return nil, server.NotFound("proxy is not supported")
@@ -226,30 +224,8 @@ func (a *Adapter) EnsureServer(server *server.Server) {
 }
 
 var _ server.Adapter = (*Adapter)(nil)
+var _ server.Preparable = (*Adapter)(nil)
 var _ server.EventPublisher = (*Adapter)(nil)
 var _ server.RootRouteRegistrar = (*Adapter)(nil)
 var _ server.Blockable = (*Adapter)(nil)
 var _ server.Cleanable = (*Adapter)(nil)
-
-func createOpenAPIClients(
-	token *token.Token,
-	sandbox bool,
-	timeout time.Duration,
-) (openapi.OpenAPI, openapi.OpenAPI, error) {
-	v1Impl, ok := openapi.VersionMapping[openapi.APIv1]
-	if !ok || v1Impl == nil {
-		return nil, nil, errors.New("botgo-plus openapi v1 is not registered")
-	}
-	v2Impl, ok := openapi.VersionMapping[openapi.APIv2]
-	if !ok || v2Impl == nil {
-		return nil, nil, errors.New("botgo-plus openapi v2 is not registered")
-	}
-
-	v1 := v1Impl.Setup(token, sandbox)
-	v2 := v2Impl.Setup(token, sandbox)
-	if timeout > 0 {
-		v1 = v1.WithTimeout(timeout)
-		v2 = v2.WithTimeout(timeout)
-	}
-	return v1, v2, nil
-}
