@@ -2,13 +2,11 @@ package qq
 
 import (
 	"context"
-	"fmt"
+	"errors"
 	"strings"
-	"time"
 
 	"github.com/WindowsSov8forUs/botgo-plus/dto"
 	"github.com/satori-protocol-go/satori-go/pkg/satori/adapter/qq/convert"
-	"github.com/satori-protocol-go/satori-go/pkg/satori/logging"
 	"github.com/satori-protocol-go/satori-go/pkg/satori/model/event"
 	"github.com/satori-protocol-go/satori-go/pkg/satori/model/login"
 	"github.com/satori-protocol-go/satori-go/pkg/satori/model/user"
@@ -16,240 +14,123 @@ import (
 )
 
 func (a *Adapter) ensureLogins(ctx context.Context) error {
+	if err := a.eventContext.Err(); err != nil {
+		return err
+	}
 	a.mu.RLock()
-	if len(a.logins) > 0 {
-		a.mu.RUnlock()
+	ready := len(a.logins) > 0
+	a.mu.RUnlock()
+	if ready {
 		return nil
 	}
+	a.loginInitMu.Lock()
+	defer a.loginInitMu.Unlock()
+	a.mu.RLock()
+	ready = len(a.logins) > 0
 	a.mu.RUnlock()
-
+	if ready {
+		return nil
+	}
 	if ctx == nil {
 		ctx = context.Background()
 	}
-
-	nextLogins := []*login.Login{}
-	nextSelfToApp := map[string]string{}
-	fallbackSelfID := ""
-	var firstErr error
-	for _, appID := range a.sortedAppIDs() {
-		state := a.appStates[appID]
-		if state == nil || state.apiV1 == nil {
-			continue
-		}
-		me, err := state.apiV1.Me(withAppID(ctx, appID))
+	logins := make([]*login.Login, 0, 2*len(a.appStates))
+	owners := map[string]string{}
+	for _, id := range a.sortedAppIDs() {
+		state := a.appStates[id]
+		me, err := state.api.Me(withAppID(ctx, id))
 		if err != nil {
-			if firstErr == nil {
-				firstErr = err
-			}
-			continue
+			return qqActionError(err)
 		}
 		identity := convert.UserFromDTO(me)
-		if identity == nil || strings.TrimSpace(identity.Id) == "" {
-			continue
+		if identity == nil || identity.Id == "" {
+			return errors.New("QQ account response has no identity")
 		}
+		if owners[identity.Id] != "" {
+			return server.NewActionError(409, "QQ application account identities are ambiguous", nil)
+		}
+		owners[identity.Id] = id
 		identity.IsBot = true
-		selfID := strings.TrimSpace(identity.Id)
-		if fallbackSelfID == "" {
-			fallbackSelfID = selfID
+		status := login.LoginStatusOnline
+		if a.wsEnabled {
+			status = login.LoginStatusConnect
 		}
-		state.selfID = selfID
-		nextSelfToApp[selfID] = appID
-
-		nextLogins = append(nextLogins, &login.Login{
-			Platform: "qq",
-			User:     copyUser(identity),
-			Status:   login.LoginStatusOnline,
-			Adapter:  a.adapterName,
-			Features: copyStrings(a.qqFeatures),
-		})
-		nextLogins = append(nextLogins, &login.Login{
-			Platform: "qqguild",
-			User:     copyUser(identity),
-			Status:   login.LoginStatusOnline,
-			Adapter:  a.adapterName,
-			Features: copyStrings(a.qqGuildFeatures),
-		})
-	}
-
-	if len(nextLogins) == 0 {
-		if firstErr != nil {
-			return firstErr
+		for _, platform := range []string{"qq", "qqguild"} {
+			features := a.qqFeatures
+			if platform == "qqguild" {
+				features = a.qqGuildFeatures
+			}
+			logins = append(logins, &login.Login{Platform: platform, User: copyUser(identity), Status: status, Adapter: a.adapterName, Features: copyStrings(features)})
 		}
-		return server.NotFound("qq login not found")
 	}
-
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	if len(a.logins) > 0 {
-		return nil
+	for _, info := range logins {
+		info.Sn = a.nextLoginSN
+		a.nextLoginSN++
 	}
-	a.logins = nextLogins
-	a.selfToApp = nextSelfToApp
-	a.selfID = fallbackSelfID
+	a.logins = logins
+	a.selfToApp = owners
+	for selfID, id := range owners {
+		a.appStates[id].selfID = selfID
+	}
 	return nil
 }
 
 func (a *Adapter) loginForEventType(ctx context.Context, eventType string) *login.Login {
-	platform := platformByEventType(eventType)
-	state := a.stateFromContextOrEvent(ctx, eventType)
-	if err := a.ensureLogins(ctx); err != nil {
-		fallbackID := ""
-		if state != nil {
-			fallbackID = strings.TrimSpace(state.selfID)
-		}
-		if fallbackID == "" {
-			fallbackID = a.selfID
-		}
-		if fallbackID == "" {
-			if state != nil {
-				fallbackID = state.appID
-			} else {
-				fallbackID = a.appID
-			}
-		}
-		features := a.qqGuildFeatures
-		if platform == "qq" {
-			features = a.qqFeatures
-		}
-		return &login.Login{
-			Platform: platform,
-			User: &user.User{
-				Id:    fallbackID,
-				IsBot: true,
-			},
-			Status:   login.LoginStatusOnline,
-			Adapter:  a.adapterName,
-			Features: copyStrings(features),
-		}
-	}
-
-	if state != nil {
-		if loginValue := a.findLoginInState(platform, state.appID); loginValue != nil {
-			return loginValue
-		}
-	}
-	if loginValue := a.findLoginInState(platform, a.primaryAppID); loginValue != nil {
-		return loginValue
-	}
-	return nil
+	return a.loginForPlatform(ctx, platformByEventType(eventType))
 }
 
 func (a *Adapter) loginForPlatform(ctx context.Context, platform string) *login.Login {
-	if strings.TrimSpace(platform) == "" {
+	if platform == "" {
 		return nil
 	}
 	state := a.stateFromContextOrEvent(ctx, "")
-	if err := a.ensureLogins(ctx); err == nil {
-		if state != nil {
-			if loginValue := a.findLoginInState(platform, state.appID); loginValue != nil {
-				return loginValue
-			}
-		}
-		if loginValue := a.findLoginInState(platform, a.primaryAppID); loginValue != nil {
-			return loginValue
-		}
-	}
-
-	features := a.qqGuildFeatures
-	if platform == "qq" {
-		features = a.qqFeatures
-	}
-	return &login.Login{
-		Platform: platform,
-		User: &user.User{
-			Id:    firstNonEmpty(a.selfID, stateAppID(state), a.appID),
-			IsBot: true,
-		},
-		Status:   login.LoginStatusOnline,
-		Adapter:  a.adapterName,
-		Features: copyStrings(features),
-	}
-}
-
-func stateAppID(state *appState) string {
-	if state == nil {
-		return ""
-	}
-	return state.appID
-}
-
-func (a *Adapter) findLoginInState(platform string, appID string) *login.Login {
-	appID = strings.TrimSpace(appID)
-	if appID == "" {
+	if state == nil || a.ensureLogins(ctx) != nil {
 		return nil
 	}
-	a.mu.RLock()
-	defer a.mu.RUnlock()
-	for _, item := range a.logins {
-		if item == nil || item.User == nil || item.Platform != platform {
-			continue
-		}
-		if a.selfToApp[item.User.Id] != appID {
-			continue
-		}
-		return cloneLogin(item)
-	}
-	return nil
+	return a.findLoginInState(platform, state.appID)
 }
 
-func (a *Adapter) findLogin(platform string, selfID string) *login.Login {
+func (a *Adapter) findLoginInState(platform, appID string) *login.Login {
 	a.mu.RLock()
 	defer a.mu.RUnlock()
 	for _, item := range a.logins {
-		if item == nil || item.User == nil {
-			continue
-		}
-		if item.Platform == platform && item.User.Id == selfID {
+		if item != nil && item.User != nil && item.Platform == platform && a.selfToApp[item.User.Id] == appID {
 			return cloneLogin(item)
 		}
 	}
 	return nil
 }
 
-func (a *Adapter) bootstrap(ctx context.Context) {
-	if err := a.ensureLogins(ctx); err != nil {
-		a.log(ctx, logging.LevelError, fmt.Sprintf("bootstrap login failed error=%v", err))
-		return
-	}
-	a.log(ctx, logging.LevelInfo, "connected to QQ platform")
-	logins, err := a.GetLogins(ctx)
-	if err != nil {
-		return
-	}
-	welcomed := map[string]struct{}{}
-	for _, item := range logins {
-		if item == nil || item.User == nil {
-			continue
+func (a *Adapter) findLogin(platform, selfID string) *login.Login {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	for _, item := range a.logins {
+		if item != nil && item.User != nil && item.Platform == platform && item.User.Id == selfID {
+			return cloneLogin(item)
 		}
-		name := strings.TrimSpace(item.User.Name)
-		if name == "" {
-			continue
-		}
-		if _, exists := welcomed[name]; exists {
-			continue
-		}
-		welcomed[name] = struct{}{}
-		a.log(ctx, logging.LevelInfo, fmt.Sprintf("welcome %s", name))
 	}
-	for _, item := range logins {
-		if item == nil {
-			continue
-		}
-		a.pushEvent(&event.Event{
-			Type:      event.EventTypeLoginAdded,
-			Timestamp: time.Now().UnixMilli(),
-			Login:     item,
-		})
-	}
+	return nil
 }
 
-func (a *Adapter) pushEvent(evt *event.Event) {
+func (a *Adapter) pushEvent(ctx context.Context, evt *event.Event) error {
 	if evt == nil {
-		return
+		return nil
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if err := a.eventContext.Err(); err != nil {
+		return err
 	}
 	select {
 	case a.eventCh <- evt:
-	default:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-a.eventContext.Done():
+		return a.eventContext.Err()
 	}
 }
 
@@ -262,20 +143,14 @@ func firstNonEmpty(items ...string) string {
 	return ""
 }
 
-func copyStrings(items []string) []string {
-	if len(items) == 0 {
-		return nil
-	}
-	result := make([]string, len(items))
-	copy(result, items)
-	return result
-}
+func copyStrings(items []string) []string { return append([]string(nil), items...) }
 
-func valueOrDefaultFeatures(values []string, defaults []string) []string {
-	if len(values) == 0 {
+func valueOrDefaultFeatures(values, defaults []string) []string {
+	if values == nil {
 		return copyStrings(defaults)
 	}
-	return copyStrings(values)
+	// Explicit declarations may include platform extensions, not just API names.
+	return append([]string{}, values...)
 }
 
 func copyUser(item *user.User) *user.User {
@@ -290,26 +165,19 @@ func cloneLogin(item *login.Login) *login.Login {
 	if item == nil {
 		return nil
 	}
-	cloned := *item
-	cloned.User = copyUser(item.User)
-	cloned.Features = copyStrings(item.Features)
-	return &cloned
+	return item.Clone()
 }
 
 func platformByEventType(eventType string) string {
 	switch eventType {
-	case string(dto.EventGroupAtMessageCreate),
-		string(dto.EventGroupAddRobot),
-		string(dto.EventGroupDelRobot),
-		string(dto.EventGroupMsgReject),
-		string(dto.EventGroupMsgReceive),
-		string(dto.EventC2CMessageCreate),
-		string(dto.EventFriendAdd),
-		string(dto.EventFriendDel),
-		string(dto.EventC2CMsgReceive),
-		string(dto.EventC2CMsgReject):
+	case string(dto.EventGroupMessageCreate), string(dto.EventGroupAtMessageCreate), string(dto.EventGroupMemberAdd), string(dto.EventGroupMemberRemove), string(dto.EventGroupJoinRequest), string(dto.EventGroupAddRobot), string(dto.EventGroupDelRobot),
+		string(dto.EventGroupMsgReject), string(dto.EventGroupMsgReceive), string(dto.EventC2CMessageCreate),
+		string(dto.EventC2CFriendAdd), string(dto.EventC2CFriendDel), "C2C_MSG_RECEIVE", "C2C_MSG_REJECT":
 		return "qq"
 	default:
-		return "qqguild"
+		if dto.EventToIntent(dto.EventType(eventType)) != 0 {
+			return "qqguild"
+		}
+		return ""
 	}
 }

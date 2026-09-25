@@ -1,19 +1,22 @@
 package qq
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"net/http"
 	"net/url"
+	"sort"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/WindowsSov8forUs/botgo-plus/dto"
 	"github.com/WindowsSov8forUs/botgo-plus/errs"
 	"github.com/satori-protocol-go/satori-go/pkg/satori/adapter/qq/convert"
+	"github.com/satori-protocol-go/satori-go/pkg/satori/logging"
 	"github.com/satori-protocol-go/satori-go/pkg/satori/model"
 	"github.com/satori-protocol-go/satori-go/pkg/satori/model/channel"
 	"github.com/satori-protocol-go/satori-go/pkg/satori/model/guild"
@@ -33,7 +36,7 @@ func (a *Adapter) handleChannelGet(request *server.Request[server.ChannelParam])
 	if err != nil {
 		return nil, err
 	}
-	api := state.apiV1
+	api := state.api
 	channelID := request.Params.ChannelID
 
 	fetched, err := api.Channel(requestContext(request.Origin), convert.SplitChannelCompositeID(channelID))
@@ -54,7 +57,7 @@ func (a *Adapter) handleChannelList(request *server.Request[server.ChannelListPa
 	if err != nil {
 		return nil, err
 	}
-	api := state.apiV1
+	api := state.api
 	guildID := request.Params.GuildID
 
 	channelsValue, err := api.Channels(requestContext(request.Origin), convert.SplitGuildCompositeID(guildID))
@@ -76,7 +79,7 @@ func (a *Adapter) handleChannelCreate(request *server.Request[server.ChannelCrea
 	if err != nil {
 		return nil, err
 	}
-	api := state.apiV1
+	api := state.api
 	guildID := request.Params.GuildID
 
 	created, err := api.PostChannel(
@@ -101,7 +104,7 @@ func (a *Adapter) handleChannelUpdate(request *server.Request[server.ChannelUpda
 	if err != nil {
 		return nil, err
 	}
-	api := state.apiV1
+	api := state.api
 	channelID := request.Params.ChannelID
 
 	updated, err := api.PatchChannel(
@@ -126,7 +129,7 @@ func (a *Adapter) handleChannelDelete(request *server.Request[server.ChannelPara
 	if err != nil {
 		return nil, err
 	}
-	api := state.apiV1
+	api := state.api
 	channelID := request.Params.ChannelID
 
 	if err := api.DeleteChannel(requestContext(request.Origin), convert.SplitChannelCompositeID(channelID)); err != nil {
@@ -140,6 +143,17 @@ func (a *Adapter) handleChannelMute(_ *server.Request[server.ChannelMuteParam]) 
 }
 
 func (a *Adapter) handleGuildGet(request *server.Request[server.GuildGetParam]) (any, error) {
+	if request.Platform == "qq" {
+		state, err := a.resolveRequestState(request.Origin, request.SelfID)
+		if err != nil {
+			return nil, err
+		}
+		info, _, err := state.api.GetQQGroupInfo(requestContext(request.Origin), request.Params.GuildID)
+		if err != nil {
+			return nil, err
+		}
+		return &guild.Guild{Id: firstNonEmpty(info.GroupOpenID, request.Params.GuildID), Name: info.GroupName}, nil
+	}
 	if request.Platform != "qqguild" {
 		return nil, server.NotFound("guild.get is not supported in current platform")
 	}
@@ -147,7 +161,7 @@ func (a *Adapter) handleGuildGet(request *server.Request[server.GuildGetParam]) 
 	if err != nil {
 		return nil, err
 	}
-	api := state.apiV1
+	api := state.api
 	guildID := request.Params.GuildID
 
 	fetched, err := api.Guild(requestContext(request.Origin), convert.SplitGuildCompositeID(guildID))
@@ -168,7 +182,7 @@ func (a *Adapter) handleGuildList(request *server.Request[server.GuildListParam]
 	if err != nil {
 		return nil, err
 	}
-	api := state.apiV1
+	api := state.api
 
 	pager := &dto.GuildPager{Limit: "100"}
 	if nextValue, ok := request.Params.Next.Get(); ok {
@@ -195,172 +209,48 @@ func (a *Adapter) handleGuildList(request *server.Request[server.GuildListParam]
 }
 
 func (a *Adapter) handleInternalRoute(request *server.Request[server.InternalParam]) (any, error) {
-	path := strings.TrimPrefix(request.Action, "internal/")
-	params := request.Params
-	if params == nil {
-		params = map[string]any{}
-	}
-
-	resp, err := a.HandleInternal(server.Request[map[string]any]{
-		Origin:   request.Origin,
-		Action:   request.Action,
-		Params:   params,
-		Platform: request.Platform,
-		SelfID:   request.SelfID,
-	}, path)
-	if err != nil {
-		return nil, err
-	}
-	if resp == nil {
-		return map[string]any{}, nil
-	}
-	return resp, nil
+	return a.HandleInternal(server.Request[map[string]any]{Origin: request.Origin, Action: request.Action, Params: request.Params, Platform: request.Platform, SelfID: request.SelfID}, "_api/"+strings.TrimPrefix(request.Action, "internal/"))
 }
 
-func (a *Adapter) HandleInternal(
-	request server.Request[map[string]any],
-	path string,
-) (*server.Response, error) {
-	path = strings.TrimSpace(path)
-	if !strings.HasPrefix(path, "_api") {
-		return nil, server.NotFound("internal path is not supported")
+func (a *Adapter) HandleInternal(request server.Request[map[string]any], path string) (*server.Response, error) {
+	if !strings.HasPrefix(path, "_api/") {
+		return nil, server.NotFound("QQ internal resource is not available")
 	}
-
-	action := strings.TrimPrefix(path, "_api")
-	action = strings.TrimPrefix(action, "/")
+	action := strings.TrimPrefix(path, "_api/")
 	if action == "" {
-		return nil, server.BadRequest("internal api action is required")
+		return nil, server.BadRequest("native QQ API path is required")
 	}
-
-	method := http.MethodGet
-	ctx := context.Background()
-	if request.Origin != nil {
-		method = request.Origin.Method
-		ctx = request.Origin.Context()
-	}
-	if strings.TrimSpace(method) == "" {
-		method = http.MethodGet
-	}
-
-	params := request.Params
-	if params == nil {
-		params = map[string]any{}
-	}
-
 	state, err := a.resolveRequestState(request.Origin, request.SelfID)
 	if err != nil {
 		return nil, err
 	}
-
-	body, contentType, status, err := a.callRawAPI(ctx, state, method, action, params)
-	if err != nil {
+	ctx := requestContext(request.Origin)
+	method := http.MethodGet
+	var body any = request.Params
+	if request.Origin != nil {
+		method = request.Origin.Method
+		body = request.Origin.Body
+		headers := protocol.NativeRequestHeaders(request.Origin.Header)
+		headers.Del("X-Union-Appid")
+		headers.Del("X-Bot-Appid")
+		ctx = context.WithValue(ctx, nativeHeadersKey{}, headers)
+		if request.Origin.URL.RawQuery != "" {
+			separator := "?"
+			if strings.Contains(action, "?") {
+				separator = "&"
+			}
+			action += separator + request.Origin.URL.RawQuery
+		}
+	}
+	meta, err := state.api.Do(ctx, method, action, body, nil)
+	if meta == nil {
 		return nil, err
 	}
-	response := server.NewResponse(status, body)
-	if contentType != "" {
-		response.Header.Set("Content-Type", contentType)
-	}
+	// Native operations preserve platform status and bytes, including binary
+	// bodies which intentionally have no Satori JSON schema.
+	response := server.NewResponse(meta.StatusCode, meta.Raw)
+	response.Header = meta.Header.Clone()
 	return response, nil
-}
-
-func (a *Adapter) callRawAPI(
-	ctx context.Context,
-	state *appState,
-	method string,
-	action string,
-	params map[string]any,
-) ([]byte, string, int, error) {
-	if ctx == nil {
-		ctx = context.Background()
-	}
-	if state == nil {
-		return nil, "", 0, server.NotFound("qq app state not found")
-	}
-
-	method = strings.ToUpper(strings.TrimSpace(method))
-	if method == "" {
-		method = http.MethodGet
-	}
-
-	api := state.apiV1
-	action = strings.TrimSpace(action)
-	if strings.HasPrefix(strings.TrimLeft(action, "/"), "v2/") && state.apiV2 != nil {
-		api = state.apiV2
-	}
-	if api == nil {
-		api = state.apiV2
-	}
-	if api == nil {
-		return nil, "", 0, server.NotFound("qq openapi client is not configured")
-	}
-
-	targetURL := strings.TrimRight(a.apiBaseURL(), "/") + "/" + strings.TrimLeft(action, "/")
-	var payload any
-	if method == http.MethodGet || method == http.MethodDelete {
-		query := url.Values{}
-		for key, value := range params {
-			switch typed := value.(type) {
-			case nil:
-				continue
-			case []string:
-				for _, item := range typed {
-					query.Add(key, item)
-				}
-			case []any:
-				for _, item := range typed {
-					query.Add(key, fmt.Sprint(item))
-				}
-			default:
-				query.Set(key, fmt.Sprint(value))
-			}
-		}
-		if encoded := query.Encode(); encoded != "" {
-			targetURL += "?" + encoded
-		}
-	} else {
-		payload = params
-	}
-
-	data, err := api.Transport(ctx, method, targetURL, payload)
-	if err != nil {
-		status, message := mapTransportError(err)
-		return nil, "", 0, server.NewActionError(status, message, err)
-	}
-	return data, detectRawResponseContentType(data), http.StatusOK, nil
-}
-
-func (a *Adapter) apiBaseURL() string {
-	if a.cfg.Sandbox {
-		return qqSandboxAPIBaseURL
-	}
-	return qqAPIBaseURL
-}
-
-func mapTransportError(err error) (int, string) {
-	if err == nil {
-		return http.StatusOK, ""
-	}
-	typed := errs.Error(err)
-	status := typed.Code()
-	if status < 100 || status > 599 {
-		status = http.StatusInternalServerError
-	}
-	message := strings.TrimSpace(typed.Text())
-	if message == "" {
-		message = err.Error()
-	}
-	return status, message
-}
-
-func detectRawResponseContentType(data []byte) string {
-	content := bytes.TrimSpace(data)
-	if len(content) == 0 {
-		return ""
-	}
-	if json.Valid(content) {
-		return "application/json"
-	}
-	return http.DetectContentType(content)
 }
 
 func (a *Adapter) handleLoginGet(request *server.Request[server.LoginGetParam]) (any, error) {
@@ -375,6 +265,17 @@ func (a *Adapter) handleLoginGet(request *server.Request[server.LoginGetParam]) 
 }
 
 func (a *Adapter) handleGuildMemberGet(request *server.Request[server.GuildMemberGetParam]) (any, error) {
+	if request.Platform == "qq" {
+		state, err := a.resolveRequestState(request.Origin, request.SelfID)
+		if err != nil {
+			return nil, err
+		}
+		member, _, err := state.api.GetQQGroupMember(requestContext(request.Origin), request.Params.GuildID, request.Params.UserID)
+		if err != nil {
+			return nil, err
+		}
+		return convert.GroupMemberFromNative(member)
+	}
 	if request.Platform != "qqguild" {
 		return nil, server.NotFound("guild.member.get is not supported in current platform")
 	}
@@ -382,7 +283,7 @@ func (a *Adapter) handleGuildMemberGet(request *server.Request[server.GuildMembe
 	if err != nil {
 		return nil, err
 	}
-	api := state.apiV1
+	api := state.api
 	guildID := request.Params.GuildID
 	userID := request.Params.UserID
 
@@ -397,6 +298,25 @@ func (a *Adapter) handleGuildMemberGet(request *server.Request[server.GuildMembe
 }
 
 func (a *Adapter) handleGuildMemberList(request *server.Request[server.GuildListByGuildParam]) (any, error) {
+	if request.Platform == "qq" {
+		state, err := a.resolveRequestState(request.Origin, request.SelfID)
+		if err != nil {
+			return nil, err
+		}
+		page, _, err := state.api.GetQQGroupMembers(requestContext(request.Origin), request.Params.GuildID, request.Params.Next.ValueOr(""))
+		if err != nil {
+			return nil, err
+		}
+		values := make([]*guildmember.GuildMember, 0, len(page.Members))
+		for _, member := range page.Members {
+			value, err := convert.GroupMemberFromNative(&member)
+			if err != nil {
+				return nil, err
+			}
+			values = append(values, value)
+		}
+		return &model.Paginated[*guildmember.GuildMember]{Data: values, Next: page.NextCursor}, nil
+	}
 	if request.Platform != "qqguild" {
 		return nil, server.NotFound("guild.member.list is not supported in current platform")
 	}
@@ -404,7 +324,7 @@ func (a *Adapter) handleGuildMemberList(request *server.Request[server.GuildList
 	if err != nil {
 		return nil, err
 	}
-	api := state.apiV1
+	api := state.api
 	guildID := request.Params.GuildID
 
 	pager := &dto.GuildMembersPager{After: "0", Limit: "400"}
@@ -431,6 +351,22 @@ func (a *Adapter) handleGuildMemberList(request *server.Request[server.GuildList
 }
 
 func (a *Adapter) handleGuildMemberKick(request *server.Request[server.GuildMemberKickParam]) (any, error) {
+	if request.Platform == "qq" {
+		state, err := a.resolveRequestState(request.Origin, request.SelfID)
+		if err != nil {
+			return nil, err
+		}
+		result, meta, err := state.api.RemoveQQGroupMembers(requestContext(request.Origin), request.Params.GuildID, &dto.QQGroupRemoveRequest{MemberOpenIDs: []string{request.Params.UserID}, AddToMemberBlacklist: request.Params.Permanent.ValueOr(false)})
+		if err != nil {
+			return nil, err
+		}
+		if result.RemoveMembersResult != "success" || len(result.BlacklistFailedOpenIDs) > 0 {
+			response := server.NewResponse(502, meta.Raw)
+			response.Header = meta.Header.Clone()
+			return response, nil
+		}
+		return nil, nil
+	}
 	if request.Platform != "qqguild" {
 		return nil, server.NotFound("guild.member.kick is not supported in current platform")
 	}
@@ -438,7 +374,7 @@ func (a *Adapter) handleGuildMemberKick(request *server.Request[server.GuildMemb
 	if err != nil {
 		return nil, err
 	}
-	api := state.apiV1
+	api := state.api
 	guildID := request.Params.GuildID
 	userID := request.Params.UserID
 
@@ -449,6 +385,23 @@ func (a *Adapter) handleGuildMemberKick(request *server.Request[server.GuildMemb
 }
 
 func (a *Adapter) handleGuildMemberMute(request *server.Request[server.GuildMemberMuteParam]) (any, error) {
+	if request.Platform == "qq" {
+		duration := request.Params.Duration
+		if duration < 0 || duration > math.MaxInt64/int64(time.Millisecond) {
+			return nil, server.BadRequest("mute duration is outside the supported millisecond range")
+		}
+		state, err := a.resolveRequestState(request.Origin, request.SelfID)
+		if err != nil {
+			return nil, err
+		}
+		op := dto.QQGroupMuteOperation{Op: "del", MemberOpenID: request.Params.UserID}
+		if duration > 0 {
+			op.Op = "add"
+			op.MuteExpireAt = time.Now().UTC().Add(time.Duration(duration) * time.Millisecond).Format(time.RFC3339Nano)
+		}
+		_, err = state.api.SetQQGroupMemberMute(requestContext(request.Origin), request.Params.GuildID, &dto.QQGroupMuteRequest{Members: []dto.QQGroupMuteOperation{op}})
+		return nil, err
+	}
 	if request.Platform != "qqguild" {
 		return nil, server.NotFound("guild.member.mute is not supported in current platform")
 	}
@@ -456,7 +409,7 @@ func (a *Adapter) handleGuildMemberMute(request *server.Request[server.GuildMemb
 	if err != nil {
 		return nil, err
 	}
-	api := state.apiV1
+	api := state.api
 	guildID := request.Params.GuildID
 	userID := request.Params.UserID
 
@@ -490,7 +443,7 @@ func (a *Adapter) handleGuildMemberRoleChange(
 	if err != nil {
 		return nil, err
 	}
-	api := state.apiV1
+	api := state.api
 	guildID := request.Params.GuildID
 	userID := request.Params.UserID
 	roleID := request.Params.RoleID
@@ -509,34 +462,44 @@ func (a *Adapter) handleGuildMemberRoleChange(
 }
 
 func (a *Adapter) handleMessageCreate(request *server.Request[server.MessageCreateParam]) (any, error) {
-	channelID := request.Params.ChannelID
-
-	referrerRaw, _ := request.Params.Referrer.Get()
-	referrer, err := parseMessageReferrer(referrerRaw)
+	segments, passive, err := convert.ParseMessage(request.Params.Content, request.Platform)
+	if err != nil {
+		return nil, server.BadRequest(err.Error())
+	}
+	raw, _ := request.Params.Referrer.Get()
+	referrer, err := parseMessageReferrer(raw)
 	if err != nil {
 		return nil, err
 	}
-	if err := mergePassiveReferrer(&referrer, convert.ParseQQPassiveReferrer(request.Params.Content)); err != nil {
+	if err := mergePassiveReferrer(&referrer, passive); err != nil {
 		return nil, err
 	}
 	state, err := a.resolveRequestState(request.Origin, request.SelfID)
 	if err != nil {
 		return nil, err
 	}
-	sender := newMessageSender(state.apiV1, state.apiV2, convert.MessageFromDTO, a)
-	if sender == nil {
-		return []*message.Message{}, nil
+	if referrer.AppID != "" && referrer.AppID != state.appID {
+		return nil, server.BadRequest("reply context belongs to a different QQ application")
 	}
-
-	result, err := sender.Send(requestContext(request.Origin), messageCreateInput{
-		Platform:  request.Platform,
-		ChannelID: channelID,
-		Content:   request.Params.Content,
-		Referrer:  referrer,
-	})
+	result, err := newMessageSender(state, convert.MessageFromDTO, a).Send(requestContext(request.Origin), messageCreateInput{Platform: request.Platform, ChannelID: request.Params.ChannelID, Content: request.Params.Content, Segments: segments, Referrer: referrer})
 	if err != nil {
 		if errors.Is(err, errUnsupportedPlatform) {
 			return nil, server.NotFound("unsupported platform")
+		}
+		if len(result) > 0 {
+			cause := qqActionError(err)
+			status := http.StatusInternalServerError
+			var typed interface{ HTTPStatus() int }
+			if errors.As(cause, &typed) {
+				status = typed.HTTPStatus()
+			}
+			raw, marshalErr := json.Marshal(map[string]any{"error": cause.Error(), "messages": result})
+			if marshalErr != nil {
+				return nil, marshalErr
+			}
+			response := server.NewResponse(status, raw)
+			response.Header.Set("Content-Type", "application/json")
+			return response, nil
 		}
 		return nil, err
 	}
@@ -560,7 +523,7 @@ func (a *Adapter) handleMessageUpdate(request *server.Request[server.MessageUpda
 	if err != nil {
 		return nil, err
 	}
-	api := state.apiV1
+	api := state.api
 
 	payload := &dto.MessageToCreate{Content: request.Params.Content}
 	updated, err := api.PatchMessage(requestContext(request.Origin), channelID, messageID, payload)
@@ -586,15 +549,15 @@ func (a *Adapter) handleMessageDelete(request *server.Request[server.MessageOpPa
 	switch request.Platform {
 	case "qqguild":
 		if strings.Contains(channelID, "_") {
-			callErr = state.apiV1.RetractDMMessage(ctx, convert.SplitGuildCompositeID(channelID), messageID)
+			callErr = state.api.RetractDMMessage(ctx, convert.SplitGuildCompositeID(channelID), messageID)
 		} else {
-			callErr = state.apiV1.RetractMessage(ctx, channelID, messageID)
+			callErr = state.api.RetractMessage(ctx, channelID, messageID)
 		}
 	case "qq":
 		if userID, direct := convert.SplitPrivateChannelID(channelID); direct {
-			callErr = state.apiV2.RetractC2CMessage(ctx, userID, messageID)
+			callErr = state.api.RetractC2CMessage(ctx, userID, messageID)
 		} else {
-			callErr = state.apiV2.RetractGroupMessage(ctx, channelID, messageID)
+			callErr = state.api.RetractGroupMessage(ctx, channelID, messageID)
 		}
 	default:
 		return nil, server.NotFound("unsupported platform")
@@ -619,14 +582,26 @@ func (a *Adapter) handleMessageGet(request *server.Request[server.MessageOpParam
 	if err != nil {
 		return nil, err
 	}
-	fetched, err := state.apiV1.Message(requestContext(request.Origin), channelID, messageID)
+	// Use the existing native request boundary: the pinned SDK's Message helper
+	// targets the message-list URI, rather than the single-message URI.
+	path := "/channels/" + url.PathEscape(channelID) + "/messages/" + url.PathEscape(messageID)
+	var envelope map[string]json.RawMessage
+	meta, err := state.api.Do(requestContext(request.Origin), http.MethodGet, path, nil, &envelope)
 	if err != nil {
 		return nil, err
 	}
-	if fetched == nil {
-		return nil, server.NotFound("message not found")
+	raw := meta.Raw
+	if wrapped := envelope["message"]; len(wrapped) > 0 {
+		raw = wrapped
 	}
-	return convert.MessageFromDTO(fetched, request.Platform), nil
+	var fetched dto.Message
+	if err := json.Unmarshal(raw, &fetched); err != nil {
+		return nil, err
+	}
+	if fetched.ID == "" {
+		return nil, server.NewActionError(502, "QQ response has no message ID", nil)
+	}
+	return convert.MessageFromDTO(&fetched, request.Platform), nil
 }
 
 func (a *Adapter) handleMessageList(request *server.Request[server.MessageListParam]) (any, error) {
@@ -637,100 +612,153 @@ func (a *Adapter) handleMessageList(request *server.Request[server.MessageListPa
 	if strings.Contains(channelID, "_") {
 		return nil, server.NotFound("message.list is not supported for user-channel")
 	}
-
+	direction := request.Params.Direction.ValueOr(model.Direction("before"))
+	order := request.Params.Order.ValueOr(model.Order("asc"))
+	next := request.Params.Next.ValueOr("")
+	if next == "" && direction != "before" {
+		return nil, server.BadRequest("direction must be before when next is absent")
+	}
+	if direction == "around" {
+		return nil, server.NewActionError(501, "around pagination is not implemented for QQ channels", nil)
+	}
+	limit := request.Params.Limit.ValueOr(20)
+	if limit <= 0 || limit > 20 {
+		limit = 20
+	}
+	pager := &dto.MessagesPager{ID: next, Type: dto.MPTBefore, Limit: strconv.FormatInt(limit, 10)}
+	if direction == "after" {
+		pager.Type = dto.MPTAfter
+	}
 	state, err := a.resolveRequestState(request.Origin, request.SelfID)
 	if err != nil {
 		return nil, err
 	}
-	api := state.apiV1
-
-	pager := &dto.MessagesPager{Limit: "20"}
-	if limit, ok := request.Params.Limit.Get(); ok && limit > 0 {
-		pager.Limit = strconv.FormatInt(limit, 10)
-	}
-	if nextValue, ok := request.Params.Next.Get(); ok {
-		next := nextValue
-		if next != "" {
-			direction := ""
-			if directionValue, ok := request.Params.Direction.Get(); ok {
-				direction = strings.ToLower(string(directionValue))
-			}
-			switch direction {
-			case "after":
-				pager.Type = dto.MPTAfter
-			default:
-				pager.Type = dto.MPTBefore
-			}
-			pager.ID = next
-		}
-	}
-
-	items, err := api.Messages(requestContext(request.Origin), channelID, pager)
+	items, err := state.api.Messages(requestContext(request.Origin), channelID, pager)
 	if err != nil {
 		return nil, err
 	}
-	result := make([]*message.Message, 0, len(items))
+	values := make([]*dto.Message, 0, len(items))
 	for _, item := range items {
+		if item != nil {
+			values = append(values, item)
+		}
+	}
+	sort.SliceStable(values, func(i, j int) bool {
+		x, xerr := strconv.ParseUint(values[i].SeqInChannel, 10, 64)
+		y, yerr := strconv.ParseUint(values[j].SeqInChannel, 10, 64)
+		if xerr == nil && yerr == nil {
+			return x < y
+		}
+		a, _ := values[i].Timestamp.Time()
+		b, _ := values[j].Timestamp.Time()
+		return a.Before(b)
+	})
+	cursor := ""
+	if len(values) > 0 {
+		if direction == "before" {
+			cursor = values[0].ID
+		} else {
+			cursor = values[len(values)-1].ID
+		}
+	}
+	if order == "desc" {
+		for i, j := 0, len(values)-1; i < j; i, j = i+1, j-1 {
+			values[i], values[j] = values[j], values[i]
+		}
+	}
+	result := make([]*message.Message, 0, len(values))
+	for _, item := range values {
 		result = append(result, convert.MessageFromDTO(item, request.Platform))
 	}
-
-	response := &model.BidiPaginated[*message.Message]{Data: result}
-	if len(result) > 0 {
-		response.Prev = result[0].Id
-		response.Next = result[len(result)-1].Id
-	}
-	return response, nil
+	// QQ returns a message cursor, not a has_more flag. An empty subsequent page
+	// terminates traversal; short pages may still continue.
+	return &model.BidiPaginated[*message.Message]{Data: result, Prev: cursor, Next: cursor}, nil
 }
 
 func parseMessageReferrer(raw map[string]any) (messageReferrer, error) {
-	result := messageReferrer{}
-	if raw == nil {
-		return result, nil
-	}
-
-	if msgIDRaw, ok := raw["msg_id"]; ok {
-		result.MsgID = fmt.Sprint(msgIDRaw)
-	}
-	if directRaw, ok := raw["direct"]; ok {
-		if direct, ok := asBool(directRaw); ok {
-			result.Direct = direct
+	result := messageReferrer{Raw: raw}
+	for key, target := range map[string]*string{"msg_id": &result.MsgID, "event_id": &result.EventID, "app_id": &result.AppID} {
+		if value, present := raw[key]; present && value != nil {
+			text, ok := value.(string)
+			if !ok {
+				return result, server.BadRequest(key + " must be a string")
+			}
+			*target = text
 		}
 	}
-	if seqRaw, ok := raw["msg_seq"]; ok {
-		parsed, ok := asInt64(seqRaw)
-		if ok {
-			seq, err := int64ToInt(parsed, "msg_seq")
-			if err != nil {
-				return result, err
-			}
-			result.MsgSeq = seq
-			result.HasMsgSeq = true
+	if value, present := raw["direct"]; present {
+		direct, ok := asBool(value)
+		if !ok {
+			return result, server.BadRequest("direct must be boolean")
+		}
+		result.Direct = direct
+	}
+	if value, present := raw["msg_seq"]; present {
+		seq, err := replySequence(value)
+		if err != nil {
+			return result, err
+		}
+		result.MsgSeq = seq
+		result.HasMsgSeq = true
+	}
+	if value, present := raw["msg_scene"]; present && value != nil {
+		data, err := json.Marshal(value)
+		if err != nil {
+			return result, server.BadRequest("invalid msg_scene")
+		}
+		if err := json.Unmarshal(data, &result.Scene); err != nil {
+			return result, server.BadRequest("invalid msg_scene")
 		}
 	}
 	return result, nil
 }
 
-func mergePassiveReferrer(referrer *messageReferrer, passive convert.QQPassiveReferrer) error {
-	if referrer == nil {
-		return nil
+func replySequence(raw any) (int, error) {
+	if number, ok := raw.(json.Number); ok {
+		value, err := number.Int64()
+		if err != nil {
+			return 0, server.BadRequest("msg_seq must be an integer")
+		}
+		raw = value
 	}
-	if msgID := strings.TrimSpace(passive.MsgID); msgID != "" {
-		referrer.MsgID = msgID
+	if number, ok := raw.(uint64); ok && number > math.MaxUint32 {
+		return 0, server.BadRequest("msg_seq exceeds QQ sequence range")
 	}
-	if !passive.HasMsgSeq {
-		return nil
+	if number, ok := raw.(uint); ok && uint64(number) > math.MaxUint32 {
+		return 0, server.BadRequest("msg_seq exceeds QQ sequence range")
 	}
 
-	parsed, ok := asInt64(passive.MsgSeq)
-	if !ok {
-		return server.BadRequest("qq:passive seq must be an integer")
+	if number, ok := raw.(float64); ok && (math.IsNaN(number) || math.IsInf(number, 0) || math.Trunc(number) != number) {
+		return 0, server.BadRequest("msg_seq must be an integer")
 	}
-	seq, err := int64ToInt(parsed, "qq:passive seq")
-	if err != nil {
-		return err
+	if number, ok := raw.(float32); ok && math.Trunc(float64(number)) != float64(number) {
+		return 0, server.BadRequest("msg_seq must be an integer")
 	}
-	referrer.MsgSeq = seq
-	referrer.HasMsgSeq = true
+	value, ok := asInt64(raw)
+	if !ok || value < -1 || value > math.MaxUint32 {
+		return 0, server.BadRequest("msg_seq must be between -1 and 4294967295")
+	}
+	return int64ToInt(value, "msg_seq")
+}
+
+func mergePassiveReferrer(referrer *messageReferrer, passive convert.QQPassiveReferrer) error {
+	if passive.MsgID != "" {
+		if referrer.MsgID != "" && referrer.MsgID != passive.MsgID {
+			return server.BadRequest("qq:passive id conflicts with referrer.msg_id")
+		}
+		referrer.MsgID = passive.MsgID
+	}
+	if passive.HasMsgSeq {
+		value, err := replySequence(passive.MsgSeq)
+		if err != nil {
+			return err
+		}
+		if referrer.HasMsgSeq && referrer.MsgSeq != value {
+			return server.BadRequest("qq:passive seq conflicts with referrer.msg_seq")
+		}
+		referrer.MsgSeq = value
+		referrer.HasMsgSeq = true
+	}
 	return nil
 }
 
@@ -808,7 +836,7 @@ func (a *Adapter) handleReactionList(request *server.Request[server.ReactionList
 	if err != nil {
 		return nil, err
 	}
-	api := state.apiV1
+	api := state.api
 	channelID := request.Params.ChannelID
 	messageID := request.Params.MessageID
 	emojiRaw := request.Params.EmojiID
@@ -850,7 +878,7 @@ func (a *Adapter) handleReactionCreate(request *server.Request[server.ReactionCr
 	if err != nil {
 		return nil, err
 	}
-	api := state.apiV1
+	api := state.api
 	channelID := request.Params.ChannelID
 	messageID := request.Params.MessageID
 	emojiRaw := request.Params.EmojiID
@@ -874,7 +902,7 @@ func (a *Adapter) handleReactionDelete(request *server.Request[server.ReactionDe
 	if err != nil {
 		return nil, err
 	}
-	api := state.apiV1
+	api := state.api
 	channelID := request.Params.ChannelID
 	messageID := request.Params.MessageID
 	emojiRaw := request.Params.EmojiID
@@ -940,10 +968,74 @@ func (a *Adapter) registerRoutes() {
 	a.RouterMixin.Route(protocol.ApiFriendApprove, unsupportedRoute("friend.approve"))
 
 	a.RouterMixin.Route(protocol.ParseApi("internal/*"), server.Wrapper(a.handleInternalRoute))
+	for action, handle := range a.Routes() {
+		a.RouterMixin.Route(protocol.ParseApi(action), func(request *server.Request[any]) (any, error) {
+			started := time.Now()
+			result, err := handle(request)
+			err = qqActionError(err)
+			status := 200
+			var coded interface{ HTTPStatus() int }
+			if errors.As(err, &coded) {
+				status = coded.HTTPStatus()
+			} else if err != nil {
+				status = 500
+			}
+			if response, ok := result.(*server.Response); ok {
+				status = response.StatusCode
+			}
+			level := logging.LevelDebug
+			if status >= 400 {
+				level = logging.LevelWarn
+			}
+			if status >= 500 {
+				level = logging.LevelError
+			}
+			code, trace := 0, ""
+			var apiErr *errs.APIError
+			if errors.As(err, &apiErr) {
+				code, trace = apiErr.ErrorCode, apiErr.TraceID
+			}
+			label := request.Action
+			if strings.HasPrefix(label, protocol.InternalApiPrefix) {
+				label = "internal"
+			}
+			a.log(requestContext(request.Origin), level, fmt.Sprintf("QQ API action=%q platform=%q self_id=%q status=%d code=%d trace=%q elapsed_ms=%d error_type=%T", label, request.Platform, request.SelfID, status, code, trace, time.Since(started).Milliseconds(), err))
+			return result, err
+		})
+	}
+}
+
+func qqActionError(err error) error {
+	if err == nil {
+		return nil
+	}
+	var alreadyMapped interface{ HTTPStatus() int }
+	if errors.As(err, &alreadyMapped) {
+		return err
+	}
+	var apiError *errs.APIError
+	if !errors.As(err, &apiError) {
+		return err
+	}
+	status := apiError.StatusCode
+	if status < 400 || status > 599 {
+		status = http.StatusBadGateway
+	}
+	if apiError.ErrorCode == 11253 {
+		status = http.StatusForbidden
+	}
+	var pending *errs.PendingError
+	if errors.As(err, &pending) {
+		status = http.StatusServiceUnavailable
+	}
+	return server.NewActionError(status, err.Error(), err)
 }
 
 func unsupportedRoute(action string) server.RouteCall[any, any] {
-	return func(_ *server.Request[any]) (any, error) {
+	return func(request *server.Request[any]) (any, error) {
+		if request.Platform == "qq" && (action == "guild.approve" || action == "guild.member.approve") {
+			return nil, server.NewActionError(501, action+" is not implemented by this adapter", nil)
+		}
 		return nil, server.NotFound(action + " is not supported")
 	}
 }
@@ -956,7 +1048,7 @@ func (a *Adapter) handleGuildRoleList(request *server.Request[server.GuildListBy
 	if err != nil {
 		return nil, err
 	}
-	api := state.apiV1
+	api := state.api
 	guildID := request.Params.GuildID
 
 	roles, err := api.Roles(requestContext(request.Origin), convert.SplitGuildCompositeID(guildID))
@@ -977,7 +1069,7 @@ func (a *Adapter) handleGuildRoleCreate(request *server.Request[server.GuildRole
 	if err != nil {
 		return nil, err
 	}
-	api := state.apiV1
+	api := state.api
 	guildID := request.Params.GuildID
 
 	updated, err := api.PostRole(
@@ -1006,7 +1098,7 @@ func (a *Adapter) handleGuildRoleUpdate(request *server.Request[server.GuildRole
 	if err != nil {
 		return nil, err
 	}
-	api := state.apiV1
+	api := state.api
 	guildID := request.Params.GuildID
 	roleID := request.Params.RoleID
 
@@ -1037,7 +1129,7 @@ func (a *Adapter) handleGuildRoleDelete(request *server.Request[server.GuildRole
 	if err != nil {
 		return nil, err
 	}
-	api := state.apiV1
+	api := state.api
 	guildID := request.Params.GuildID
 	roleID := request.Params.RoleID
 
@@ -1081,7 +1173,7 @@ func (a *Adapter) handleUserChannelCreate(request *server.Request[server.UserCha
 			return nil, server.BadRequest("guild_id is required")
 		}
 		guildID := guildIDRaw
-		dm, callErr := state.apiV1.CreateDirectMessage(requestContext(request.Origin), &dto.DirectMessageToCreate{
+		dm, callErr := state.api.CreateDirectMessage(requestContext(request.Origin), &dto.DirectMessageToCreate{
 			RecipientID:   userID,
 			SourceGuildID: guildID,
 		})
@@ -1108,7 +1200,7 @@ func (a *Adapter) handleUserGet(request *server.Request[server.UserGetParam]) (a
 	if err != nil {
 		return nil, err
 	}
-	api := state.apiV1
+	api := state.api
 
 	guildID, userID := convert.SplitGuildUserCompositeID(userID)
 	if guildID == "" {

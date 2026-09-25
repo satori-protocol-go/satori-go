@@ -12,7 +12,9 @@ type qqLogger struct {
 	logger logging.Logger
 }
 
-func registerQQLogger(logger logging.Logger) {
+// RegisterSDKLogger configures botgo-plus process-wide logging. Call once during
+// application startup, before any SDK work. Adapter loggers remain instance-local.
+func RegisterSDKLogger(logger logging.Logger) {
 	if logger == nil {
 		logger = logging.NopLogger{}
 	}
@@ -24,15 +26,15 @@ func (l *qqLogger) Debug(v ...interface{}) {
 }
 
 func (l *qqLogger) Info(v ...interface{}) {
-	l.log(context.Background(), logging.LevelDebug, v...)
+	l.log(context.Background(), logging.LevelInfo, v...)
 }
 
 func (l *qqLogger) Warn(v ...interface{}) {
-	l.log(context.Background(), logging.LevelDebug, v...)
+	l.log(context.Background(), logging.LevelWarn, v...)
 }
 
 func (l *qqLogger) Error(v ...interface{}) {
-	l.log(context.Background(), logging.LevelDebug, v...)
+	l.log(context.Background(), logging.LevelError, v...)
 }
 
 func (l *qqLogger) Debugf(format string, v ...interface{}) {
@@ -40,18 +42,21 @@ func (l *qqLogger) Debugf(format string, v ...interface{}) {
 }
 
 func (l *qqLogger) Infof(format string, v ...interface{}) {
-	l.log(context.Background(), logging.LevelDebug, fmt.Sprintf(format, v...))
+	l.log(context.Background(), logging.LevelInfo, fmt.Sprintf(format, v...))
 }
 
 func (l *qqLogger) Warnf(format string, v ...interface{}) {
-	l.log(context.Background(), logging.LevelDebug, fmt.Sprintf(format, v...))
+	l.log(context.Background(), logging.LevelWarn, fmt.Sprintf(format, v...))
 }
 
 func (l *qqLogger) Errorf(format string, v ...interface{}) {
-	l.log(context.Background(), logging.LevelDebug, fmt.Sprintf(format, v...))
+	l.log(context.Background(), logging.LevelError, fmt.Sprintf(format, v...))
 }
 
 func (l *qqLogger) Sync() error {
+	if target, ok := l.logger.(interface{ Sync() error }); ok {
+		return target.Sync()
+	}
 	return nil
 }
 
@@ -67,7 +72,6 @@ func (a *Adapter) RegisterLogger(logger logging.Logger) {
 	if logger == nil {
 		logger = logging.NopLogger{}
 	}
-	registerQQLogger(logger)
 	a.mu.Lock()
 	a.logger = logger
 	a.mu.Unlock()
