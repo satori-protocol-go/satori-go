@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/satori-protocol-go/satori-go/pkg/satori/model/login"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -259,6 +260,58 @@ func TestQQNativeResponses(t *testing.T) {
 	if rec.Code != 200 || rec.Body.String() != "binary-content" || rec.Header().Get("Content-Type") != "application/octet-stream" {
 		t.Fatalf("proxied native response=%d %q", rec.Code, rec.Body.String())
 	}
+}
+
+func TestQQMultiAppOwnershipAndShardStatus(t *testing.T) {
+	f := newQQFixture(t, func(cfg *Config) {
+		cfg.Apps = []AppConfig{{AppID: 123, Secret: "fixture-secret"}, {AppID: 456, Secret: "fixture-secret"}}
+		cfg.UseWebSocket = true
+	})
+	ctx := context.Background()
+	if err := f.adapter.Prepare(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if state := f.adapter.stateFromContextOrEvent(ctx, ""); state != nil {
+		t.Fatalf("ambiguous event state=%+v", state)
+	}
+	if _, err := f.adapter.resolveStateBySelfID(ctx, ""); err == nil {
+		t.Fatal("empty identity selected an App")
+	}
+	state, err := f.adapter.resolveStateBySelfID(ctx, "bot-456")
+	if err != nil || state.appID != "456" {
+		t.Fatalf("owner=%+v error=%v", state, err)
+	}
+	primary := f.adapter.appStates["123"]
+	primary.expectedShards = 2
+	check := func(want123, want456 login.LoginStatus) {
+		t.Helper()
+		items, err := f.adapter.GetLogins(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, item := range items {
+			want := want123
+			if item.User.Id == "bot-456" {
+				want = want456
+			}
+			if item.Status != want {
+				t.Fatalf("login=%+v want status=%d", item, want)
+			}
+		}
+	}
+	check(login.LoginStatusConnect, login.LoginStatusConnect)
+	if err := f.adapter.updateShardStatus(ctx, primary, 0, true); err != nil {
+		t.Fatal(err)
+	}
+	check(login.LoginStatusReconnect, login.LoginStatusConnect)
+	if err := f.adapter.updateShardStatus(ctx, primary, 1, true); err != nil {
+		t.Fatal(err)
+	}
+	check(login.LoginStatusOnline, login.LoginStatusConnect)
+	if err := f.adapter.updateShardStatus(ctx, primary, 0, false); err != nil {
+		t.Fatal(err)
+	}
+	check(login.LoginStatusReconnect, login.LoginStatusConnect)
 }
 
 type capturedQQLog struct {

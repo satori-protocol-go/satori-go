@@ -326,7 +326,7 @@ func (a *Adapter) updateShardStatus(ctx context.Context, state *appState, shard 
 		delete(state.readyShards, shard)
 	}
 	status := login.LoginStatusReconnect
-	if len(state.readyShards) > 0 {
+	if len(state.readyShards) == state.expectedShards {
 		status = login.LoginStatusOnline
 	}
 	events := make([]*event.Event, 0, 2)

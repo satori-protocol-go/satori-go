@@ -144,9 +144,6 @@ func (a *Adapter) resolveStateBySelfID(ctx context.Context, selfID string) (*app
 	if err := a.ensureLogins(ctx); err != nil {
 		return nil, err
 	}
-	if selfID == "" {
-		return a.primaryState(), nil
-	}
 	a.mu.RLock()
 	id := a.selfToApp[selfID]
 	a.mu.RUnlock()
@@ -160,5 +157,8 @@ func (a *Adapter) stateFromContextOrEvent(ctx context.Context, _ string) *appSta
 	if id := appIDFromContext(ctx); id != "" {
 		return a.appStates[id]
 	}
-	return a.primaryState()
+	if len(a.appStates) == 1 {
+		return a.primaryState()
+	}
+	return nil
 }
