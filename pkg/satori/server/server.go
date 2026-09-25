@@ -2006,6 +2006,11 @@ func writeError(w http.ResponseWriter, err error) {
 		w.WriteHeader(status)
 		return
 	}
+	for key, values := range ErrorHeaders(err) {
+		for _, value := range values {
+			w.Header().Add(key, value)
+		}
+	}
 	http.Error(w, err.Error(), status)
 }
 

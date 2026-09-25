@@ -482,6 +482,14 @@ func (p *APIProtocol) MessageCreate(
 		"referrer":   referrer,
 	}, false, http.MethodPost)
 	if err != nil {
+		var partial interface {
+			PartialMessages() ([]*message.Message, error)
+		}
+		if errors.As(err, &partial) {
+			if sent, decodeErr := partial.PartialMessages(); decodeErr == nil {
+				return sent, err
+			}
+		}
 		return nil, err
 	}
 	var result []*message.Message
@@ -1109,12 +1117,15 @@ func (p *APIProtocol) doRequestWithClient(request *http.Request, client *http.Cl
 
 	payload, err := io.ReadAll(response.Body)
 	if err != nil {
-		return nil, err
+		if len(payload) > 64*1024 {
+			payload = payload[:64*1024]
+		}
+		return nil, &RequestError{StatusCode: response.StatusCode, Body: string(payload), Header: response.Header.Clone(), Operation: request.Method + " request", Cause: err}
 	}
 	if response.StatusCode >= 200 && response.StatusCode < 300 {
 		return payload, nil
 	}
-	return nil, errorFromStatusCode(response.StatusCode, payload)
+	return nil, errorFromStatusCode(response.StatusCode, payload, response.Header)
 }
 
 func (p *APIProtocol) resolveInternalRequestClient(options *InternalRequestOptions) (*http.Client, error) {

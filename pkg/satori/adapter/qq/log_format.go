@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/WindowsSov8forUs/botgo-plus/errs"
@@ -20,7 +21,10 @@ func describeActionLog(action, platform, selfID string, status, code int, trace 
 	reason := logging.ErrorText(cause)
 	var apiError *errs.APIError
 	if errors.As(cause, &apiError) && apiError.Message != "" {
-		reason = logging.SafeText(apiError.Message)
+		detail := logging.SafeText(apiError.Message)
+		if !strings.Contains(reason, detail) {
+			reason += " QQ response: " + detail
+		}
 	}
 	var body []byte
 	switch response := result.(type) {
@@ -35,7 +39,8 @@ func describeActionLog(action, platform, selfID string, status, code int, trace 
 		Error    string            `json:"error"`
 		Messages []json.RawMessage `json:"messages"`
 	}
-	if status >= 400 && json.Unmarshal(body, &partial) == nil && partial.Error != "" {
+	_ = json.Unmarshal(body, &partial)
+	if status >= 400 && partial.Error != "" && cause == nil {
 		reason = logging.ErrorText(errors.New(partial.Error))
 	}
 	text := fmt.Sprintf("%s ended with HTTP %d after %d ms.", identity, status, elapsed.Milliseconds())
