@@ -207,7 +207,7 @@ func TestServerHTTP(t *testing.T) {
 		t.Fatalf("webhook delete=%d", w.Code)
 	}
 	text := strings.Join(logs, "\n")
-	for _, entry := range []string{"warn Satori HTTP authorization failed", "debug Satori RPC action=", "error Satori RPC action="} {
+	for _, entry := range []string{"warn Rejected an HTTP request because Satori API authorization failed.", "debug Handled Satori request ", "error Satori request "} {
 		if !strings.Contains(text, entry) {
 			t.Fatalf("injected logs missing %q: %s", entry, text)
 		}

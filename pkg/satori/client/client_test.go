@@ -216,7 +216,7 @@ func TestClientHTTP(t *testing.T) {
 	mu.Lock()
 	text := strings.Join(entries, "\n")
 	mu.Unlock()
-	for _, entry := range []string{"info Satori login status", "debug Satori HTTP method=POST status=200", "warn Satori HTTP method=POST status=403"} {
+	for _, entry := range []string{"info Login for ", "debug The Satori HTTP POST request returned HTTP 200", "warn The Satori HTTP POST request returned HTTP 403"} {
 		if !strings.Contains(text, entry) {
 			t.Fatalf("injected logs missing %q: %s", entry, text)
 		}

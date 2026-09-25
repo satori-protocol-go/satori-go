@@ -81,9 +81,17 @@ func (a *Adapter) captureAuditResult(appID, eventType string, raw json.RawMessag
 	}
 	a.auditMu.Unlock()
 	if err != nil {
-		a.log(context.Background(), logging.LevelWarn, err.Error())
+		a.log(context.Background(), logging.LevelWarn, fmt.Sprintf("Cannot track QQ audit %s for app %s: %s", logging.SafeText(data.AuditID), logging.SafeText(appID), logging.ErrorText(err)))
 	}
-	a.log(context.Background(), logging.LevelInfo, fmt.Sprintf("QQ audit result app_id=%q audit_id=%q outcome=%q", appID, data.AuditID, eventType))
+	description := fmt.Sprintf("QQ approved message audit %s for app %s.", logging.SafeText(data.AuditID), logging.SafeText(appID))
+	if eventType == "MESSAGE_AUDIT_REJECT" {
+		reason := data.Reason
+		if reason == "" {
+			reason = "no rejection reason was provided"
+		}
+		description = fmt.Sprintf("QQ rejected message audit %s for app %s: %s", logging.SafeText(data.AuditID), logging.SafeText(appID), logging.SafeText(reason))
+	}
+	a.log(context.Background(), logging.LevelInfo, description)
 	// The original audit event is still published by the common event path.
 }
 

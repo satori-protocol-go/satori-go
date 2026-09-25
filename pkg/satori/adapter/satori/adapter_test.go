@@ -257,7 +257,7 @@ func TestSatoriBridge(t *testing.T) {
 	logMu.Lock()
 	output := strings.Join(logs, "\n")
 	logMu.Unlock()
-	if !strings.Contains(output, "Satori websocket ready") || !strings.Contains(output, "Satori HTTP method=") {
+	if !strings.Contains(output, "to the Satori server is authenticated and ready.") || !strings.Contains(output, "debug The Satori HTTP POST request returned HTTP 200") {
 		t.Fatalf("bridge logger=%s", output)
 	}
 	localCancel()

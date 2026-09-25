@@ -356,7 +356,7 @@ func (a *App) Run(ctx context.Context) error {
 		wg.Add(1)
 		go func(r clientnetwork.Runner) { defer wg.Done(); results <- r.Run(runCtx) }(runner)
 	}
-	a.log(runCtx, logging.LevelInfo, fmt.Sprintf("Satori client running networks=%d", len(networks)))
+	a.log(runCtx, logging.LevelInfo, fmt.Sprintf("Starting the Satori client with %d configured networks.", len(networks)))
 	var runErr error
 	remaining := len(networks)
 wait:
@@ -390,7 +390,11 @@ wait:
 	if runErr != nil {
 		level = logging.LevelError
 	}
-	a.log(ctx, level, fmt.Sprintf("Satori client stopped error_type=%T", runErr))
+	description := "Satori client stopped."
+	if runErr != nil {
+		description = "Satori client stopped with an error: " + logging.ErrorText(runErr)
+	}
+	a.log(ctx, level, description)
 	return runErr
 }
 
@@ -678,7 +682,7 @@ func (a *App) dispatchEvent(account *Account, evt *event.Event) error {
 }
 
 func (a *App) accountUpdate(account *Account, status login.LoginStatus) {
-	a.log(context.Background(), logging.LevelInfo, fmt.Sprintf("Satori login status platform=%q self_id=%q status=%d", account.Platform(), account.SelfID(), status))
+	a.log(context.Background(), logging.LevelInfo, fmt.Sprintf("Login for %s bot %s is now %s.", logging.SafeText(account.Platform()), logging.SafeText(account.SelfID()), logging.LoginStatusName(status)))
 	a.mu.RLock()
 	callbacks := append([]LifecycleCallback(nil), a.lifecycleCallbacks...)
 	a.mu.RUnlock()
@@ -706,7 +710,7 @@ func (a *App) accountUpdate(account *Account, status login.LoginStatus) {
 	close(errCh)
 
 	for err := range errCh {
-		a.log(context.Background(), logging.LevelError, fmt.Sprintf("lifecycle callback error error=%v", err))
+		a.log(context.Background(), logging.LevelError, fmt.Sprintf("A lifecycle callback failed for %s bot %s: %s", logging.SafeText(account.Platform()), logging.SafeText(account.SelfID()), logging.ErrorText(err)))
 	}
 }
 

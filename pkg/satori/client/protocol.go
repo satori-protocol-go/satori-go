@@ -1646,7 +1646,7 @@ func appendQueryValues(rawURL string, values url.Values) (string, error) {
 	return parsed.String(), nil
 }
 
-// exchange logs transport metadata, never URLs, authorization or payload bytes.
+// exchange describes the transport result without logging resource URLs, authorization or payloads.
 func (p *APIProtocol) exchange(request *http.Request, client *http.Client) (*http.Response, error) {
 	started := time.Now()
 	response, err := client.Do(request)
@@ -1661,6 +1661,12 @@ func (p *APIProtocol) exchange(request *http.Request, client *http.Client) (*htt
 	if err != nil || status >= 500 {
 		level = logging.LevelError
 	}
-	p.account.log(request.Context(), level, fmt.Sprintf("Satori HTTP method=%s status=%d elapsed_ms=%d error_type=%T", request.Method, status, time.Since(started).Milliseconds(), err))
+	description := fmt.Sprintf("The Satori HTTP %s request returned HTTP %d after %d ms.", request.Method, status, time.Since(started).Milliseconds())
+	if err != nil {
+		description = fmt.Sprintf("The Satori HTTP %s request failed after %d ms: %s", request.Method, time.Since(started).Milliseconds(), logging.ErrorText(err))
+	} else if response == nil {
+		description = fmt.Sprintf("The Satori HTTP %s request ended without a response after %d ms.", request.Method, time.Since(started).Milliseconds())
+	}
+	p.account.log(request.Context(), level, description)
 	return response, err
 }

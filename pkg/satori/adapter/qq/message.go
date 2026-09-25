@@ -332,7 +332,15 @@ func (s *messageSender) sendQQResource(ctx context.Context, targetID string, isD
 		return nil, err
 	}
 	fileType := int(convert.MapMessageResourceFileType(segment.Resource.Kind))
-	s.adapter.log(ctx, logging.LevelDebug, fmt.Sprintf("QQ media upload app_id=%q file_type=%d local_bytes=%d", s.state.appID, fileType, len(resource.Data)))
+	mediaName := map[int]string{1: "image", 2: "video", 3: "voice message", 4: "file"}[fileType]
+	if mediaName == "" {
+		mediaName = "file"
+	}
+	description := fmt.Sprintf("Uploading a %s from a remote URL to QQ for app %s.", mediaName, logging.SafeText(s.state.appID))
+	if resource.Data != nil {
+		description = fmt.Sprintf("Uploading a %s to QQ for app %s (%d bytes).", mediaName, logging.SafeText(s.state.appID), len(resource.Data))
+	}
+	s.adapter.log(ctx, logging.LevelDebug, description)
 	var uploaded *dto.MediaUploadResult
 	if resource.Data != nil {
 		data := resource.Data
@@ -352,10 +360,10 @@ func (s *messageSender) sendQQResource(ctx context.Context, targetID string, isD
 	if err != nil {
 		return nil, err
 	}
-	s.adapter.log(ctx, logging.LevelDebug, fmt.Sprintf("QQ media upload completed app_id=%q file_type=%d", s.state.appID, fileType))
 	if uploaded == nil || uploaded.FileInfo == "" {
 		return nil, errors.New("QQ upload response has no file_info")
 	}
+	s.adapter.log(ctx, logging.LevelDebug, fmt.Sprintf("Uploaded the %s to QQ for app %s.", mediaName, logging.SafeText(s.state.appID)))
 	payload := &dto.MessageToCreate{Content: " ", MsgType: dto.RichMediaMsg, MsgID: referrer.MsgID, EventID: referrer.EventID, MessageReference: replyReference(referrer, segment.QuoteID), MsgSeq: uint32(seq), Media: &dto.MediaInfo{FileInfo: uploaded.FileInfo}}
 	return s.callQQMessageAPI(ctx, targetID, isDirect, payload)
 }
@@ -383,7 +391,7 @@ func (s *messageSender) awaitAudit(ctx context.Context, err error, content strin
 	if !errors.As(err, &pending) || pending.AuditID == "" {
 		return nil, err
 	}
-	s.adapter.log(ctx, logging.LevelInfo, fmt.Sprintf("QQ audit pending app_id=%q audit_id=%q", s.state.appID, pending.AuditID))
+	s.adapter.log(ctx, logging.LevelInfo, fmt.Sprintf("QQ is reviewing the message for app %s (audit %s).", logging.SafeText(s.state.appID), logging.SafeText(pending.AuditID)))
 	result, waitErr := s.adapter.waitAuditResult(ctx, s.state.appID, pending.AuditID, defaultAuditWait)
 	if waitErr != nil {
 		status := 503

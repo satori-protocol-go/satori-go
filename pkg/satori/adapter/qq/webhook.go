@@ -23,7 +23,7 @@ func (a *Adapter) RegisterRootRoutes(router chi.Router) {
 	for _, path := range normalizeWebhookPaths(a.path) {
 		router.Handle(path, http.HandlerFunc(a.handleWebhookRequest))
 	}
-	a.log(context.Background(), logging.LevelInfo, "QQ webhook routes registered")
+	a.log(context.Background(), logging.LevelInfo, "Registered the QQ Webhook callback routes.")
 }
 
 func normalizeWebhookPath(path string) string {
@@ -59,7 +59,7 @@ func (a *Adapter) handleWebhookRequest(w http.ResponseWriter, request *http.Requ
 	}
 	state := a.stateByAppID(request.Header.Get("X-Bot-Appid"))
 	if state == nil {
-		a.log(request.Context(), logging.LevelWarn, "QQ callback has unknown application status=401")
+		a.log(request.Context(), logging.LevelWarn, "Rejected a QQ Webhook request for an unknown application.")
 		http.Error(w, "unknown QQ application", http.StatusUnauthorized)
 		return
 	}
@@ -72,14 +72,26 @@ func (a *Adapter) handleWebhookRequest(w http.ResponseWriter, request *http.Requ
 	if response.status >= 500 {
 		level = logging.LevelError
 	}
-	a.log(request.Context(), level, fmt.Sprintf("QQ webhook response app_id=%q status=%d", state.appID, response.status))
+	description := fmt.Sprintf("The QQ Webhook request for app %s ended with HTTP %d.", logging.SafeText(state.appID), response.status)
+	if response.status >= 200 && response.status < 300 {
+		description = fmt.Sprintf("Handled the QQ Webhook request for app %s (HTTP %d).", logging.SafeText(state.appID), response.status)
+	}
+	a.log(request.Context(), level, description)
 }
 
 // Both native transports enter this conversion boundary after SDK validation.
 func (a *Adapter) acceptPayload(ctx context.Context, state *appState, payload *dto.WSPayload) (resultErr error) {
 	defer func() {
 		if resultErr != nil {
-			a.log(ctx, logging.LevelError, fmt.Sprintf("QQ event handling failed app_id=%q error_type=%T", appIDFromContext(ctx), resultErr))
+			appID := appIDFromContext(ctx)
+			if state != nil {
+				appID = state.appID
+			}
+			description := "Failed to handle a QQ event"
+			if appID != "" {
+				description += " for app " + logging.SafeText(appID)
+			}
+			a.log(ctx, logging.LevelError, description+": "+logging.ErrorText(resultErr))
 		}
 	}()
 	if state == nil || payload == nil || a.converter == nil {

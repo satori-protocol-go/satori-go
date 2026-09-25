@@ -372,7 +372,7 @@ func TestQQMessages(t *testing.T) {
 
 	})
 
-	if text := f.logs.text(); !strings.Contains(text, `QQ API action="message.create"`) {
+	if text := f.logs.text(); !strings.Contains(text, "QQ API call message.create for qq bot bot-123") {
 		t.Fatalf("QQ request logs=%s", text)
 	}
 }
@@ -472,7 +472,7 @@ func TestQQWebhook(t *testing.T) {
 		})
 	}
 
-	if text := logger.text(); !strings.Contains(text, `message_id="incoming"`) || !strings.Contains(text, "QQ webhook response") {
+	if text := logger.text(); !strings.Contains(text, "Received QQ group message incoming from user member in group group for bot bot-123.") || !strings.Contains(text, "Handled the QQ Webhook request for app 123 (HTTP 200).") {
 		t.Fatalf("QQ callback logs=%s", text)
 	}
 }

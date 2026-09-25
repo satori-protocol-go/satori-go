@@ -999,7 +999,7 @@ func (a *Adapter) registerRoutes() {
 			if strings.HasPrefix(label, protocol.InternalApiPrefix) {
 				label = "internal"
 			}
-			a.log(requestContext(request.Origin), level, fmt.Sprintf("QQ API action=%q platform=%q self_id=%q status=%d code=%d trace=%q elapsed_ms=%d error_type=%T", label, request.Platform, request.SelfID, status, code, trace, time.Since(started).Milliseconds(), err))
+			a.log(requestContext(request.Origin), level, describeActionLog(label, request.Platform, request.SelfID, status, code, trace, time.Since(started), result, err))
 			return result, err
 		})
 	}
