@@ -330,62 +330,91 @@ func (a *App) RunAsync(ctx context.Context) <-chan error {
 	return result
 }
 
+// Run owns cancellation and cleanup for its configured networks.
 func (a *App) Run(ctx context.Context) error {
 	if ctx == nil {
 		ctx = context.Background()
 	}
-
-	a.mu.RLock()
+	a.mu.Lock()
+	if a.runCancel != nil {
+		a.mu.Unlock()
+		return errors.New("app is already running")
+	}
 	networks := append([]clientnetwork.Runner(nil), a.networks...)
-	a.mu.RUnlock()
 	if len(networks) == 0 {
+		a.mu.Unlock()
 		return errors.New("no network configured")
 	}
-
 	runCtx, cancel := context.WithCancel(ctx)
-	defer cancel()
+	a.runCancel = cancel
+	a.mu.Unlock()
+	defer func() { cancel(); a.mu.Lock(); a.runCancel = nil; a.mu.Unlock() }()
 
-	errCh := make(chan error, len(networks))
+	results := make(chan error, len(networks))
 	var wg sync.WaitGroup
-
 	for _, runner := range networks {
 		wg.Add(1)
-		go func(r clientnetwork.Runner) {
-			defer wg.Done()
-			if err := r.Run(runCtx); err != nil && !errors.Is(err, context.Canceled) {
-				errCh <- err
-			}
-		}(runner)
+		go func(r clientnetwork.Runner) { defer wg.Done(); results <- r.Run(runCtx) }(runner)
 	}
-
+	a.log(runCtx, logging.LevelInfo, fmt.Sprintf("Satori client running networks=%d", len(networks)))
 	var runErr error
-	select {
-	case <-ctx.Done():
-	case err := <-errCh:
-		runErr = err
-		cancel()
+	remaining := len(networks)
+wait:
+	for remaining > 0 {
+		select {
+		case <-runCtx.Done():
+			break wait
+		case err := <-results:
+			remaining--
+			if err != nil && !errors.Is(err, context.Canceled) {
+				runErr = err
+				break wait
+			}
+		}
 	}
-
+	cancel()
 	for _, runner := range networks {
-		_ = runner.Close()
+		if err := runner.Close(); err != nil {
+			runErr = errors.Join(runErr, err)
+		}
 	}
 	wg.Wait()
-
+	// Drain results from runners that completed during cancellation/cleanup.
+	for i := 0; i < remaining; i++ {
+		if err := <-results; err != nil && !errors.Is(err, context.Canceled) {
+			runErr = errors.Join(runErr, err)
+		}
+	}
 	a.cleanupAccounts()
+	level := logging.LevelInfo
+	if runErr != nil {
+		level = logging.LevelError
+	}
+	a.log(ctx, level, fmt.Sprintf("Satori client stopped error_type=%T", runErr))
 	return runErr
 }
 
+// Close requests the same cancellation used by Run. Run owns final cleanup;
+// a callback may request shutdown without waiting for itself to finish.
 func (a *App) Close() error {
 	a.mu.RLock()
+	cancel := a.runCancel
 	networks := append([]clientnetwork.Runner(nil), a.networks...)
 	a.mu.RUnlock()
+	if cancel != nil {
+		cancel()
+		return nil
+	}
+	var result error
 	for _, runner := range networks {
-		_ = runner.Close()
+		result = errors.Join(result, runner.Close())
 	}
 	a.cleanupAccounts()
-	return nil
+	return result
 }
 
+// SyncLogins replaces one source connection's complete READY/meta login snapshot.
+// META proxy-only updates use UpdateProxyURLs and never replace the login set.
 func (a *App) SyncLogins(networkID string, cfg clientnetwork.APIConfig, proxyURLs []string, logins []*login.Login) error {
 	seen := make(map[int64]bool, len(logins))
 	for _, info := range logins {

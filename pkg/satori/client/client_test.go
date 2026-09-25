@@ -1,8 +1,11 @@
 package client_test
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
+	clientnetwork "github.com/satori-protocol-go/satori-go/pkg/satori/client/network"
+	"sync"
 	"testing"
 	"time"
 
@@ -106,5 +109,108 @@ func TestClientLogins(t *testing.T) {
 	err = app.PostEvent("source-a", &event.Event{Sn: 100, Type: event.EventTypeMessageCreated, Login: first, Message: &message.Message{Id: "callback"}})
 	if !errors.Is(err, callbackErr) {
 		t.Fatalf("callback result=%v", err)
+	}
+}
+
+type customConfig struct {
+	identity string
+}
+
+func (c customConfig) APIBase() string {
+	return "http://localhost:5140/v1"
+}
+
+func (c customConfig) TokenValue() string {
+	return ""
+}
+
+func (c customConfig) TimeoutValue() time.Duration {
+	return 0
+}
+
+func (c customConfig) Identity() string {
+	return c.identity
+}
+
+func (c customConfig) NetworkKind() string {
+	return "custom"
+}
+
+type lifecycleRunner struct {
+	started chan struct{}
+	closed  chan struct{}
+	mode    string
+	failure error
+	once    sync.Once
+}
+
+func (r *lifecycleRunner) ID() string { return "lifecycle/fixture" }
+func (r *lifecycleRunner) Run(ctx context.Context) error {
+	close(r.started)
+	switch r.mode {
+	case "shutdown-failure":
+		<-ctx.Done()
+		return r.failure
+	case "normal":
+		return nil
+	case "failure":
+		return r.failure
+	default:
+		<-ctx.Done()
+		return ctx.Err()
+	}
+}
+func (r *lifecycleRunner) Close() error { r.once.Do(func() { close(r.closed) }); return nil }
+
+func TestApplicationLifecycle(t *testing.T) {
+	for _, mode := range []string{"normal", "failure", "close", "cancel", "shutdown-failure"} {
+		t.Run(mode, func(t *testing.T) {
+			failure := errors.New("fixture runner failure")
+			runner := &lifecycleRunner{started: make(chan struct{}), closed: make(chan struct{}), mode: mode, failure: failure}
+			app, err := satoriclient.NewApp()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := app.RegisterNetworkFactory("custom", func(*satoriclient.App, satoriclient.Config) (clientnetwork.Runner, satoriclient.APIConfig, error) {
+				return runner, staticAPIConfig{base: "http://127.0.0.1"}, nil
+			}); err != nil {
+				t.Fatal(err)
+			}
+			if err := app.Apply(customConfig{identity: mode}); err != nil {
+				t.Fatal(err)
+			}
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			done := app.RunAsync(ctx)
+			select {
+			case <-runner.started:
+			case <-time.After(time.Second):
+				t.Fatal("runner startup timeout")
+			}
+			if mode == "close" {
+				if err := app.Close(); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if mode == "cancel" || mode == "shutdown-failure" {
+				cancel()
+			}
+			select {
+			case err := <-done:
+				if (mode == "failure" || mode == "shutdown-failure") && !errors.Is(err, failure) {
+					t.Fatalf("failure=%v", err)
+				}
+				if mode != "failure" && mode != "shutdown-failure" && err != nil {
+					t.Fatal(err)
+				}
+			case <-time.After(2 * time.Second):
+				t.Fatal("Run completion timeout")
+			}
+			select {
+			case <-runner.closed:
+			case <-time.After(time.Second):
+				t.Fatal("runner cleanup timeout")
+			}
+		})
 	}
 }
