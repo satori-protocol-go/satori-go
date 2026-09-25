@@ -189,7 +189,7 @@ func (a *Adapter) HandleInternal(request server.Request[map[string]any], path st
 	return a.fetchURL(requestContext(request.Origin), path)
 }
 
-func (a *Adapter) HandleProxied(_ string, rawURL string) (*server.Response, error) {
+func (a *Adapter) HandleProxied(_ context.Context, _ string, rawURL string) (*server.Response, error) {
 	return a.fetchURL(context.Background(), rawURL)
 }
 

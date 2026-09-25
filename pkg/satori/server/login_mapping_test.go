@@ -32,7 +32,7 @@ func (p *loginMappingProvider) Ensure(platform, selfID string) bool {
 func (p *loginMappingProvider) HandleInternal(satoriserver.Request[map[string]any], string) (*satoriserver.Response, error) {
 	return nil, satoriserver.NotFound("not found")
 }
-func (p *loginMappingProvider) HandleProxied(string, string) (*satoriserver.Response, error) {
+func (p *loginMappingProvider) HandleProxied(context.Context, string, string) (*satoriserver.Response, error) {
 	return nil, satoriserver.NotFound("not found")
 }
 

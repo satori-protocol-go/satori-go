@@ -9,7 +9,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"mime"
 	"net"
 	"net/http"
 	"net/url"
@@ -41,7 +40,6 @@ const (
 	defaultStreamChunkSize = 64 * 1024
 	defaultHeartbeat       = 12 * time.Second
 	defaultIdentifyTimeout = 10 * time.Second
-	defaultReadFormMemory  = 32 << 20 // 32 MB
 	defaultCleanupTimeout  = 10 * time.Second
 	defaultWebhookTimeout  = protocol.DefaultRequestTimeout
 )
@@ -66,6 +64,7 @@ type Config struct {
 	StreamThreshold int
 	StreamChunkSize int
 	EventCacheSize  int
+	MaxRequestBytes int64 // Local limit for standard RPC/upload bodies; default 32 MiB.
 	HTTPClient      *http.Client
 	Logger          Logger
 }
@@ -74,6 +73,12 @@ type staticResourceMount struct {
 	targetPath string
 	kind       staticMountKind
 	html       bool
+}
+
+type temporaryFile struct {
+	platform, selfID, contentType string
+	expires                       time.Time
+	timer                         *time.Timer
 }
 
 type providerLoginKey struct {
@@ -113,7 +118,9 @@ type Server struct {
 	loginSequence int64
 	loginMappings map[providerLoginKey]*loginBinding
 
-	tempDir string
+	tempDir         string
+	tempFiles       map[string]*temporaryFile
+	maxRequestBytes int64
 
 	httpClient     *http.Client
 	httpServer     *http.Server
@@ -166,6 +173,10 @@ func NewServer(cfg Config) (*Server, error) {
 		eventCacheSize = defaultEventCacheSize
 	}
 
+	maxRequestBytes := cfg.MaxRequestBytes
+	if maxRequestBytes <= 0 {
+		maxRequestBytes = 32 << 20
+	}
 	tempDir, err := os.MkdirTemp("", "satori-server-*")
 	if err != nil {
 		return nil, err
@@ -197,6 +208,8 @@ func NewServer(cfg Config) (*Server, error) {
 		eventCache:             newEventDeque(eventCacheSize),
 		loginMappings:          map[providerLoginKey]*loginBinding{},
 		tempDir:                tempDir,
+		tempFiles:              map[string]*temporaryFile{},
+		maxRequestBytes:        maxRequestBytes,
 		httpClient:             httpClient,
 		logger:                 logger,
 		responseHeader:         cloneHTTPHeader(cfg.ResponseHeaders),
@@ -652,18 +665,30 @@ func (s *Server) eventSource(info *login.Login) (int, error) {
 	return 0, errors.New("event source login is not registered")
 }
 
+// GetLocalFile reads an owned upload using its complete internal URL.
 func (s *Server) GetLocalFile(rawURL string) ([]byte, error) {
-	name := filepath.Base(rawURL)
-	if name == "." || name == string(filepath.Separator) {
-		return nil, os.ErrNotExist
+	match := internalURLPattern.FindStringSubmatch(rawURL)
+	if len(match) != 4 || !strings.HasPrefix(match[3], "_tmp/") {
+		return nil, BadRequest("expected an internal temporary resource")
 	}
-	s.mu.RLock()
-	tempDir := s.tempDir
-	s.mu.RUnlock()
-	if tempDir == "" {
-		return nil, os.ErrNotExist
+	if !s.hasLogin(match[1], match[2]) {
+		return nil, NotFound("resource login not found")
 	}
-	return os.ReadFile(filepath.Join(tempDir, name))
+	response, err := s.fetchTempFile(match[1], match[2], strings.TrimPrefix(match[3], "_tmp/"))
+	if err != nil {
+		return nil, err
+	}
+	defer response.closeStream()
+	return io.ReadAll(io.LimitReader(response.Stream, s.maxRequestBytes+1))
+}
+
+func (s *Server) hasLogin(platform, selfID string) bool {
+	for _, provider := range s.snapshotProviders() {
+		if provider.Ensure(platform, selfID) {
+			return true
+		}
+	}
+	return false
 }
 
 func (s *Server) metaGetHandler(w http.ResponseWriter, request *http.Request) {
@@ -919,7 +944,30 @@ func (s *Server) proxyURLHandler(w http.ResponseWriter, request *http.Request) {
 		return
 	}
 
-	resp, err := s.fetchProxy(rawURL, request)
+	// Public GET resources contain opaque identifiers. Native API proxying always
+	// uses Satori authorization, including GET requests that may disclose platform data.
+	normalized, parseErr := normalizeProxyURL(rawURL)
+	if parseErr != nil {
+		writeError(w, BadRequest(parseErr.Error()))
+		return
+	}
+	match := internalURLPattern.FindStringSubmatch(normalized)
+	native := false
+	if len(match) == 4 {
+		nativePath, _, _ := strings.Cut(match[3], "?")
+		native = nativePath == "_api" || strings.HasPrefix(nativePath, "_api/")
+	}
+	if (native || (request.Method != http.MethodGet && request.Method != http.MethodHead)) && !s.authorize(w, request) {
+		return
+	}
+	if request.URL.RawQuery != "" {
+		separator := "?"
+		if strings.Contains(normalized, "?") {
+			separator = "&"
+		}
+		normalized += separator + request.URL.RawQuery
+	}
+	resp, err := s.fetchProxy(normalized, request)
 	if err != nil {
 		writeError(w, err)
 		return
@@ -930,15 +978,13 @@ func (s *Server) proxyURLHandler(w http.ResponseWriter, request *http.Request) {
 		return
 	}
 
-	if resp.Stream != nil {
-		writeServerResponse(w, resp, s.streamChunkSize)
-		return
+	chunkSize := 0
+	if resp.Stream != nil || len(resp.Body) > s.streamThreshold {
+		chunkSize = s.streamChunkSize
 	}
-	if len(resp.Body) > s.streamThreshold {
-		writeServerResponse(w, resp, s.streamChunkSize)
-		return
+	if err := writeServerResponse(w, resp, chunkSize); err != nil {
+		s.log(request.Context(), LogLevelError, fmt.Sprintf("Satori resource response interrupted error_type=%T", err))
 	}
-	writeServerResponse(w, resp, 0)
 }
 
 func (s *Server) executeRoute(
@@ -949,8 +995,28 @@ func (s *Server) executeRoute(
 	selfID string,
 	handler RouteCall[any, any],
 ) {
+	started := time.Now()
+	status := http.StatusOK
+	defer func() {
+		label := action
+		if strings.HasPrefix(label, protocol.InternalApiPrefix) {
+			label = "internal"
+		}
+		level := LogLevelDebug
+		if status >= 400 {
+			level = LogLevelWarn
+		}
+		if status >= 500 {
+			level = LogLevelError
+		}
+		s.log(request.Context(), level, fmt.Sprintf("Satori RPC action=%q platform=%q self_id=%q status=%d elapsed_ms=%d", label, platform, selfID, status, time.Since(started).Milliseconds()))
+	}()
+	if !strings.HasPrefix(action, protocol.InternalApiPrefix) {
+		request.Body = http.MaxBytesReader(w, request.Body, s.maxRequestBytes)
+	}
 	params, err := parseParams(action, request)
 	if err != nil {
+		status = statusFromError(err)
 		writeError(w, err)
 		return
 	}
@@ -963,15 +1029,22 @@ func (s *Server) executeRoute(
 		SelfID:   selfID,
 	})
 	if callErr != nil {
+		status = statusFromError(callErr)
 		writeError(w, callErr)
 		return
 	}
 
 	switch typed := result.(type) {
 	case *Response:
-		writeServerResponse(w, typed, 0)
+		status = typed.statusCodeOrDefault()
+		if err := writeServerResponse(w, typed, 0); err != nil {
+			s.log(request.Context(), LogLevelError, fmt.Sprintf("Satori response interrupted error_type=%T", err))
+		}
 	case Response:
-		writeServerResponse(w, &typed, 0)
+		status = typed.statusCodeOrDefault()
+		if err := writeServerResponse(w, &typed, 0); err != nil {
+			s.log(request.Context(), LogLevelError, fmt.Sprintf("Satori response interrupted error_type=%T", err))
+		}
 	default:
 		writeJSON(w, http.StatusOK, typed)
 	}
@@ -1017,16 +1090,17 @@ func (s *Server) findRouteHandler(action string, platform string, selfID string)
 	return nil, false
 }
 
+// rawURL has already been decoded at the proxy route boundary. Query bytes
+// retain their own URL encoding when the target request is constructed.
 func (s *Server) fetchProxy(rawURL string, request *http.Request) (*Response, error) {
-	normalized, err := normalizeProxyURL(rawURL)
-	if err != nil {
-		return nil, BadRequest(err.Error())
+	if strings.HasPrefix(rawURL, "internal:") {
+		return s.fetchInternalProxy(rawURL, request)
 	}
-
-	if strings.HasPrefix(normalized, "internal:") {
-		return s.fetchInternalProxy(normalized, request)
+	ctx := context.Background()
+	if request != nil {
+		ctx = request.Context()
 	}
-	return s.fetchExternalProxy(normalized)
+	return s.fetchExternalProxy(ctx, rawURL)
 }
 
 func (s *Server) fetchInternalProxy(rawURL string, request *http.Request) (*Response, error) {
@@ -1038,14 +1112,31 @@ func (s *Server) fetchInternalProxy(rawURL string, request *http.Request) (*Resp
 	platform := match[1]
 	selfID := match[2]
 	path := match[3]
-	tmpPath := ""
-	hasTmpPrefix := strings.HasPrefix(path, "_tmp")
-	if hasTmpPrefix && len(path) > 5 {
-		tmpPath = path[5:]
+	operationPath, query, _ := strings.Cut(path, "?")
+	if request != nil && (operationPath == "_api" || strings.HasPrefix(operationPath, "_api/")) {
+		// Match the ordinary /internal request boundary: path and raw query
+		// are distinct, so the provider sends the query exactly once.
+		request = request.Clone(request.Context())
+		request.URL.RawQuery = query
+		path = operationPath
 	}
-
+	if strings.ContainsAny(platform+selfID, "\\?#\x00") {
+		return nil, BadRequest("invalid internal identity")
+	}
+	if !s.hasLogin(platform, selfID) {
+		return nil, NotFound("resource login not found")
+	}
+	reserved := strings.SplitN(path, "/", 2)[0]
+	if strings.HasPrefix(reserved, "_") && reserved != "_tmp" && reserved != "_api" {
+		return nil, NotFound("unknown reserved resource path")
+	}
+	hasTmpPrefix := reserved == "_tmp"
+	tmpPath := strings.TrimPrefix(path, "_tmp/")
 	if hasTmpPrefix {
-		resp, err := s.fetchTempFile(tmpPath)
+		if !strings.HasPrefix(path, "_tmp/") {
+			return nil, BadRequest("temporary file identifier is required")
+		}
+		resp, err := s.fetchTempFile(platform, selfID, tmpPath)
 		if err == nil && resp != nil {
 			return resp, nil
 		}
@@ -1084,13 +1175,17 @@ func (s *Server) fetchInternalProxy(rawURL string, request *http.Request) (*Resp
 	return nil, NotFound(fmt.Sprintf("login with %s:%s not found", platform, selfID))
 }
 
-func (s *Server) fetchExternalProxy(rawURL string) (*Response, error) {
+func (s *Server) fetchExternalProxy(ctx context.Context, rawURL string) (*Response, error) {
+	u, err := url.Parse(rawURL)
+	if err != nil || u.Host == "" || u.User != nil || (u.Scheme != "http" && u.Scheme != "https") {
+		return nil, BadRequest("invalid external resource URL")
+	}
 	for _, provider := range s.snapshotProviders() {
 		for _, prefix := range provider.ProxyUrls() {
 			if !strings.HasPrefix(rawURL, prefix) {
 				continue
 			}
-			resp, err := provider.HandleProxied(prefix, rawURL)
+			resp, err := provider.HandleProxied(ctx, prefix, rawURL)
 			if err != nil {
 				return nil, err
 			}
@@ -1102,109 +1197,119 @@ func (s *Server) fetchExternalProxy(rawURL string) (*Response, error) {
 	return nil, Forbidden(fmt.Sprintf("unknown proxy url: %s", rawURL))
 }
 
-func (s *Server) fetchTempFile(name string) (*Response, error) {
+func (s *Server) fetchTempFile(platform, selfID, name string) (*Response, error) {
+	if name == "" || name == "." || name == ".." || strings.ContainsAny(name, "/\\:\x00?#") {
+		return nil, BadRequest("invalid temporary file identifier")
+	}
 	s.mu.RLock()
-	tempDir := s.tempDir
+	record, dir := s.tempFiles[name], s.tempDir
 	s.mu.RUnlock()
-	if tempDir == "" {
-		return nil, NotFound("temporary directory is not available")
+	if record == nil || dir == "" || !time.Now().Before(record.expires) {
+		return nil, NotFound("temporary resource expired or not found")
 	}
-
-	cleanName := filepath.Clean(name)
-	if strings.HasPrefix(cleanName, "..") {
-		return nil, BadRequest("invalid file path")
+	if record.platform != platform || record.selfID != selfID {
+		return nil, Forbidden("temporary resource belongs to a different login")
 	}
-
-	filePath := filepath.Join(tempDir, cleanName)
-	file, err := os.Open(filePath)
+	file, err := os.Open(filepath.Join(dir, name))
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
-			return nil, NotFound(fmt.Sprintf("file not found: %s", cleanName))
+			return nil, NotFound("temporary resource not found")
 		}
 		return nil, err
 	}
-	info, statErr := file.Stat()
-	if statErr != nil {
-		_ = file.Close()
-		return nil, statErr
+	info, err := file.Stat()
+	if err != nil {
+		file.Close()
+		return nil, err
 	}
+	response := NewStreamResponse(http.StatusOK, file)
+	response.Header.Set("Content-Type", record.contentType)
+	response.ContentLength = info.Size()
+	return response, nil
+}
 
-	contentType := mime.TypeByExtension(filepath.Ext(filePath))
-	if contentType == "" {
-		contentType = "application/octet-stream"
+func (s *Server) removeTemporaryFile(name string) {
+	s.mu.Lock()
+	record, dir := s.tempFiles[name], s.tempDir
+	delete(s.tempFiles, name)
+	if record != nil && record.timer != nil {
+		record.timer.Stop()
 	}
-	resp := NewStreamResponse(http.StatusOK, file)
-	resp.Header.Set("Content-Type", contentType)
-	resp.ContentLength = info.Size()
-	resp.Header.Set("Content-Length", strconv.FormatInt(info.Size(), 10))
-	return resp, nil
+	s.mu.Unlock()
+	if record != nil && dir != "" {
+		_ = os.Remove(filepath.Join(dir, name))
+	}
 }
 
 func (s *Server) defaultUploadCreateHandler(request *Request[UploadCreateParam]) (map[string]string, error) {
 	if request == nil || request.Params == nil {
 		return nil, BadRequest("invalid form data")
 	}
-	form := request.Params
-
+	if !s.hasLogin(request.Platform, request.SelfID) {
+		return nil, NotFound("upload login not found")
+	}
 	result := map[string]string{}
-
-	for name, files := range form.File {
-		if len(files) == 0 {
-			continue
+	var total int64
+	for name, file := range request.Params {
+		if name == "" {
+			return nil, BadRequest("upload name is required")
 		}
-
-		file := files[0]
-		opened, err := file.Open()
-		if err != nil {
-			return nil, err
+		contentType := file.ContentType
+		if int64(len(file.Data)) > s.maxRequestBytes-total {
+			return nil, NewActionError(413, "upload exceeds local request limit", nil)
 		}
-
-		data, err := io.ReadAll(opened)
-		_ = opened.Close()
-		if err != nil {
-			return nil, err
+		if request.Origin != nil {
+			if err := request.Origin.Context().Err(); err != nil {
+				return nil, err
+			}
 		}
-
 		token, err := randomToken(16)
 		if err != nil {
 			return nil, err
 		}
-
-		filename := file.Filename
-		if filename == "" {
-			ext := ".png"
-			if contentType := file.Header.Get("Content-Type"); contentType != "" {
-				if exts, _ := mime.ExtensionsByType(contentType); len(exts) > 0 {
-					ext = exts[0]
-				}
-			}
-			filename = name + ext
+		filename := filepath.Base(strings.ReplaceAll(file.Filename, "\\", "/"))
+		if filename == "" || filename == "." || filename == ".." {
+			filename = "upload"
 		}
-		filename = filepath.Base(filename)
-		if filename == "." || filename == string(filepath.Separator) {
-			filename = name
+		if strings.ContainsAny(filename, ":\x00?#") {
+			return nil, BadRequest("invalid upload filename")
 		}
-
 		finalName := token + "-" + filename
-
 		s.mu.RLock()
-		tempDir := s.tempDir
+		dir := s.tempDir
 		s.mu.RUnlock()
-		if tempDir == "" {
-			return nil, errors.New("temporary directory is not available")
+		if dir == "" {
+			return nil, errors.New("temporary directory is closed")
 		}
-
-		target := filepath.Join(tempDir, finalName)
-		if err := os.WriteFile(target, data, 0o600); err != nil {
+		target := filepath.Join(dir, finalName)
+		output, err := os.OpenFile(target, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0600)
+		if err != nil {
 			return nil, err
 		}
-		time.AfterFunc(10*time.Minute, func() {
-			_ = os.Remove(target)
-		})
-
+		size, copyErr := io.Copy(output, bytes.NewReader(file.Data))
+		closeErr := output.Close()
+		if err = errors.Join(copyErr, closeErr); err != nil {
+			os.Remove(target)
+			return nil, err
+		}
+		total += size
+		if total > s.maxRequestBytes {
+			os.Remove(target)
+			return nil, NewActionError(413, "upload exceeds local request limit", nil)
+		}
+		record := &temporaryFile{platform: request.Platform, selfID: request.SelfID, contentType: contentType, expires: time.Now().Add(10 * time.Minute)}
+		s.mu.Lock()
+		if s.tempDir != dir {
+			s.mu.Unlock()
+			os.Remove(target)
+			return nil, errors.New("temporary directory is closed")
+		}
+		record.timer = time.AfterFunc(10*time.Minute, func() { s.removeTemporaryFile(finalName) })
+		s.tempFiles[finalName] = record
+		s.mu.Unlock()
 		result[name] = fmt.Sprintf("internal:%s/%s/_tmp/%s", request.Platform, request.SelfID, finalName)
 	}
-
+	s.log(context.Background(), LogLevelDebug, fmt.Sprintf("Satori upload accepted platform=%q self_id=%q files=%d bytes=%d", request.Platform, request.SelfID, len(result), total))
 	return result, nil
 }
 
@@ -1527,12 +1632,12 @@ func (s *Server) runBlocking(ctx context.Context) error {
 	})
 
 	for index, provider := range s.snapshotProviders() {
-		source := index + 1
 		publisher, ok := provider.(EventPublisher)
 		if !ok {
 			continue
 		}
 		stream := publisher.Publisher(groupCtx)
+		source := index + 1
 		group.Go(func() error {
 			err := s.runPublisherTask(groupCtx, source, stream)
 			recordFirst(err)
@@ -1648,6 +1753,12 @@ func (s *Server) runCleanup(ctx context.Context) error {
 
 	tempDir := s.tempDir
 	s.tempDir = ""
+	for _, file := range s.tempFiles {
+		if file.timer != nil {
+			file.timer.Stop()
+		}
+	}
+	s.tempFiles = map[string]*temporaryFile{}
 	s.mu.Unlock()
 
 	var cleanupErr error
@@ -1799,10 +1910,7 @@ func parseParams(action string, request *http.Request) (any, error) {
 		return nil, nil
 	}
 	if action == string(protocol.ApiUploadCreate) {
-		if err := request.ParseMultipartForm(defaultReadFormMemory); err != nil {
-			return nil, BadRequest(err.Error())
-		}
-		return request.MultipartForm, nil
+		return parseUploads(request)
 	}
 
 	if request.Method == http.MethodGet {
@@ -1818,6 +1926,10 @@ func parseParams(action string, request *http.Request) (any, error) {
 
 	body, err := io.ReadAll(request.Body)
 	if err != nil {
+		var tooLarge *http.MaxBytesError
+		if errors.As(err, &tooLarge) {
+			return nil, NewActionError(413, "request exceeds local limit", err)
+		}
 		return nil, err
 	}
 	var params any
@@ -1883,12 +1995,12 @@ func writeJSON(w http.ResponseWriter, status int, payload any) {
 	_, _ = w.Write(data)
 }
 
-func writeServerResponse(w http.ResponseWriter, response *Response, chunkSize int) {
+func writeServerResponse(w http.ResponseWriter, response *Response, chunkSize int) error {
 	if response == nil {
 		w.WriteHeader(http.StatusOK)
-		return
+		return nil
 	}
-	for key, values := range response.Header {
+	for key, values := range protocol.ForwardHeaders(response.Header) {
 		for _, value := range values {
 			w.Header().Add(key, value)
 		}
@@ -1897,38 +2009,53 @@ func writeServerResponse(w http.ResponseWriter, response *Response, chunkSize in
 		w.Header().Set("Content-Length", strconv.FormatInt(response.ContentLength, 10))
 	}
 	w.WriteHeader(response.statusCodeOrDefault())
-
 	if response.Stream != nil {
 		defer response.closeStream()
 		if chunkSize <= 0 {
 			chunkSize = defaultStreamChunkSize
 		}
 		buffer := make([]byte, chunkSize)
-		_, _ = io.CopyBuffer(w, response.Stream, buffer)
-		return
+		flusher, _ := w.(http.Flusher)
+		for {
+			n, err := response.Stream.Read(buffer)
+			if n > 0 {
+				if _, writeErr := w.Write(buffer[:n]); writeErr != nil {
+					return writeErr
+				}
+				if flusher != nil {
+					flusher.Flush()
+				}
+			}
+			if err == io.EOF {
+				return nil
+			}
+			if err != nil {
+				return err
+			}
+		}
 	}
-
 	if len(response.Body) == 0 {
-		return
+		return nil
 	}
-
 	if chunkSize <= 0 {
-		_, _ = w.Write(response.Body)
-		return
+		chunkSize = len(response.Body)
 	}
-	for i := 0; i < len(response.Body); i += chunkSize {
-		end := i + chunkSize
+	for offset := 0; offset < len(response.Body); offset += chunkSize {
+		end := offset + chunkSize
 		if end > len(response.Body) {
 			end = len(response.Body)
 		}
-		_, _ = w.Write(response.Body[i:end])
+		if _, err := w.Write(response.Body[offset:end]); err != nil {
+			return err
+		}
 	}
+	return nil
 }
 
 func extractPlatformAndSelfID(header http.Header) (string, string, error) {
 	platform, selfID, err := protocol.ExtractIdentityHeaders(header)
 	if err != nil {
-		return "", "", Unauthorized(err.Error())
+		return "", "", BadRequest(err.Error())
 	}
 	return platform, selfID, nil
 }
@@ -1942,50 +2069,6 @@ func randomToken(size int) (string, error) {
 		return "", err
 	}
 	return base64.RawURLEncoding.EncodeToString(buffer), nil
-}
-
-func toInt64(value any) (int64, bool) {
-	switch typed := value.(type) {
-	case int:
-		return int64(typed), true
-	case int8:
-		return int64(typed), true
-	case int16:
-		return int64(typed), true
-	case int32:
-		return int64(typed), true
-	case int64:
-		return typed, true
-	case uint:
-		return int64(typed), true
-	case uint8:
-		return int64(typed), true
-	case uint16:
-		return int64(typed), true
-	case uint32:
-		return int64(typed), true
-	case uint64:
-		return int64(typed), true
-	case float64:
-		return int64(typed), true
-	case float32:
-		return int64(typed), true
-	case json.Number:
-		result, err := typed.Int64()
-		if err == nil {
-			return result, true
-		}
-		floatResult, err := typed.Float64()
-		if err == nil {
-			return int64(floatResult), true
-		}
-	case string:
-		result, err := strconv.ParseInt(typed, 10, 64)
-		if err == nil {
-			return result, true
-		}
-	}
-	return 0, false
 }
 
 func cloneHTTPHeader(source http.Header) http.Header {
@@ -2002,20 +2085,6 @@ func cloneHTTPHeader(source http.Header) http.Header {
 		cloned[key] = copied
 	}
 	return cloned
-}
-
-func asString(value any) string {
-	switch typed := value.(type) {
-	case string:
-		return typed
-	case json.Number:
-		return typed.String()
-	default:
-		if value == nil {
-			return ""
-		}
-		return fmt.Sprint(value)
-	}
 }
 
 func isLoginEventType(typ event.EventType) bool {
