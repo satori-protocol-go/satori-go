@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/WindowsSov8forUs/botgo-plus/dto"
 	"github.com/go-chi/chi/v5"
@@ -101,14 +102,35 @@ func (a *Adapter) acceptPayload(ctx context.Context, state *appState, payload *d
 	if strings.HasPrefix(string(payload.Type), "MESSAGE_AUDIT_") {
 		a.captureAuditResult(state.appID, string(payload.Type), raw)
 	}
-	evt, err := a.converter.Convert(withAppID(ctx, state.appID), payload.OPCode, payload.Type, raw)
-	if err != nil {
-		return err
+	evt, conversionErr := a.converter.Convert(withAppID(ctx, state.appID), payload.OPCode, payload.Type, raw)
+	if conversionErr != nil {
+		if !a.wsEnabled || ctx.Err() != nil {
+			return conversionErr
+		}
+		// WebSocket has no per-event negative ACK. Preserve an unconvertible
+		// event through the native event channel instead of replaying it forever.
+		platform := platformByEventType(string(payload.Type))
+		if platform == "" {
+			platform = "qq"
+			var source struct {
+				GuildID   string `json:"guild_id"`
+				ChannelID string `json:"channel_id"`
+			}
+			if json.Unmarshal(raw, &source) == nil && (source.GuildID != "" || source.ChannelID != "") {
+				platform = "qqguild"
+			}
+		}
+		loginValue := a.findLoginInState(platform, state.appID)
+		if loginValue == nil {
+			return conversionErr
+		}
+		evt = &event.Event{Type: event.EventTypeInternal, Type_: string(payload.Type), Login: loginValue, Timestamp: time.Now().UnixMilli(), Data_: json.RawMessage(raw)}
+		a.log(ctx, logging.LevelError, fmt.Sprintf("Could not convert QQ WebSocket event %s; preserving it as an internal event: %s", logging.SafeText(string(payload.Type)), logging.ErrorText(conversionErr)))
 	}
 	if evt == nil {
 		return nil
 	}
-	if payload.Type == dto.EventInteractionCreate {
+	if payload.Type == dto.EventInteractionCreate && conversionErr == nil {
 		var interaction dto.Interaction
 		if err := json.Unmarshal(raw, &interaction); err != nil {
 			return err
@@ -119,7 +141,12 @@ func (a *Adapter) acceptPayload(ctx context.Context, state *appState, payload *d
 		kind := convert.InteractionKind(&interaction)
 		if (kind == 11 || kind == 12) && !a.cfg.ManualInteractionResponse {
 			if meta, err := state.api.AcknowledgeInteraction(ctx, interaction.ID, 0); err != nil {
-				return wrapQQResponse(meta, err)
+				if !a.wsEnabled {
+					return wrapQQResponse(meta, err)
+				}
+				// Delivery is independent of the platform's interaction acknowledgement.
+				// Do not replay an interaction with potentially completed side effects.
+				a.log(ctx, logging.LevelError, fmt.Sprintf("Could not acknowledge QQ interaction %s; continuing event delivery without automatic retry: %s", logging.SafeText(interaction.ID), logging.ErrorText(wrapQQResponse(meta, err))))
 			}
 		}
 	}
