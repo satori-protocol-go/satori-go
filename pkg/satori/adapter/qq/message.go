@@ -227,10 +227,12 @@ func (s *messageSender) sendQQ(ctx context.Context, input messageCreateInput) ([
 		}
 		var created *dto.Message
 		var err error
+		groupMention := !isDirect && segment.GroupMentionMarkdown != "" &&
+			replyReference(input.Referrer, segment.QuoteID) == nil
 		switch {
 		case segment.ArkJSON != "":
 			created, err = s.sendQQArk(ctx, targetID, isDirect, segment, input.Referrer, seq.Next())
-		case segment.Markdown || len(segment.Buttons) > 0:
+		case segment.Markdown || len(segment.Buttons) > 0 || groupMention:
 			created, err = s.sendQQMarkdown(ctx, targetID, isDirect, segment, input.Referrer, seq.Next())
 		case segment.Resource == nil:
 			created, err = s.sendQQText(ctx, targetID, isDirect, segment, input.Referrer, seq.Next())
@@ -282,6 +284,10 @@ func (s *messageSender) sendQQMarkdown(
 	seq int,
 ) (*dto.Message, error) {
 	markdownContent := escapeQQMarkdown(segment.Text)
+	if !isDirect && segment.GroupMentionMarkdown != "" {
+		// The converter already escaped text around the native mention tags.
+		markdownContent = segment.GroupMentionMarkdown
+	}
 	if strings.TrimSpace(markdownContent) == "" {
 		markdownContent = " "
 	}
