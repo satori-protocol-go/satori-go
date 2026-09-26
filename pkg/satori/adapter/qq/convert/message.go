@@ -96,8 +96,8 @@ func messageContentFromDTO(input *dto.Message) string {
 	if input.MentionEveryone {
 		chunks = append(chunks, `<at type="all"/>`)
 	}
-	if input.MessageReference != nil && input.MessageReference.MessageID != "" {
-		chunks = append(chunks, xhtml.NewElement("quote", map[string]any{"id": input.MessageReference.MessageID}).String())
+	if quote := messageQuoteFromDTO(input); quote != "" {
+		chunks = append(chunks, quote)
 	}
 	chunks = append(chunks, nativeText(input.Content))
 	for _, attachment := range input.Attachments {
@@ -121,8 +121,9 @@ func messageContentFromDTO(input *dto.Message) string {
 			chunks = append(chunks, xhtml.NewElement("qq:ark-data", map[string]any{"data": string(raw)}).String())
 		}
 	}
-	if len(input.MsgElements) > 0 {
-		chunks = append(chunks, nestedMessages(input.MsgElements))
+	if len(input.MsgElements) > 0 && input.MessageType != 103 {
+		// Only chat records (102) are forwarded messages; parallel messages (101) are not.
+		chunks = append(chunks, nestedMessages(input.MsgElements, input.MessageType == 102))
 	}
 	return strings.Join(chunks, "")
 }
@@ -172,21 +173,68 @@ func attachmentElement(item *dto.MessageAttachment) string {
 	return xhtml.NewElement(kind, attrs).String()
 }
 
-func nestedMessages(items []dto.MessageElement) string {
+// Quote targets use ref_msg_idx, never the current message's msg_idx.
+func messageQuoteFromDTO(input *dto.Message) string {
+	id := ""
+	if input.MessageReference != nil {
+		id = input.MessageReference.MessageID
+	}
+	content := ""
+	if input.MessageType == 103 {
+		if id == "" {
+			id, _ = input.MessageScene.GetExt("ref_msg_idx")
+		}
+		if len(input.MsgElements) == 1 {
+			item := input.MsgElements[0]
+			if id == "" {
+				id = item.MsgIdx
+			}
+			content = messageElementContent(item)
+		} else if len(input.MsgElements) > 1 {
+			content = nestedMessages(input.MsgElements, false)
+		}
+	}
+	if id == "" && content == "" {
+		return ""
+	}
+	attrs := ""
+	if id != "" {
+		attrs = fmt.Sprintf(` id="%s"`, xhtml.Escape(id, true))
+	}
+	if content == "" {
+		return "<quote" + attrs + "/>"
+	}
+	return "<quote" + attrs + ">" + content + "</quote>"
+}
+
+func messageElementContent(item dto.MessageElement) string {
 	var out strings.Builder
-	out.WriteString("<message forward>")
+	if author := UserFromDTO(item.Author); author != nil {
+		out.WriteString(xhtml.NewElement("author", map[string]any{"id": author.Id, "name": author.Name}).String())
+	}
+	out.WriteString(messageContentFromDTO(&dto.Message{
+		MessageType: item.MessageType, Content: item.Content, Attachments: item.Attachments,
+		ArkData: item.ArkData, MsgElements: item.MsgElements,
+	}))
+	return out.String()
+}
+
+func nestedMessages(items []dto.MessageElement, forward bool) string {
+	var out strings.Builder
+	if forward {
+		out.WriteString("<message forward>")
+	}
 	for _, item := range items {
 		attrs := ""
 		if item.MsgIdx != "" {
 			attrs = fmt.Sprintf(` id="%s"`, xhtml.Escape(item.MsgIdx, true))
 		}
 		out.WriteString("<message" + attrs + ">")
-		if author := UserFromDTO(item.Author); author != nil {
-			out.WriteString(xhtml.NewElement("author", map[string]any{"id": author.Id, "name": author.Name}).String())
-		}
-		out.WriteString(messageContentFromDTO(&dto.Message{Content: item.Content, Attachments: item.Attachments, ArkData: item.ArkData, MsgElements: item.MsgElements}))
+		out.WriteString(messageElementContent(item))
 		out.WriteString("</message>")
 	}
-	out.WriteString("</message>")
+	if forward {
+		out.WriteString("</message>")
+	}
 	return out.String()
 }
