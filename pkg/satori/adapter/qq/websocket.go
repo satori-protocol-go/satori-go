@@ -232,23 +232,21 @@ func (a *Adapter) resolveWebSocketTargets(
 	return gatewayURL, targets, startupInterval, nil
 }
 
-func parseWSIntentNames(names []string, logger logging.Logger) int64 {
-	if logger == nil {
-		logger = logging.NopLogger{}
+func parseWSIntentNames(names []string) (int64, error) {
+	// An omitted list uses the documented defaults; an explicit empty list does not.
+	if names != nil && len(names) == 0 {
+		return 0, errors.New("QQ WebSocket intents cannot be an empty list")
 	}
 	var intents dto.Intent
 	for _, raw := range names {
 		name := strings.ToUpper(strings.TrimSpace(raw))
-		if name == "" {
-			continue
+		value, ok := wsIntentByName[name]
+		if !ok {
+			return 0, fmt.Errorf("unknown QQ WebSocket intent %q", raw)
 		}
-		if value, ok := wsIntentByName[name]; ok {
-			intents |= value
-			continue
-		}
-		logger.Log(context.Background(), logging.LevelWarn, fmt.Sprintf("Ignoring unknown QQ WebSocket intent %q.", raw))
+		intents |= value
 	}
-	return int64(intents)
+	return int64(intents), nil
 }
 
 var wsIntentByName = map[string]dto.Intent{
