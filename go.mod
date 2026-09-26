@@ -3,7 +3,7 @@ module github.com/satori-protocol-go/satori-go
 go 1.25.4
 
 require (
-	github.com/WindowsSov8forUs/botgo-plus v0.2.2
+	github.com/WindowsSov8forUs/botgo-plus v0.2.4
 	github.com/go-chi/chi/v5 v5.2.3
 	github.com/gorilla/websocket v1.5.3
 	golang.org/x/net v0.43.0

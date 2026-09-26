@@ -95,7 +95,7 @@ type Config struct {
 	UseWebSocket              bool
 	WSGatewayURL              string
 	WSIntents                 int64
-	WSIntentNames             []string
+	WSIntentNames             []string // Nil uses the default subscriptions; an explicit empty list is rejected.
 	WSShardID                 uint32
 	WSShardCount              uint32
 	WSReconnectDelay          time.Duration

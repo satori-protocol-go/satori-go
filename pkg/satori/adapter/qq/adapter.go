@@ -82,13 +82,21 @@ func New(cfg Config) (*Adapter, error) {
 		logger = logging.NewStdLogger()
 	}
 	wsIntents := cfg.WSIntents
-	if wsIntents == 0 {
-		wsIntents = parseWSIntentNames(cfg.WSIntentNames, logger)
-	}
-	if wsIntents == 0 {
-		wsIntents = defaultWSIntents
-	}
 	if cfg.UseWebSocket {
+		if wsIntents < 0 || wsIntents > 1<<31-1 {
+			return nil, errors.New("QQ WebSocket intent mask is outside the supported range")
+		}
+		if wsIntents == 0 {
+			var err error
+			wsIntents, err = parseWSIntentNames(cfg.WSIntentNames)
+			if err != nil {
+				return nil, err
+			}
+		}
+		if wsIntents == 0 {
+			wsIntents = defaultWSIntents
+			logger.Log(context.Background(), logging.LevelWarn, "QQ WebSocket intents were not specified; using GUILDS, GUILD_MEMBERS, PUBLIC_GUILD_MESSAGES, GROUP_AND_C2C_EVENT, INTERACTION and MESSAGE_AUDIT. Verify permissions or specify the required subscriptions explicitly.")
+		}
 		logger.Log(context.Background(), logging.LevelInfo, fmt.Sprintf("Using intent mask %d for the QQ WebSocket connection.", wsIntents))
 	}
 	wsReconnect := cfg.WSReconnectDelay
