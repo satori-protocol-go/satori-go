@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/WindowsSov8forUs/botgo-plus/dto"
+	"github.com/WindowsSov8forUs/botgo-plus/errs"
 	"github.com/WindowsSov8forUs/botgo-plus/sessions/manager"
 	"github.com/WindowsSov8forUs/botgo-plus/websocket"
 	"github.com/satori-protocol-go/satori-go/pkg/satori/logging"
@@ -43,7 +44,7 @@ func (a *Adapter) Block(ctx context.Context) error {
 	defer a.closeAllWSConnections()
 	for _, id := range a.sortedAppIDs() {
 		state := a.appStates[id]
-		gateway, targets, interval, err := a.resolveWebSocketTargets(groupCtx, state)
+		gateway, targets, gatewayInfo, err := a.resolveWebSocketTargets(groupCtx, state)
 		if err != nil {
 			cancel()
 			a.closeAllWSConnections()
@@ -54,19 +55,9 @@ func (a *Adapter) Block(ctx context.Context) error {
 		state.expectedShards = len(targets)
 		state.readyShards = map[uint32]bool{}
 		a.mu.Unlock()
-		for index, target := range targets {
-			if index > 0 && interval > 0 {
-				timer := time.NewTimer(interval)
-				select {
-				case <-groupCtx.Done():
-					timer.Stop()
-					cancel()
-					a.closeAllWSConnections()
-					return group.Wait()
-				case <-timer.C:
-				}
-			}
-			group.Go(func() error { return a.runShardLoop(groupCtx, state, gateway, target) })
+		identify := newWSIdentifyGate(gatewayInfo)
+		for _, target := range targets {
+			group.Go(func() error { return a.runShardLoop(groupCtx, state, gateway, target, identify) })
 		}
 	}
 	err := group.Wait()
@@ -90,13 +81,91 @@ func (a *Adapter) Cleanup(_ context.Context) error {
 	return nil
 }
 
-func (a *Adapter) runShardLoop(ctx context.Context, state *appState, gatewayURL string, target wsShardTarget) error {
+// All shards for one application share this gate, including fresh Identify on reconnect.
+// Resume does not consume the session-creation quota. Separate processes must coordinate it.
+type wsIdentifyGate struct {
+	lock     chan struct{}
+	next     time.Time
+	interval time.Duration
+	limit    *dto.SessionStartLimit
+	resetAt  time.Time
+}
+
+func newWSIdentifyGate(info *dto.WebsocketAP) *wsIdentifyGate {
+	gate := &wsIdentifyGate{lock: make(chan struct{}, 1), interval: 5 * time.Second}
+	if info != nil {
+		gate.configure(info.SessionStartLimit)
+	}
+	return gate
+}
+
+func (g *wsIdentifyGate) configure(limit dto.SessionStartLimit) {
+	concurrency := time.Duration(limit.MaxConcurrency)
+	if concurrency == 0 {
+		concurrency = 1
+	}
+	g.interval = (5*time.Second + concurrency - 1) / concurrency
+	g.limit = &limit
+	g.resetAt = time.Time{}
+	if limit.ResetAfter > 0 {
+		g.resetAt = time.Now().Add(time.Duration(limit.ResetAfter) * time.Millisecond)
+	}
+}
+
+func (g *wsIdentifyGate) connect(ctx context.Context, state *appState, connection websocket.WebSocket) error {
+	select {
+	case g.lock <- struct{}{}:
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+	defer func() { <-g.lock }()
+	if delay := time.Until(g.next); delay > 0 {
+		timer := time.NewTimer(delay)
+		defer timer.Stop()
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-timer.C:
+		}
+	}
+	if g.limit != nil && !g.resetAt.IsZero() && !time.Now().Before(g.resetAt) {
+		info, err := state.api.WS(withAppID(ctx, state.appID), nil, "")
+		if err != nil {
+			return err
+		}
+		if info == nil {
+			return errors.New("QQ gateway returned no session limits")
+		}
+		g.configure(info.SessionStartLimit)
+	}
+	if g.limit != nil && g.limit.Remaining == 0 {
+		return errs.ErrSessionLimit
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	// Wait before opening the socket, so queued shards do not time out before Identify.
+	if err := connection.Connect(); err != nil {
+		return err
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if g.limit != nil {
+		g.limit.Remaining--
+	}
+	// Hold the gate through the write; slow connects/token retrieval cannot bunch up sends.
+	defer func() { g.next = time.Now().Add(g.interval) }()
+	return connection.Identify()
+}
+
+func (a *Adapter) runShardLoop(ctx context.Context, state *appState, gatewayURL string, target wsShardTarget, identify *wsIdentifyGate) error {
 	session := &dto.Session{}
 	for {
 		if ctx.Err() != nil {
 			return nil
 		}
-		err := a.runWebSocketSession(ctx, state, gatewayURL, target, session)
+		err := a.runWebSocketSession(ctx, state, gatewayURL, target, session, identify)
 		if ctx.Err() != nil {
 			return nil
 		}
@@ -123,7 +192,7 @@ func (a *Adapter) runShardLoop(ctx context.Context, state *appState, gatewayURL 
 	}
 }
 
-func (a *Adapter) runWebSocketSession(ctx context.Context, state *appState, gatewayURL string, target wsShardTarget, session *dto.Session) error {
+func (a *Adapter) runWebSocketSession(ctx context.Context, state *appState, gatewayURL string, target wsShardTarget, session *dto.Session, identify *wsIdentifyGate) error {
 	initial := *session
 	initial.URL = gatewayURL
 	initial.AppID = state.appID
@@ -142,17 +211,15 @@ func (a *Adapter) runWebSocketSession(ctx context.Context, state *appState, gate
 	defer a.clearWSClient(key, connection)
 	stop := context.AfterFunc(ctx, connection.Close)
 	defer stop()
-	if err := connection.Connect(); err != nil {
-		return err
-	}
 	if initial.ID != "" {
+		if err := connection.Connect(); err != nil {
+			return err
+		}
 		if err := connection.Resume(); err != nil {
 			return err
 		}
-	} else {
-		if err := connection.Identify(); err != nil {
-			return err
-		}
+	} else if err := identify.connect(ctx, state, connection); err != nil {
+		return err
 	}
 	err := connection.Listening()
 	*session = *connection.Session()
@@ -182,19 +249,19 @@ func payloadDataFromEvent(payload *dto.WSPayload) json.RawMessage {
 func (a *Adapter) resolveWebSocketTargets(
 	ctx context.Context,
 	state *appState,
-) (string, []wsShardTarget, time.Duration, error) {
+) (string, []wsShardTarget, *dto.WebsocketAP, error) {
 	gatewayURL := strings.TrimSpace(a.wsGatewayURL)
 	var gatewayInfo *dto.WebsocketAP
 	if gatewayURL == "" {
 		info, err := state.api.WS(withAppID(ctx, state.appID), nil, "")
 		if err != nil {
-			return "", nil, 0, err
+			return "", nil, nil, err
 		}
 		if info == nil || strings.TrimSpace(info.URL) == "" {
-			return "", nil, 0, errors.New("qq gateway url is empty")
+			return "", nil, nil, errors.New("qq gateway url is empty")
 		}
 		if info.SessionStartLimit.Remaining == 0 {
-			return "", nil, 0, errors.New("qq gateway session start limit reached")
+			return "", nil, nil, errors.New("qq gateway session start limit reached")
 		}
 		gatewayURL = strings.TrimSpace(info.URL)
 		gatewayInfo = info
@@ -204,7 +271,7 @@ func (a *Adapter) resolveWebSocketTargets(
 	if a.wsShardCount > 0 {
 		shardID := a.wsShardID
 		if shardID >= a.wsShardCount {
-			return "", nil, 0, errors.New("QQ shard ID is outside configured shard count")
+			return "", nil, nil, errors.New("QQ shard ID is outside configured shard count")
 		}
 		targets = append(targets, wsShardTarget{ID: shardID, Count: a.wsShardCount})
 	} else {
@@ -220,16 +287,14 @@ func (a *Adapter) resolveWebSocketTargets(
 		targets = append(targets, wsShardTarget{ID: 0, Count: 1})
 	}
 
-	startupInterval := manager.CalcInterval(1)
 	if gatewayInfo != nil {
 		limitPayload := *gatewayInfo
 		limitPayload.Shards = uint32(len(targets))
 		if err := manager.CheckSessionLimit(&limitPayload); err != nil {
-			return "", nil, 0, err
+			return "", nil, nil, err
 		}
-		startupInterval = manager.CalcInterval(gatewayInfo.SessionStartLimit.MaxConcurrency)
 	}
-	return gatewayURL, targets, startupInterval, nil
+	return gatewayURL, targets, gatewayInfo, nil
 }
 
 func parseWSIntentNames(names []string) (int64, error) {
