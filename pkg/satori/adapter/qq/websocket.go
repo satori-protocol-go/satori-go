@@ -322,6 +322,8 @@ var wsIntentByName = map[string]dto.Intent{
 	"GUILD_MESSAGE_REACTION":       dto.IntentGuildMessageReactions,
 	"DIRECT_MESSAGES":              dto.IntentDirectMessages,
 	"DIRECT_MESSAGE":               dto.IntentDirectMessages,
+	"GROUP_MEMBER_EVENT":           dto.IntentGroupMembers,
+	"GROUP_MEMBERS":                dto.IntentGroupMembers,
 	"GROUP_AND_C2C_EVENT":          dto.IntentGroupMessages,
 	"C2C_GROUP_AT_MESSAGES":        dto.IntentGroupMessages,
 	"USER_MESSAGES":                dto.IntentGroupMessages,
