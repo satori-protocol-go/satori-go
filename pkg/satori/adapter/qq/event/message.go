@@ -1,6 +1,7 @@
 package event
 
 import (
+	"github.com/satori-protocol-go/satori-go/pkg/satori/adapter/qq/convert"
 	"github.com/satori-protocol-go/satori-go/pkg/satori/model/channel"
 	satorievent "github.com/satori-protocol-go/satori-go/pkg/satori/model/event"
 	"github.com/satori-protocol-go/satori-go/pkg/satori/model/guild"
@@ -71,9 +72,12 @@ func (c *Converter) makeGuildDirectMessageCreatedEvent(loginValue *login.Login, 
 	}
 }
 
-func (c *Converter) makeGroupMessageCreatedEvent(loginValue *login.Login, data map[string]any) *satorievent.Event {
+func (c *Converter) makeGroupMessageCreatedEvent(loginValue *login.Login, data map[string]any, atEvent bool) *satorievent.Event {
 	msg := decodeDTOMessage(data)
 	satoriMessage := c.messageFromDTO(msg, "qq")
+	if loginValue.User != nil && loginValue.User.Id != "" {
+		satoriMessage.Content = convert.GroupMessageContent(msg, loginValue.User.Id, atEvent)
+	}
 	groupID := firstNonEmpty(
 		valueAsString(data["group_openid"]),
 		valueAsString(data["group_id"]),

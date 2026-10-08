@@ -75,7 +75,7 @@ func (c *Converter) convertDispatchEvent(
 	case dto.EventDirectMessageCreate:
 		return c.makeGuildDirectMessageCreatedEvent(loginValue, data)
 	case dto.EventGroupAtMessageCreate, dto.EventGroupMessageCreate:
-		return c.makeGroupMessageCreatedEvent(loginValue, data)
+		return c.makeGroupMessageCreatedEvent(loginValue, data, eventType == dto.EventGroupAtMessageCreate)
 	case dto.EventC2CMessageCreate:
 		return c.makeC2CMessageCreatedEvent(loginValue, data)
 

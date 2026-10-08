@@ -429,6 +429,11 @@ func TestQQWebhook(t *testing.T) {
 			"ark_data":      map[string]any{"prompt": "card", "fields": map[string]any{"future": []int{1, 2}}},
 			"msg_elements":  []any{map[string]any{"msg_idx": "REFIDX_child==", "content": "child", "msg_elements": []any{map[string]any{"content": "nested"}}}},
 		}, event.EventTypeMessageCreated},
+		{"GROUP_MESSAGE_CREATE", map[string]any{
+			"id": "mentioned", "group_openid": "group", "content": `hello <@opaque>`,
+			"author":   map[string]string{"member_openid": "member"},
+			"mentions": []any{map[string]any{"id": "opaque", "username": "Bot", "is_you": true}},
+		}, event.EventTypeMessageCreated},
 		{"GROUP_MEMBER_ADD", map[string]any{"group_openid": "group", "member_openid": "member", "member_role": "admin", "op_member_openid": "operator"}, event.EventTypeGuildMemberAdded},
 		{"GROUP_JOIN_REQUEST", map[string]any{"group_openid": "group", "member_openid": "member", "join_request_id": "join-id"}, event.EventTypeGuildMemberRequest},
 		{"FUTURE_QQ_EVENT", map[string]any{"opaque": json.Number("9007199254740993")}, event.EventTypeInternal},
@@ -453,7 +458,13 @@ func TestQQWebhook(t *testing.T) {
 				if !ok || !bytes.Equal(raw, preserved) || evt.Referrer["qq_event_id"] != "native-event-id" {
 					t.Fatalf("native context=%+v", evt.Referrer)
 				}
-				if tc.kind == "GROUP_MESSAGE_CREATE" {
+				if tc.data["id"] == "at-message" && !strings.HasPrefix(evt.Message.Content, `<at id="bot-123"/>`) {
+					t.Fatalf("group at content=%s", evt.Message.Content)
+				}
+				if tc.data["id"] == "mentioned" && evt.Message.Content != `hello <at id="bot-123" name="Bot"/>` {
+					t.Fatalf("group mention content=%s", evt.Message.Content)
+				}
+				if tc.data["id"] == "incoming" {
 					if evt.Channel.Id != "group" || evt.User.Id != "member" || len(evt.Member.Roles) != 1 || evt.Member.Roles[0].Id != "admin" || evt.Referrer["ref_idx"] != "REFIDX_in==" {
 						t.Fatalf("group resources=%+v", evt)
 					}

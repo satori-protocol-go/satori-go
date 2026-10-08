@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"regexp"
 	"strings"
+	"unicode"
 
 	"github.com/WindowsSov8forUs/botgo-plus/dto"
 	"github.com/satori-protocol-go/satori-go/pkg/satori/internal/xhtml"
@@ -13,7 +14,7 @@ import (
 	"github.com/satori-protocol-go/satori-go/pkg/satori/model/message"
 )
 
-var nativeTextToken = regexp.MustCompile(`<@!?(\w+)>|<#(\w+)>|<emoji:(\w+)>`)
+var nativeTextToken = regexp.MustCompile(`<@!?(\w+)>|<#(\w+)>|<emoji:(\w+)>|<qqbot-at-user id="(\w+)"\s*/>`)
 
 func MessageFromDTO(input *dto.Message, platform string) *message.Message {
 	if input == nil {
@@ -70,13 +71,36 @@ func MessageFromDTO(input *dto.Message, platform string) *message.Message {
 // Only native mention/emoji tokens become elements. Literal user content is
 // escaped so an incoming '<img>' cannot turn into an executable resource request.
 func nativeText(content string) string {
+	result, _ := nativeTextWithMentions(content, nil, "")
+	return result
+}
+
+func nativeTextWithMentions(content string, mentions map[string]*dto.User, selfID string) (string, bool) {
 	var out strings.Builder
 	position := 0
+	hasAt := false
 	for _, match := range nativeTextToken.FindAllStringSubmatchIndex(content, -1) {
 		out.WriteString(xhtml.Escape(content[position:match[0]], false))
 		switch {
-		case match[2] >= 0:
-			out.WriteString(xhtml.NewElement("at", map[string]any{"id": content[match[2]:match[3]]}).String())
+		case match[2] >= 0 || match[8] >= 0:
+			id := ""
+			if match[2] >= 0 {
+				id = content[match[2]:match[3]]
+			}
+			if match[8] >= 0 {
+				id = content[match[8]:match[9]]
+			}
+			attrs := map[string]any{"id": id}
+			if mention := mentions[id]; mention != nil {
+				if mention.IsYou && selfID != "" {
+					attrs["id"] = selfID
+				}
+				if mention.Username != "" {
+					attrs["name"] = mention.Username
+				}
+			}
+			out.WriteString(xhtml.NewElement("at", attrs).String())
+			hasAt = true
 		case match[4] >= 0:
 			out.WriteString(xhtml.NewElement("sharp", map[string]any{"id": content[match[4]:match[5]]}).String())
 		case match[6] >= 0:
@@ -85,13 +109,66 @@ func nativeText(content string) string {
 		position = match[1]
 	}
 	out.WriteString(xhtml.Escape(content[position:], false))
-	return out.String()
+	return out.String(), hasAt
+}
+
+// GroupMessageContent resolves native group mentions against the current QQ login.
+func GroupMessageContent(input *dto.Message, selfID string, atEvent bool) string {
+	if input == nil {
+		return ""
+	}
+	if atEvent {
+		content := input.Content
+		if input.MessageReference == nil && !input.MentionEveryone && input.MessageType != 103 {
+			content = strings.TrimLeftFunc(content, unicode.IsSpace)
+		}
+		return xhtml.NewElement("at", map[string]any{"id": selfID}).String() + messageContentFromDTOWithNativeText(input, nativeText(content))
+	}
+
+	mentions := make(map[string]*dto.User, len(input.Mentions))
+	for _, mention := range input.Mentions {
+		if mention != nil && mention.ID != "" && mention.Scope != "all" {
+			mentions[mention.ID] = mention
+		}
+	}
+	native, hasAt := nativeTextWithMentions(input.Content, mentions, selfID)
+	content := messageContentFromDTOWithNativeText(input, native)
+	if hasAt {
+		return content
+	}
+	var prefix, suffix strings.Builder
+	seen := make(map[string]bool, len(mentions))
+	for _, mention := range input.Mentions {
+		if mention == nil || mention.ID == "" || mention.Scope == "all" || seen[mention.ID] {
+			continue
+		}
+		seen[mention.ID] = true
+		id := mention.ID
+		if mention.IsYou && selfID != "" {
+			id = selfID
+		}
+		attrs := map[string]any{"id": id}
+		if mention.Username != "" {
+			attrs["name"] = mention.Username
+		}
+		at := xhtml.NewElement("at", attrs).String()
+		if mention.IsYou {
+			prefix.WriteString(at)
+		} else {
+			suffix.WriteString(at)
+		}
+	}
+	return prefix.String() + content + suffix.String()
 }
 
 func messageContentFromDTO(input *dto.Message) string {
 	if input == nil {
 		return ""
 	}
+	return messageContentFromDTOWithNativeText(input, nativeText(input.Content))
+}
+
+func messageContentFromDTOWithNativeText(input *dto.Message, native string) string {
 	var chunks []string
 	if input.MentionEveryone {
 		chunks = append(chunks, `<at type="all"/>`)
@@ -99,7 +176,7 @@ func messageContentFromDTO(input *dto.Message) string {
 	if quote := messageQuoteFromDTO(input); quote != "" {
 		chunks = append(chunks, quote)
 	}
-	chunks = append(chunks, nativeText(input.Content))
+	chunks = append(chunks, native)
 	for _, attachment := range input.Attachments {
 		chunks = append(chunks, attachmentElement(attachment))
 	}
